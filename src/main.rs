@@ -7,13 +7,7 @@ use std::io::Read;
 use std::path::PathBuf;
 
 fn parse_graph_value(value: &serde_json::Value) -> Result<build::Graph> {
-    match value.as_array() {
-        Some(extractions) => Ok(build::merge_extractions(extractions)),
-        None => match serde_json::from_value(value.clone()) {
-            Ok(graph) => Ok(graph),
-            Err(_) => Ok(build::merge_extractions(std::slice::from_ref(value))),
-        },
-    }
+    Ok(build::coerce_graph(value)?)
 }
 
 #[derive(Parser)]
@@ -80,6 +74,14 @@ enum Commands {
 
     /// Export HTML visualization to a file
     ExportHtml {
+        /// Output HTML path
+        #[arg(long)]
+        output: PathBuf,
+    },
+
+    /// Export 3D HTML visualization to a file
+    #[command(name = "export-html-3d")]
+    ExportHtml3d {
         /// Output HTML path
         #[arg(long)]
         output: PathBuf,
@@ -509,6 +511,25 @@ fn main() -> Result<()> {
             let input: ExportHtmlInput = serde_json::from_str(&stdin)?;
             let graph = parse_graph_value(&input.graph)?;
             build::export_html_to_path(
+                &graph,
+                &input.communities,
+                &input.community_labels,
+                &output,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "output": output }))?
+            );
+        }
+        Commands::ExportHtml3d { output } => {
+            let mut stdin = String::new();
+            std::io::stdin().read_to_string(&mut stdin)?;
+            if stdin.trim().is_empty() {
+                bail!("export-html-3d expects graph JSON on stdin");
+            }
+            let input: ExportHtmlInput = serde_json::from_str(&stdin)?;
+            let graph = parse_graph_value(&input.graph)?;
+            build::export_html_3d_to_path(
                 &graph,
                 &input.communities,
                 &input.community_labels,

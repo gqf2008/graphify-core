@@ -9,13 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 fn parse_graph_value(value: &Value) -> Result<graphify_core::build::Graph> {
-    match value.as_array() {
-        Some(extractions) => Ok(graphify_core::build::merge_extractions(extractions)),
-        None => match serde_json::from_value(value.clone()) {
-            Ok(graph) => Ok(graph),
-            Err(_) => Ok(graphify_core::build::merge_extractions(std::slice::from_ref(value))),
-        },
-    }
+    Ok(graphify_core::build::coerce_graph(value)?)
 }
 
 #[derive(Parser)]
@@ -84,6 +78,21 @@ enum Commands {
 
         #[arg(long = "home-dir", hide = true)]
         home_dir: Option<PathBuf>,
+
+        #[arg(long = "version-stamp", hide = true)]
+        version_stamp: Option<String>,
+    },
+
+    /// Configure VS Code Copilot Chat skill and project instructions
+    Vscode {
+        #[command(subcommand)]
+        action: InstallAction,
+
+        #[arg(long = "home-dir", hide = true)]
+        home_dir: Option<PathBuf>,
+
+        #[arg(long = "project-dir", hide = true, default_value = ".")]
+        project_dir: PathBuf,
 
         #[arg(long = "version-stamp", hide = true)]
         version_stamp: Option<String>,
@@ -449,6 +458,12 @@ enum Commands {
         output: PathBuf,
     },
 
+    #[command(hide = true, name = "export-html-3d")]
+    ExportHtml3d {
+        #[arg(long)]
+        output: PathBuf,
+    },
+
     #[command(hide = true, name = "export-obsidian")]
     ExportObsidian {
         #[arg(long = "output-dir")]
@@ -530,6 +545,24 @@ enum Commands {
 
     #[command(hide = true, name = "setup-gemini-uninstall")]
     SetupGeminiUninstall {
+        #[arg(long = "home-dir")]
+        home_dir: PathBuf,
+        #[arg(long = "project-dir", default_value = ".")]
+        project_dir: PathBuf,
+    },
+
+    #[command(hide = true, name = "setup-vscode-install")]
+    SetupVscodeInstall {
+        #[arg(long = "home-dir")]
+        home_dir: PathBuf,
+        #[arg(long = "project-dir", default_value = ".")]
+        project_dir: PathBuf,
+        #[arg(long = "version-stamp")]
+        version_stamp: String,
+    },
+
+    #[command(hide = true, name = "setup-vscode-uninstall")]
+    SetupVscodeUninstall {
         #[arg(long = "home-dir")]
         home_dir: PathBuf,
         #[arg(long = "project-dir", default_value = ".")]
@@ -756,6 +789,16 @@ fn main() -> Result<()> {
                     &version_stamp,
                 )?),
                 "cursor" => print_lines(setup::cursor_install(&project_dir)?),
+                "opencode" => print_lines(setup::opencode_install(
+                    &resolve_home_dir(home_dir)?,
+                    &project_dir,
+                    &version_stamp,
+                )?),
+                "vscode" => print_lines(setup::vscode_install(
+                    &resolve_home_dir(home_dir)?,
+                    &project_dir,
+                    &version_stamp,
+                )?),
                 _ => print_lines(setup::install_platform(
                     &resolve_home_dir(home_dir)?,
                     &platform,
@@ -806,6 +849,22 @@ fn main() -> Result<()> {
             InstallAction::Uninstall => print_lines(setup::uninstall_platform_skill(
                 &resolve_home_dir(home_dir)?,
                 "copilot",
+            )?),
+        },
+        Commands::Vscode {
+            action,
+            home_dir,
+            project_dir,
+            version_stamp,
+        } => match action {
+            InstallAction::Install => print_lines(setup::vscode_install(
+                &resolve_home_dir(home_dir)?,
+                &project_dir,
+                &version_stamp.unwrap_or_else(default_version_stamp),
+            )?),
+            InstallAction::Uninstall => print_lines(setup::vscode_uninstall(
+                &resolve_home_dir(home_dir)?,
+                &project_dir,
             )?),
         },
         Commands::Kiro {
@@ -943,7 +1002,8 @@ fn main() -> Result<()> {
                 );
             } else {
                 println!("{}", result.message);
-                println!("Nothing to update or rebuild failed — check output above.");
+                eprintln!("Nothing to update or rebuild failed — check output above.");
+                exit_code = 1;
             }
         }
         Commands::ClusterOnly { path, today } => {
@@ -1174,6 +1234,25 @@ fn main() -> Result<()> {
                 serde_json::to_string_pretty(&json!({ "output": output }))?
             );
         }
+        Commands::ExportHtml3d { output } => {
+            let mut stdin = String::new();
+            std::io::stdin().read_to_string(&mut stdin)?;
+            if stdin.trim().is_empty() {
+                bail!("export-html-3d expects graph JSON on stdin");
+            }
+            let input: ExportHtmlInput = serde_json::from_str(&stdin)?;
+            let graph = parse_graph_value(&input.graph)?;
+            graphify_core::build::export_html_3d_to_path(
+                &graph,
+                &input.communities,
+                &input.community_labels,
+                &output,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({ "output": output }))?
+            );
+        }
         Commands::ExportObsidian { output_dir } => {
             let mut stdin = String::new();
             std::io::stdin().read_to_string(&mut stdin)?;
@@ -1304,6 +1383,19 @@ fn main() -> Result<()> {
             home_dir,
             project_dir,
         } => print_lines(setup::gemini_uninstall(&home_dir, &project_dir)?),
+        Commands::SetupVscodeInstall {
+            home_dir,
+            project_dir,
+            version_stamp,
+        } => print_lines(setup::vscode_install(
+            &home_dir,
+            &project_dir,
+            &version_stamp,
+        )?),
+        Commands::SetupVscodeUninstall {
+            home_dir,
+            project_dir,
+        } => print_lines(setup::vscode_uninstall(&home_dir, &project_dir)?),
         Commands::SetupCursorInstall { project_dir } => {
             print_lines(setup::cursor_install(&project_dir)?)
         }

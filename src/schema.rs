@@ -1,17 +1,27 @@
 use std::collections::BTreeMap;
 
-use serde::{de::Deserializer, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::Deserializer};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Extraction {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub raw_calls: Vec<RawCall>,
     #[serde(default)]
     pub hyperedges: Vec<serde_json::Value>,
     #[serde(default)]
     pub input_tokens: u32,
     #[serde(default)]
     pub output_tokens: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RawCall {
+    pub caller_nid: String,
+    pub callee: String,
+    pub source_file: String,
+    pub source_location: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -133,7 +143,8 @@ impl<'de> Deserialize<'de> for Edge {
         let target = take_required_string::<D::Error>(&mut map, "target")?;
         let relation = take_required_string::<D::Error>(&mut map, "relation")?;
         let confidence = take_required_string::<D::Error>(&mut map, "confidence")?;
-        let source_file = take_optional_string::<D::Error>(&mut map, "source_file")?.unwrap_or_default();
+        let source_file =
+            take_optional_string::<D::Error>(&mut map, "source_file")?.unwrap_or_default();
         let original_source = take_optional_string::<D::Error>(&mut map, "_src")?;
         let original_target = take_optional_string::<D::Error>(&mut map, "_tgt")?;
         let source_location = take_optional_string::<D::Error>(&mut map, "source_location")?;

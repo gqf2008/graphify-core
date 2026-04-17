@@ -5,6 +5,16 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
+macro_rules! skill_asset {
+    ($name:literal) => {
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../graphify/assets/skills/",
+            $name
+        ))
+    };
+}
+
 const SKILL_REGISTRATION: &str = "\n# graphify\n- **graphify** (`~/.claude/skills/graphify/SKILL.md`) - any input to knowledge graph. Trigger: `/graphify`\nWhen the user types `/graphify`, invoke the Skill tool with `skill: \"graphify\"` before doing anything else.\n";
 
 const HOOK_MARKER: &str = "# graphify-hook-start";
@@ -27,6 +37,8 @@ pub const AGENTS_MD_SECTION: &str = "## graphify\n\nThis project has a graphify 
 
 pub const GEMINI_MD_SECTION: &str = "## graphify\n\nThis project has a graphify knowledge graph at graphify-out/.\n\nRules:\n- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure\n- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files\n- After modifying code files in this session, run `graphify update .` to keep the graph current (AST-only, no API cost)\n";
 
+pub const VSCODE_INSTRUCTIONS_SECTION: &str = "## graphify\n\nBefore answering architecture or codebase questions, read `graphify-out/GRAPH_REPORT.md` if it exists.\nIf `graphify-out/wiki/index.md` exists, navigate it for deep questions.\nType `/graphify` in Copilot Chat to build or update the knowledge graph.\n";
+
 pub const CURSOR_RULE: &str = "---\ndescription: graphify knowledge graph context\nalwaysApply: true\n---\n\nThis project has a graphify knowledge graph at graphify-out/.\n\n- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure\n- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files\n- After modifying code files in this session, run `graphify update .` to keep the graph current\n";
 
 pub const OPENCODE_PLUGIN_JS: &str = "// graphify OpenCode plugin\n// Injects a knowledge graph reminder before bash tool calls when the graph exists.\nimport { existsSync } from \"fs\";\nimport { join } from \"path\";\n\nexport const GraphifyPlugin = async ({ directory }) => {\n  let reminded = false;\n\n  return {\n    \"tool.execute.before\": async (input, output) => {\n      if (reminded) return;\n      if (!existsSync(join(directory, \"graphify-out\", \"graph.json\"))) return;\n\n      if (input.tool === \"bash\") {\n        output.args.command =\n          'echo \"[graphify] Knowledge graph available. Read graphify-out/GRAPH_REPORT.md for god nodes and architecture context before searching files.\" && ' +\n          output.args.command;\n        reminded = true;\n      }\n    },\n  };\n};\n";
@@ -43,100 +55,67 @@ pub fn platform_config(platform: &str) -> Option<PlatformConfig> {
         "claude" => PlatformConfig {
             skill_dst: ".claude/skills/graphify/SKILL.md",
             claude_md: true,
-            skill: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../graphify/skill.md")),
+            skill: skill_asset!("skill.md"),
         },
         "codex" => PlatformConfig {
             skill_dst: ".agents/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-codex.md"
-            )),
+            skill: skill_asset!("skill-codex.md"),
         },
         "opencode" => PlatformConfig {
             skill_dst: ".config/opencode/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-opencode.md"
-            )),
+            skill: skill_asset!("skill-opencode.md"),
         },
         "aider" => PlatformConfig {
             skill_dst: ".aider/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-aider.md"
-            )),
+            skill: skill_asset!("skill-aider.md"),
         },
         "copilot" => PlatformConfig {
             skill_dst: ".copilot/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-copilot.md"
-            )),
+            skill: skill_asset!("skill-copilot.md"),
         },
         "claw" => PlatformConfig {
             skill_dst: ".openclaw/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-claw.md"
-            )),
+            skill: skill_asset!("skill-claw.md"),
         },
         "droid" => PlatformConfig {
             skill_dst: ".factory/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-droid.md"
-            )),
+            skill: skill_asset!("skill-droid.md"),
         },
         "trae" => PlatformConfig {
             skill_dst: ".trae/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-trae.md"
-            )),
+            skill: skill_asset!("skill-trae.md"),
         },
         "trae-cn" => PlatformConfig {
             skill_dst: ".trae-cn/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-trae.md"
-            )),
+            skill: skill_asset!("skill-trae.md"),
         },
         "hermes" => PlatformConfig {
             skill_dst: ".hermes/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-claw.md"
-            )),
+            skill: skill_asset!("skill-claw.md"),
         },
         "kiro" => PlatformConfig {
             skill_dst: ".kiro/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-kiro.md"
-            )),
+            skill: skill_asset!("skill-kiro.md"),
         },
         "antigravity" => PlatformConfig {
             skill_dst: ".agent/skills/graphify/SKILL.md",
             claude_md: false,
-            skill: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../graphify/skill.md")),
+            skill: skill_asset!("skill.md"),
         },
         "windows" => PlatformConfig {
             skill_dst: ".claude/skills/graphify/SKILL.md",
             claude_md: true,
-            skill: include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../graphify/skill-windows.md"
-            )),
+            skill: skill_asset!("skill-windows.md"),
         },
         _ => return None,
     })
@@ -149,7 +128,7 @@ pub fn install_platform(
 ) -> Result<Vec<String>> {
     let cfg = platform_config(platform).ok_or_else(|| {
         anyhow::anyhow!(
-            "error: unknown platform '{}'. Choose from: claude, windows, codex, opencode, aider, claw, droid, trae, trae-cn, hermes, kiro, antigravity",
+            "error: unknown platform '{}'. Choose from: claude, windows, codex, opencode, aider, copilot, claw, droid, trae, trae-cn, hermes, kiro, antigravity",
             platform
         )
     })?;
@@ -202,7 +181,7 @@ pub fn install_platform(
 pub fn uninstall_platform_skill(home_dir: &Path, platform: &str) -> Result<Vec<String>> {
     let cfg = platform_config(platform).ok_or_else(|| {
         anyhow::anyhow!(
-            "error: unknown platform '{}'. Choose from: claude, windows, codex, opencode, aider, claw, droid, trae, trae-cn, hermes, kiro, antigravity, copilot",
+            "error: unknown platform '{}'. Choose from: claude, windows, codex, opencode, aider, copilot, claw, droid, trae, trae-cn, hermes, kiro, antigravity",
             platform
         )
     })?;
@@ -215,6 +194,32 @@ pub fn uninstall_platform_skill(home_dir: &Path, platform: &str) -> Result<Vec<S
     } else {
         Ok(vec!["nothing to remove".to_string()])
     }
+}
+
+pub fn opencode_install(
+    home_dir: &Path,
+    project_dir: &Path,
+    version_stamp: &str,
+) -> Result<Vec<String>> {
+    let cfg = platform_config("opencode").expect("opencode platform config must exist");
+    let skill_dst = home_dir.join(cfg.skill_dst);
+    write_file(&skill_dst, cfg.skill)?;
+    write_file(
+        &skill_dst
+            .parent()
+            .unwrap_or(home_dir)
+            .join(".graphify_version"),
+        version_stamp,
+    )?;
+
+    let mut lines = vec![format!("  skill installed  ->  {}", skill_dst.display())];
+    lines.extend(install_opencode_plugin(project_dir)?);
+    lines.push(String::new());
+    lines.push("Done. Open your AI coding assistant and type:".to_string());
+    lines.push(String::new());
+    lines.push("  /graphify .".to_string());
+    lines.push(String::new());
+    Ok(lines)
 }
 
 pub fn claude_install(project_dir: &Path) -> Result<Vec<String>> {
@@ -281,11 +286,8 @@ pub fn gemini_install(
     version_stamp: &str,
 ) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    let skill_dst = home_dir.join(".gemini/skills/graphify/SKILL.md");
-    write_file(
-        &skill_dst,
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../graphify/skill.md")),
-    )?;
+    let skill_dst = gemini_skill_dst(home_dir);
+    write_file(&skill_dst, skill_asset!("skill.md"))?;
     write_file(
         &skill_dst
             .parent()
@@ -312,7 +314,7 @@ pub fn gemini_install(
 
 pub fn gemini_uninstall(home_dir: &Path, project_dir: &Path) -> Result<Vec<String>> {
     let mut lines = Vec::new();
-    let skill_dst = home_dir.join(".gemini/skills/graphify/SKILL.md");
+    let skill_dst = gemini_skill_dst(home_dir);
     remove_skill(&skill_dst)?;
 
     let target = project_dir.join("GEMINI.md");
@@ -340,6 +342,93 @@ pub fn gemini_uninstall(home_dir: &Path, project_dir: &Path) -> Result<Vec<Strin
         ));
     }
     lines.extend(uninstall_gemini_hook(project_dir)?);
+    Ok(lines)
+}
+
+pub fn vscode_install(
+    home_dir: &Path,
+    project_dir: &Path,
+    version_stamp: &str,
+) -> Result<Vec<String>> {
+    let skill_dst = home_dir.join(".copilot/skills/graphify/SKILL.md");
+    write_file(&skill_dst, skill_asset!("skill-vscode.md"))?;
+    write_file(
+        &skill_dst
+            .parent()
+            .unwrap_or(home_dir)
+            .join(".graphify_version"),
+        version_stamp,
+    )?;
+
+    let instructions = project_dir.join(".github/copilot-instructions.md");
+    let instructions_display = display_relative(project_dir, &instructions);
+
+    let mut lines = vec![format!("  skill installed  ->  {}", skill_dst.display())];
+    if instructions.exists() {
+        let content = fs::read_to_string(&instructions)?;
+        if content.contains("## graphify") {
+            lines.push(format!(
+                "  {}  ->  already configured (no change)",
+                instructions_display
+            ));
+        } else {
+            fs::write(
+                &instructions,
+                format!("{}\n\n{}", content.trim_end(), VSCODE_INSTRUCTIONS_SECTION),
+            )?;
+            lines.push(format!(
+                "  {}  ->  graphify section added",
+                instructions_display
+            ));
+        }
+    } else {
+        write_file(&instructions, VSCODE_INSTRUCTIONS_SECTION)?;
+        lines.push(format!("  {}  ->  created", instructions_display));
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "VS Code Copilot Chat configured. Type /graphify in the chat panel to build the graph."
+            .to_string(),
+    );
+    lines
+        .push("Note: for GitHub Copilot CLI (terminal), use: graphify copilot install".to_string());
+    Ok(lines)
+}
+
+pub fn vscode_uninstall(home_dir: &Path, project_dir: &Path) -> Result<Vec<String>> {
+    let skill_dst = home_dir.join(".copilot/skills/graphify/SKILL.md");
+    let mut lines = Vec::new();
+    if skill_dst.exists() {
+        remove_skill(&skill_dst)?;
+        lines.push(format!("  skill removed    ->  {}", skill_dst.display()));
+    }
+
+    let instructions = project_dir.join(".github/copilot-instructions.md");
+    if !instructions.exists() {
+        return Ok(lines);
+    }
+    let content = fs::read_to_string(&instructions)?;
+    if !content.contains("## graphify") {
+        return Ok(lines);
+    }
+
+    let cleaned = remove_graphify_section(&content);
+    let instructions_display = display_relative(project_dir, &instructions);
+    if cleaned.is_empty() {
+        fs::remove_file(&instructions)?;
+        lines.push(format!(
+            "  {}  ->  deleted (was empty after removal)",
+            instructions_display
+        ));
+    } else {
+        fs::write(&instructions, format!("{cleaned}\n"))?;
+        lines.push(format!(
+            "  graphify section removed from {}",
+            instructions_display
+        ));
+    }
+
     Ok(lines)
 }
 
@@ -967,6 +1056,14 @@ fn remove_skill(skill_dst: &Path) -> Result<()> {
     Ok(())
 }
 
+fn gemini_skill_dst(home_dir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        home_dir.join(".agents/skills/graphify/SKILL.md")
+    } else {
+        home_dir.join(".gemini/skills/graphify/SKILL.md")
+    }
+}
+
 fn capitalize(value: &str) -> String {
     let mut chars = value.chars();
     match chars.next() {
@@ -1153,5 +1250,57 @@ mod tests {
         assert!(!skill.exists());
         assert!(!project.path().join(ANTIGRAVITY_RULES_PATH).exists());
         assert!(!project.path().join(ANTIGRAVITY_WORKFLOW_PATH).exists());
+    }
+
+    #[test]
+    fn vscode_round_trip() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+
+        let installed = vscode_install(home.path(), project.path(), "test-version").unwrap();
+        assert!(
+            installed
+                .iter()
+                .any(|line| line.contains("skill installed"))
+        );
+
+        let skill = home.path().join(".copilot/skills/graphify/SKILL.md");
+        let instructions = project.path().join(".github/copilot-instructions.md");
+        assert!(skill.exists());
+        assert!(instructions.exists());
+        let instructions_content = fs::read_to_string(&instructions).unwrap();
+        assert!(instructions_content.contains("## graphify"));
+        assert!(instructions_content.contains("Type `/graphify`"));
+
+        let removed = vscode_uninstall(home.path(), project.path()).unwrap();
+        assert!(!removed.is_empty());
+        assert!(!skill.exists());
+        assert!(!instructions.exists());
+    }
+
+    #[test]
+    fn opencode_install_writes_plugin() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+
+        let installed = opencode_install(home.path(), project.path(), "test-version").unwrap();
+        assert!(
+            installed
+                .iter()
+                .any(|line| line.contains("plugin registered"))
+        );
+        assert!(
+            home.path()
+                .join(".config/opencode/skills/graphify/SKILL.md")
+                .exists()
+        );
+        assert!(
+            project
+                .path()
+                .join(".opencode/plugins/graphify.js")
+                .exists()
+        );
+        let config = fs::read_to_string(project.path().join("opencode.json")).unwrap();
+        assert!(config.contains(".opencode/plugins/graphify.js"));
     }
 }

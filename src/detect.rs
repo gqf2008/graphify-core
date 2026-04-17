@@ -37,7 +37,8 @@ impl FileType {
 static CODE_EXTENSIONS: &[&str] = &[
     ".py", ".ts", ".js", ".jsx", ".tsx", ".go", ".rs", ".java", ".cpp", ".cc", ".cxx", ".c", ".h",
     ".hpp", ".rb", ".swift", ".kt", ".kts", ".cs", ".scala", ".php", ".lua", ".toc", ".zig",
-    ".ps1", ".ex", ".exs", ".m", ".mm", ".jl", ".vue", ".svelte", ".dart", ".v", ".sv",
+    ".ps1", ".ex", ".exs", ".m", ".mm", ".jl", ".vue", ".svelte", ".dart", ".v", ".sv", ".mjs",
+    ".ejs",
 ];
 
 static DOC_EXTENSIONS: &[&str] = &[".md", ".txt", ".rst"];
@@ -819,6 +820,8 @@ mod tests {
         assert_eq!(classify_file(Path::new("foo.py")), Some(FileType::Code));
         assert_eq!(classify_file(Path::new("foo.rs")), Some(FileType::Code));
         assert_eq!(classify_file(Path::new("foo.tsx")), Some(FileType::Code));
+        assert_eq!(classify_file(Path::new("foo.mjs")), Some(FileType::Code));
+        assert_eq!(classify_file(Path::new("foo.ejs")), Some(FileType::Code));
         assert_eq!(
             classify_file(Path::new("foo.blade.php")),
             Some(FileType::Code)

@@ -9,7 +9,7 @@ use regex::Regex;
 use tree_sitter::{Language, Node as TsNode, Parser};
 
 use crate::detect::{FileType, classify_file};
-use crate::schema::{Edge, Extraction, Node};
+use crate::schema::{Edge, Extraction, Node, RawCall};
 
 const PYTHON_RATIONALE_PREFIXES: [&str; 7] = [
     "# NOTE:",
@@ -501,6 +501,10 @@ pub fn extract_paths(paths: &[String]) -> Result<Extraction> {
                     append_extraction(&mut combined, extract_embedded_script_file(path)?);
                     continue;
                 }
+                if let Some(result) = extract_special_case_code(path)? {
+                    append_extraction(&mut combined, result);
+                    continue;
+                }
                 let cfg = match config_for_path(path) {
                     Some(c) => c,
                     None => {
@@ -523,15 +527,59 @@ pub fn extract_paths(paths: &[String]) -> Result<Extraction> {
             .extend(resolve_python_cross_file_imports(&python_results)?);
     }
 
+    resolve_cross_file_calls(&mut combined);
+
     Ok(combined)
 }
 
 fn append_extraction(dst: &mut Extraction, src: Extraction) {
     dst.nodes.extend(src.nodes);
     dst.edges.extend(src.edges);
+    dst.raw_calls.extend(src.raw_calls);
     dst.hyperedges.extend(src.hyperedges);
     dst.input_tokens += src.input_tokens;
     dst.output_tokens += src.output_tokens;
+}
+
+fn resolve_cross_file_calls(extraction: &mut Extraction) {
+    if extraction.raw_calls.is_empty() {
+        return;
+    }
+
+    let label_to_id = build_label_index(&extraction.nodes);
+    let mut existing_pairs: HashSet<(String, String)> = extraction
+        .edges
+        .iter()
+        .map(|edge| (edge.source.clone(), edge.target.clone()))
+        .collect();
+
+    for raw_call in extraction.raw_calls.drain(..) {
+        let key = raw_call.callee.to_lowercase();
+        let Some(target_id) = label_to_id.get(&key) else {
+            continue;
+        };
+        if target_id == &raw_call.caller_nid {
+            continue;
+        }
+        let pair = (raw_call.caller_nid.clone(), target_id.clone());
+        if !existing_pairs.insert(pair.clone()) {
+            continue;
+        }
+        extraction.edges.push(Edge {
+            source: pair.0,
+            target: pair.1,
+            relation: "calls".to_string(),
+            confidence: "INFERRED".to_string(),
+            source_file: raw_call.source_file,
+            original_source: None,
+            original_target: None,
+            source_location: raw_call.source_location,
+            confidence_score: Some(0.8),
+            confidence_score_present: true,
+            weight: 1.0,
+            extra: Default::default(),
+        });
+    }
 }
 
 fn is_embedded_script_path(path: &Path) -> bool {
@@ -605,7 +653,9 @@ fn extract_embedded_script_blocks(source: &str) -> Result<Vec<EmbeddedScriptBloc
 
     let mut blocks = Vec::new();
     for caps in script_re.captures_iter(source) {
-        let Some(body) = caps.name("body") else { continue };
+        let Some(body) = caps.name("body") else {
+            continue;
+        };
         if body.as_str().trim().is_empty() {
             continue;
         }
@@ -620,7 +670,10 @@ fn extract_embedded_script_blocks(source: &str) -> Result<Vec<EmbeddedScriptBloc
             || attrs_lower.contains("lang=\"typescript\"")
             || attrs_lower.contains("lang='typescript'")
             || attrs_lower.contains("lang=typescript");
-        let line_offset = source[..body.start()].bytes().filter(|b| *b == b'\n').count();
+        let line_offset = source[..body.start()]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
         blocks.push(EmbeddedScriptBlock {
             code: body.as_str().to_string(),
             line_offset,
@@ -677,6 +730,54 @@ fn append_extraction_unique(
     dst.output_tokens += src.output_tokens;
 }
 
+fn extract_special_case_code(path: &Path) -> Result<Option<Extraction>> {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let extraction = match ext.as_str() {
+        "m" | "mm" => Some(extract_objc_file(path)?),
+        "swift" => Some(extract_swift_file(path)?),
+        "php" => Some(extract_php_file(path)?),
+        "ps1" => Some(extract_powershell_file(path)?),
+        "jl" => Some(extract_julia_file(path)?),
+        "ex" | "exs" => Some(extract_elixir_file(path)?),
+        "zig" => Some(extract_zig_file(path)?),
+        "cs" => Some(extract_csharp_file(path)?),
+        _ => None,
+    };
+    Ok(extraction)
+}
+
+fn new_file_extraction(path: &Path) -> (Extraction, HashSet<String>, String, String) {
+    let source_file = path.to_string_lossy().to_string();
+    let file_label = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| source_file.clone());
+    let file_id = make_id(&source_file);
+    let mut extraction = Extraction::default();
+    let mut seen_ids = HashSet::new();
+    add_node(
+        &mut extraction.nodes,
+        &mut seen_ids,
+        Node {
+            id: file_id.clone(),
+            label: file_label,
+            file_type: "code".to_string(),
+            source_file: source_file.clone(),
+            source_location: Some("L1".to_string()),
+            node_type: Some("file".to_string()),
+            docstring: None,
+            parameters: Vec::new(),
+            signature: None,
+            extra: Default::default(),
+        },
+    );
+    (extraction, seen_ids, file_id, source_file)
+}
+
 // ── Generic AST extraction ────────────────────────────────────────────────────
 
 fn extract_generic(path: &Path, cfg: &LanguageConfig) -> Result<Extraction> {
@@ -685,7 +786,11 @@ fn extract_generic(path: &Path, cfg: &LanguageConfig) -> Result<Extraction> {
     extract_generic_from_source(path, &source, cfg)
 }
 
-fn extract_generic_from_source(path: &Path, source: &[u8], cfg: &LanguageConfig) -> Result<Extraction> {
+fn extract_generic_from_source(
+    path: &Path,
+    source: &[u8],
+    cfg: &LanguageConfig,
+) -> Result<Extraction> {
     let mut parser = Parser::new();
     parser.set_language(&cfg.language).map_err(|err| {
         anyhow!(
@@ -748,28 +853,35 @@ fn extract_generic_from_source(path: &Path, source: &[u8], cfg: &LanguageConfig)
     // Resolve pending calls
     let label_to_id = build_label_index(&extraction.nodes);
     let mut seen_call_pairs: HashSet<(String, String)> = HashSet::new();
+    let allow_cross_file_calls = source_extension(&source_file) != "rs";
     for pending in pending_calls {
         let key = pending.callee_name.to_lowercase();
-        let Some(target_id) = label_to_id.get(&key) else {
-            continue;
-        };
-        if target_id == &pending.caller_id {
-            continue;
-        }
-        let pair = (pending.caller_id.clone(), target_id.clone());
-        if !seen_call_pairs.insert(pair.clone()) {
-            continue;
-        }
-        push_edge(
-            &mut extraction.edges,
-            EdgeSpec {
-                source: pair.0,
-                target: pair.1,
-                relation: "calls".to_string(),
+        if let Some(target_id) = label_to_id.get(&key) {
+            if target_id == &pending.caller_id {
+                continue;
+            }
+            let pair = (pending.caller_id.clone(), target_id.clone());
+            if !seen_call_pairs.insert(pair.clone()) {
+                continue;
+            }
+            push_edge(
+                &mut extraction.edges,
+                EdgeSpec {
+                    source: pair.0,
+                    target: pair.1,
+                    relation: "calls".to_string(),
+                    source_file: source_file.clone(),
+                    line_no: pending.line_no,
+                },
+            );
+        } else if allow_cross_file_calls {
+            extraction.raw_calls.push(RawCall {
+                caller_nid: pending.caller_id,
+                callee: pending.callee_name,
                 source_file: source_file.clone(),
-                line_no: pending.line_no,
-            },
-        );
+                source_location: Some(format!("L{}", pending.line_no)),
+            });
+        }
     }
 
     if path.extension().and_then(|ext| ext.to_str()) == Some("py") {
@@ -880,7 +992,12 @@ fn handle_class<'a>(
     seen_ids: &mut HashSet<String>,
     pending_calls: &mut Vec<PendingCall>,
 ) {
-    let class_name = resolve_name(node, source, cfg).or_else(|| {
+    let class_name = if node.kind() == "impl_item" {
+        resolve_impl_type(node, source, stem)
+    } else {
+        resolve_name(node, source, cfg)
+    }
+    .or_else(|| {
         // Go type_declaration: walk into type_spec
         if node.kind() == "type_declaration" {
             for child in named_children(node) {
@@ -898,15 +1015,17 @@ fn handle_class<'a>(
                 }
             }
         }
-        // Rust impl_item: extract the type being implemented
-        if node.kind() == "impl_item" {
-            return resolve_impl_type(node, source, stem);
-        }
         None
     });
     let Some(class_name) = class_name else { return };
 
-    let class_id = make_id(&format!("{stem}_{class_name}"));
+    let class_scope = if source_extension(source_file) == "go" && node.kind() == "type_declaration"
+    {
+        package_scope(source_file, stem)
+    } else {
+        stem.to_string()
+    };
+    let class_id = make_id(&format!("{class_scope}_{class_name}"));
     let line_no = node.start_position().row + 1;
     let already_seen = seen_ids.contains(&class_id);
 
@@ -926,7 +1045,7 @@ fn handle_class<'a>(
             extra: Default::default(),
         },
     );
-    if !(node.kind() == "impl_item" && already_seen) {
+    if node.kind() != "impl_item" && !already_seen {
         push_edge(
             edges,
             EdgeSpec {
@@ -940,7 +1059,17 @@ fn handle_class<'a>(
     }
 
     // Inheritance
-    handle_inheritance(&class_id, node, source, stem, cfg, edges);
+    handle_inheritance(
+        &class_id,
+        node,
+        source,
+        source_file,
+        stem,
+        cfg,
+        nodes,
+        edges,
+        seen_ids,
+    );
 
     // Body recurse
     let body = find_body(node, cfg);
@@ -967,48 +1096,108 @@ fn handle_inheritance(
     class_id: &str,
     node: TsNode<'_>,
     source: &[u8],
+    source_file: &str,
     stem: &str,
     cfg: &LanguageConfig,
+    nodes: &mut Vec<Node>,
     edges: &mut Vec<Edge>,
+    seen_ids: &mut HashSet<String>,
 ) {
     let line_no = node.start_position().row + 1;
+    let ext = source_extension(source_file);
     for inh_type in cfg.inheritance_child_types {
-        for child in named_children(node) {
-            if child.kind() == *inh_type {
-                for base in collect_identifiers(child, source) {
-                    let base_nid = make_id(&format!("{stem}_{base}"));
-                    push_edge(
-                        edges,
-                        EdgeSpec {
-                            source: class_id.to_string(),
-                            target: base_nid,
-                            relation: "inherits".to_string(),
-                            source_file: String::new(),
-                            line_no,
-                        },
-                    );
+        let mut inheritance_nodes = Vec::new();
+        if let Some(child) = node.child_by_field_name(inh_type) {
+            inheritance_nodes.push(child);
+        }
+        inheritance_nodes.extend(
+            named_children(node)
+                .into_iter()
+                .filter(|child| child.kind() == *inh_type),
+        );
+        for child in inheritance_nodes {
+            let bases = if ext == "py" {
+                named_children(child)
+                    .into_iter()
+                    .filter(|arg| arg.kind() == "identifier")
+                    .filter_map(|arg| node_text(arg, source))
+                    .collect()
+            } else {
+                collect_identifiers(child, source)
+            };
+            for base in bases {
+                let mut base_nid = make_id(&format!("{stem}_{base}"));
+                if !seen_ids.contains(&base_nid) {
+                    base_nid = make_id(&base);
+                    if !seen_ids.contains(&base_nid) {
+                        add_node(
+                            nodes,
+                            seen_ids,
+                            Node {
+                                id: base_nid.clone(),
+                                label: base.clone(),
+                                file_type: "code".to_string(),
+                                source_file: String::new(),
+                                source_location: None,
+                                node_type: None,
+                                docstring: None,
+                                parameters: Vec::new(),
+                                signature: None,
+                                extra: Default::default(),
+                            },
+                        );
+                    }
                 }
+                push_edge(
+                    edges,
+                    EdgeSpec {
+                        source: class_id.to_string(),
+                        target: base_nid,
+                        relation: "inherits".to_string(),
+                        source_file: source_file.to_string(),
+                        line_no,
+                    },
+                );
             }
         }
     }
 }
 
+fn package_scope(source_file: &str, stem: &str) -> String {
+    Path::new(source_file)
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(stem)
+        .to_string()
+}
+
 fn resolve_impl_type(node: TsNode<'_>, source: &[u8], _stem: &str) -> Option<String> {
-    // For Rust impl blocks, return the type being implemented
+    // For `impl Trait for Type`, prefer the implemented type (`Type`), not the trait.
+    let raw = node_text(node, source);
+    let mut type_names = Vec::new();
     for child in named_children(node) {
         if child.kind() == "type_identifier" {
-            return node_text(child, source);
+            if let Some(type_name) = node_text(child, source) {
+                type_names.push(type_name);
+            }
         }
-        // Handle impl<Trait> for Type — we want Type
         if child.kind() == "trait_bound" {
             for sub in named_children(child) {
                 if sub.kind() == "type_identifier" {
-                    return node_text(sub, source);
+                    if let Some(type_name) = node_text(sub, source) {
+                        type_names.push(type_name);
+                    }
                 }
             }
         }
     }
-    None
+    if raw.as_deref().is_some_and(|text| text.contains(" for ")) {
+        type_names.into_iter().next_back()
+    } else {
+        type_names.into_iter().next()
+    }
 }
 
 // ── Function handling ─────────────────────────────────────────────────────────
@@ -1037,7 +1226,8 @@ fn handle_function<'a>(
         return;
     };
     let line_no = node.start_position().row + 1;
-    let python_property = source_extension(source_file) == "py" && is_python_property_function(node, source);
+    let python_property =
+        source_extension(source_file) == "py" && is_python_property_function(node, source);
 
     // For Go methods: check for receiver field to determine if this is a method
     let resolved_parent: Option<String> = parent_class_id.map(|s| s.to_string()).or_else(|| {
@@ -1049,13 +1239,19 @@ fn handle_function<'a>(
                         for sub in named_children(child) {
                             if sub.kind() == "type_identifier" {
                                 if let Some(type_name) = node_text(sub, source) {
-                                    return Some(make_id(&format!("{stem}_{type_name}")));
+                                    return Some(make_id(&format!(
+                                        "{}_{type_name}",
+                                        package_scope(source_file, stem)
+                                    )));
                                 }
                             }
                         }
                     } else if child.kind() == "type_identifier" {
                         if let Some(type_name) = node_text(child, source) {
-                            return Some(make_id(&format!("{stem}_{type_name}")));
+                            return Some(make_id(&format!(
+                                "{}_{type_name}",
+                                package_scope(source_file, stem)
+                            )));
                         }
                     }
                 }
@@ -1131,8 +1327,10 @@ fn is_python_property_function(node: TsNode<'_>, source: &[u8]) -> bool {
 
     named_children(parent).into_iter().any(|child| {
         child.kind() == "decorator"
-            && node_text(child, source)
-                .is_some_and(|text| text.split_whitespace().any(|part| part.ends_with("property")))
+            && node_text(child, source).is_some_and(|text| {
+                text.split_whitespace()
+                    .any(|part| part.ends_with("property"))
+            })
     })
 }
 
@@ -1154,9 +1352,127 @@ fn handle_import(
         return;
     }
 
+    if ext == "go" && kind == "import_declaration" {
+        for child in all_children(node) {
+            let specs = if child.kind() == "import_spec" {
+                vec![child]
+            } else if child.kind() == "import_spec_list" {
+                all_children(child)
+                    .into_iter()
+                    .filter(|spec| spec.kind() == "import_spec")
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            for spec in specs {
+                let Some(path_node) = spec.child_by_field_name("path") else {
+                    continue;
+                };
+                let Some(raw) = node_text(path_node, source) else {
+                    continue;
+                };
+                let module = raw
+                    .trim_matches('"')
+                    .split('/')
+                    .next_back()
+                    .unwrap_or(raw.as_str());
+                if module.is_empty() {
+                    continue;
+                }
+                push_edge(
+                    edges,
+                    EdgeSpec {
+                        source: file_id.to_string(),
+                        target: make_id(module),
+                        relation: "imports_from".to_string(),
+                        source_file: source_file.to_string(),
+                        line_no: spec.start_position().row + 1,
+                    },
+                );
+            }
+        }
+        return;
+    }
+
+    if ext == "scala" && kind == "import_declaration" {
+        for child in all_children(node) {
+            if !matches!(child.kind(), "stable_id" | "identifier") {
+                continue;
+            }
+            let Some(raw) = node_text(child, source) else {
+                continue;
+            };
+            let module = raw
+                .split('.')
+                .next_back()
+                .unwrap_or(raw.as_str())
+                .trim_matches(['{', '}', ' ']);
+            if !module.is_empty() && module != "_" {
+                push_edge(
+                    edges,
+                    EdgeSpec {
+                        source: file_id.to_string(),
+                        target: make_id(module),
+                        relation: "imports".to_string(),
+                        source_file: source_file.to_string(),
+                        line_no,
+                    },
+                );
+            }
+            return;
+        }
+        return;
+    }
+
+    if ext == "swift" && kind == "import_declaration" {
+        for child in all_children(node) {
+            if child.kind() != "identifier" {
+                continue;
+            }
+            if let Some(raw) = node_text(child, source) {
+                push_edge(
+                    edges,
+                    EdgeSpec {
+                        source: file_id.to_string(),
+                        target: make_id(&raw),
+                        relation: "imports".to_string(),
+                        source_file: source_file.to_string(),
+                        line_no,
+                    },
+                );
+            }
+            return;
+        }
+        return;
+    }
+
     let targets: Vec<(String, String)> = match kind {
         "import_statement" if is_js_like_extension(ext) => {
             extract_js_import_targets(node, source, source_file)
+        }
+        "import_statement" if ext == "py" => {
+            if let Some(text) = node_text(node, source) {
+                text.trim_start_matches("import")
+                    .trim()
+                    .split(',')
+                    .filter_map(|segment| {
+                        let module = segment
+                            .trim()
+                            .split(" as ")
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .trim_start_matches('.');
+                        if module.is_empty() {
+                            None
+                        } else {
+                            Some((make_id(module), "imports".to_string()))
+                        }
+                    })
+                    .collect()
+            } else {
+                vec![]
+            }
         }
         "import_statement" => extract_import_targets(node, source),
         "import_from_statement" => {
@@ -1220,7 +1536,11 @@ fn handle_import(
         "import_declaration" => {
             let mut targets = Vec::new();
             collect_import_paths(node, source, &mut targets);
-            let relation = if ext == "go" { "imports_from" } else { "imports" };
+            let relation = if ext == "go" {
+                "imports_from"
+            } else {
+                "imports"
+            };
             targets
                 .into_iter()
                 .map(|m| (make_id(&m), relation.to_string()))
@@ -1265,27 +1585,21 @@ fn handle_import(
             }
         }
         "use_declaration" => {
-            // Rust: use std::collections::HashMap
+            // Match Python's Rust extractor: collapse grouped imports to the base module.
             if let Some(text) = node_text(node, source) {
                 let text = text.trim_start_matches("use").trim().trim_end_matches(';');
-                text.split(',')
-                    .map(|seg| {
-                        let seg = seg.trim();
-                        seg.rsplit("::")
-                            .next()
-                            .unwrap_or(seg)
-                            .split('{')
-                            .next_back()
-                            .unwrap_or(seg)
-                            .split(" as ")
-                            .next()
-                            .unwrap_or(seg)
-                            .trim()
-                            .to_string()
-                    })
-                    .filter(|m: &String| !m.is_empty())
-                    .map(|m: String| (make_id(&m), "imports_from".to_string()))
-                    .collect()
+                let clean = text.split('{').next().unwrap_or(text).trim();
+                let clean = clean
+                    .trim_end_matches(':')
+                    .trim_end_matches('*')
+                    .trim_end_matches(':')
+                    .trim();
+                let module = clean.rsplit("::").next().unwrap_or(clean).trim();
+                if module.is_empty() {
+                    vec![]
+                } else {
+                    vec![(make_id(module), "imports_from".to_string())]
+                }
             } else {
                 vec![]
             }
@@ -1452,12 +1766,19 @@ fn extract_js_import_targets(
         let Some(raw) = node_text(child, source) else {
             continue;
         };
-        let raw = raw.trim_matches('\'').trim_matches('"').trim_matches('`').trim();
+        let raw = raw
+            .trim_matches('\'')
+            .trim_matches('"')
+            .trim_matches('`')
+            .trim();
         if raw.is_empty() {
             continue;
         }
         let target = if raw.starts_with('.') {
-            let mut resolved = Path::new(source_file).parent().unwrap_or_else(|| Path::new("")).join(raw);
+            let mut resolved = Path::new(source_file)
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(raw);
             if resolved.extension().and_then(|ext| ext.to_str()) == Some("js") {
                 resolved.set_extension("ts");
             } else if resolved.extension().and_then(|ext| ext.to_str()) == Some("jsx") {
@@ -1484,7 +1805,10 @@ fn collect_java_import_targets(node: TsNode<'_>, source: &[u8]) -> Vec<(String, 
                 let mut current = Some(node);
                 while let Some(cur) = current {
                     if cur.kind() == "scoped_identifier" {
-                        if let Some(name) = cur.child_by_field_name("name").and_then(|n| node_text(n, source)) {
+                        if let Some(name) = cur
+                            .child_by_field_name("name")
+                            .and_then(|n| node_text(n, source))
+                        {
                             parts.push(name);
                         }
                         current = cur.child_by_field_name("scope");
@@ -1552,7 +1876,6 @@ fn extract_import_targets(node: TsNode<'_>, source: &[u8]) -> Vec<(String, Strin
 
 #[derive(Debug)]
 struct PythonImportFromStatement {
-    module: String,
     target_stem: String,
     imported_names: Vec<String>,
 }
@@ -1566,16 +1889,12 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
         })?;
 
     let mut stem_to_entities: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut module_to_file_id: HashMap<String, String> = HashMap::new();
     for (_path, extraction) in per_file {
         for node in &extraction.nodes {
             if node.source_file.is_empty() {
                 continue;
             }
             if node.node_type.as_deref() == Some("file") {
-                for module_name in python_module_candidates(Path::new(&node.source_file)) {
-                    module_to_file_id.insert(module_name, node.id.clone());
-                }
                 continue;
             }
             if node.node_type.as_deref() != Some("class") {
@@ -1599,24 +1918,19 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
 
     for (path, extraction) in per_file {
         let source_file = path.to_string_lossy().to_string();
-        let Some(local_file_id) = extraction
-            .nodes
-            .iter()
-            .find(|node| {
-                node.node_type.as_deref() == Some("file") && node.source_file == source_file
-            })
-            .map(|node| node.id.clone())
-        else {
-            continue;
-        };
-        let local_classes: Vec<String> = extraction
+        let local_entities: Vec<String> = extraction
             .nodes
             .iter()
             .filter(|node| {
-                node.source_file == source_file && node.node_type.as_deref() == Some("class")
+                node.source_file == source_file
+                    && !node.label.ends_with(')')
+                    && !node.label.ends_with(".py")
             })
             .map(|node| node.id.clone())
             .collect();
+        if local_entities.is_empty() {
+            continue;
+        }
 
         let source = fs::read(path).with_context(|| {
             format!(
@@ -1631,10 +1945,8 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
         collect_python_cross_file_import_edges(
             tree.root_node(),
             &source,
-            &local_file_id,
             &source_file,
-            &local_classes,
-            &module_to_file_id,
+            &local_entities,
             &stem_to_entities,
             &mut seen_edges,
             &mut edges,
@@ -1647,66 +1959,19 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
 fn collect_python_cross_file_import_edges(
     node: TsNode<'_>,
     source: &[u8],
-    local_file_id: &str,
     source_file: &str,
-    local_classes: &[String],
-    module_to_file_id: &HashMap<String, String>,
+    local_entities: &[String],
     stem_to_entities: &HashMap<String, HashMap<String, String>>,
     seen_edges: &mut HashSet<(String, String, usize)>,
     edges: &mut Vec<Edge>,
 ) {
-    if node.kind() == "import_statement" {
-        let line_no = node.start_position().row + 1;
-        for module in parse_python_import_statement_modules(node, source) {
-            if let Some(target_file_id) = module_to_file_id.get(&module) {
-                let key = (local_file_id.to_string(), target_file_id.clone(), line_no);
-                if seen_edges.insert(key) {
-                    edges.push(Edge {
-                        source: local_file_id.to_string(),
-                        target: target_file_id.clone(),
-                        relation: "imports".to_string(),
-                        confidence: "EXTRACTED".to_string(),
-                        source_file: source_file.to_string(),
-                        original_source: None,
-                        original_target: None,
-                        source_location: Some(format!("L{}", line_no)),
-                        confidence_score: Some(1.0),
-                        confidence_score_present: true,
-                        weight: 1.0,
-                        extra: Default::default(),
-                    });
-                }
-            }
-        }
-    }
-
     if node.kind() == "import_from_statement" {
         if let Some(import_statement) = parse_python_import_from_statement(node, source) {
             let line_no = node.start_position().row + 1;
-            if let Some(target_file_id) = module_to_file_id.get(&import_statement.module) {
-                let key = (local_file_id.to_string(), target_file_id.clone(), line_no);
-                if seen_edges.insert(key) {
-                    edges.push(Edge {
-                        source: local_file_id.to_string(),
-                        target: target_file_id.clone(),
-                        relation: "imports_from".to_string(),
-                        confidence: "EXTRACTED".to_string(),
-                        source_file: source_file.to_string(),
-                        original_source: None,
-                        original_target: None,
-                        source_location: Some(format!("L{}", line_no)),
-                        confidence_score: Some(1.0),
-                        confidence_score_present: true,
-                        weight: 1.0,
-                        extra: Default::default(),
-                    });
-                }
-            }
-
             if let Some(targets) = stem_to_entities.get(&import_statement.target_stem) {
                 for imported_name in import_statement.imported_names {
                     if let Some(target_id) = targets.get(&imported_name) {
-                        for source_id in local_classes {
+                        for source_id in local_entities {
                             let key = (source_id.clone(), target_id.clone(), line_no);
                             if !seen_edges.insert(key) {
                                 continue;
@@ -1736,10 +2001,8 @@ fn collect_python_cross_file_import_edges(
         collect_python_cross_file_import_edges(
             child,
             source,
-            local_file_id,
             source_file,
-            local_classes,
-            module_to_file_id,
+            local_entities,
             stem_to_entities,
             seen_edges,
             edges,
@@ -1783,65 +2046,9 @@ fn parse_python_import_from_statement(
     }
 
     Some(PythonImportFromStatement {
-        module: module.to_string(),
         target_stem: target_stem.to_string(),
         imported_names,
     })
-}
-
-fn parse_python_import_statement_modules(node: TsNode<'_>, source: &[u8]) -> Vec<String> {
-    let Some(raw) = node_text(node, source) else {
-        return Vec::new();
-    };
-    raw.trim_start_matches("import")
-        .trim()
-        .replace(['\n', '\r'], " ")
-        .split(',')
-        .filter_map(|part| {
-            let module = part.trim().split(" as ").next()?.trim();
-            if module.is_empty() {
-                None
-            } else {
-                Some(module.to_string())
-            }
-        })
-        .collect()
-}
-
-fn python_module_candidates(path: &Path) -> Vec<String> {
-    let mut components: Vec<String> = path
-        .iter()
-        .filter_map(|part| part.to_str().map(|s| s.to_string()))
-        .collect();
-
-    if components.is_empty() {
-        return Vec::new();
-    }
-
-    if let Some(last) = components.last_mut() {
-        if let Some(stripped) = last.strip_suffix(".py") {
-            *last = stripped.to_string();
-        }
-    }
-
-    let is_init = components.last().is_some_and(|name| name == "__init__");
-    let end = if is_init {
-        components.len().saturating_sub(1)
-    } else {
-        components.len()
-    };
-    if end == 0 {
-        return Vec::new();
-    }
-
-    let mut candidates = Vec::new();
-    for start in 0..end {
-        let module = components[start..end].join(".");
-        if !module.is_empty() {
-            candidates.push(module);
-        }
-    }
-    candidates
 }
 
 // ── Call collection ───────────────────────────────────────────────────────────
@@ -1875,8 +2082,13 @@ fn collect_calls(
 }
 
 fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Option<String> {
+    if node.kind() == "class_constant_access_expression" {
+        return None;
+    }
+
     let func_node = node
         .child_by_field_name(cfg.call_function_field)
+        .or_else(|| node.child_by_field_name("name"))
         .or_else(|| named_children(node).into_iter().next())?;
 
     // Accessor call (obj.method())
@@ -1897,7 +2109,10 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
     }
 
     if func_node.kind() == "scoped_identifier" {
-        if let Some(name) = func_node.child_by_field_name("name").and_then(|node| node_text(node, source)) {
+        if let Some(name) = func_node
+            .child_by_field_name("name")
+            .and_then(|node| node_text(node, source))
+        {
             return Some(name);
         }
         if let Some(last) = named_children(func_node).into_iter().last() {
@@ -2321,6 +2536,2911 @@ fn make_id(value: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
+fn all_children(node: TsNode<'_>) -> Vec<TsNode<'_>> {
+    let mut children = Vec::new();
+    for idx in 0..node.child_count() {
+        if let Some(child) = node.child(idx) {
+            children.push(child);
+        }
+    }
+    children
+}
+
+fn add_code_node(
+    nodes: &mut Vec<Node>,
+    seen_ids: &mut HashSet<String>,
+    id: String,
+    label: String,
+    source_file: &str,
+    line_no: usize,
+) {
+    add_node(
+        nodes,
+        seen_ids,
+        Node {
+            id,
+            label,
+            file_type: "code".to_string(),
+            source_file: source_file.to_string(),
+            source_location: Some(format!("L{line_no}")),
+            node_type: None,
+            docstring: None,
+            parameters: Vec::new(),
+            signature: None,
+            extra: Default::default(),
+        },
+    );
+}
+
+fn push_edge_with_confidence(
+    edges: &mut Vec<Edge>,
+    source: String,
+    target: String,
+    relation: String,
+    source_file: &str,
+    line_no: usize,
+    confidence: &str,
+    weight: f64,
+) {
+    edges.push(Edge {
+        source,
+        target,
+        relation,
+        confidence: confidence.to_string(),
+        source_file: source_file.to_string(),
+        original_source: None,
+        original_target: None,
+        source_location: Some(format!("L{line_no}")),
+        confidence_score: Some(1.0),
+        confidence_score_present: true,
+        weight,
+        extra: Default::default(),
+    });
+}
+
+fn edge_signature(edge: &Edge) -> (String, String, String, Option<String>) {
+    (
+        edge.source.clone(),
+        edge.target.clone(),
+        edge.relation.clone(),
+        edge.source_location.clone(),
+    )
+}
+
+fn php_basename(raw: &str) -> &str {
+    raw.rsplit('\\').next().unwrap_or(raw).trim()
+}
+
+fn line_no_from_offset(text: &str, start_line: usize, offset: usize) -> usize {
+    start_line
+        + text.as_bytes()[..offset]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count()
+}
+
+fn extract_csharp_file(path: &Path) -> Result<Extraction> {
+    let mut extraction = extract_generic(path, &csharp_cfg())?;
+    let source =
+        fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
+        .map_err(|err| {
+            anyhow!(
+                "Failed to set parser language for {}: {err}",
+                path.display()
+            )
+        })?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
+    let root = tree.root_node();
+    let source_file = path.to_string_lossy().to_string();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+    let file_id = make_id(&source_file);
+    let mut seen_ids: HashSet<String> = extraction
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect();
+    let mut seen_edges: HashSet<(String, String, String, Option<String>)> =
+        extraction.edges.iter().map(edge_signature).collect();
+
+    fn walk(
+        node: TsNode<'_>,
+        stem: &str,
+        file_id: &str,
+        source: &[u8],
+        source_file: &str,
+        nodes: &mut Vec<Node>,
+        edges: &mut Vec<Edge>,
+        seen_ids: &mut HashSet<String>,
+        seen_edges: &mut HashSet<(String, String, String, Option<String>)>,
+    ) {
+        if node.kind() == "namespace_declaration" {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|child| node_text(child, source))
+            {
+                let line_no = node.start_position().row + 1;
+                let namespace_id = make_id(&format!("{stem}_{name}"));
+                add_code_node(
+                    nodes,
+                    seen_ids,
+                    namespace_id.clone(),
+                    name,
+                    source_file,
+                    line_no,
+                );
+                let edge = Edge {
+                    source: file_id.to_string(),
+                    target: namespace_id,
+                    relation: "contains".to_string(),
+                    confidence: "EXTRACTED".to_string(),
+                    source_file: source_file.to_string(),
+                    original_source: None,
+                    original_target: None,
+                    source_location: Some(format!("L{line_no}")),
+                    confidence_score: Some(1.0),
+                    confidence_score_present: true,
+                    weight: 1.0,
+                    extra: Default::default(),
+                };
+                if seen_edges.insert(edge_signature(&edge)) {
+                    edges.push(edge);
+                }
+            }
+        }
+
+        for child in named_children(node) {
+            walk(
+                child,
+                stem,
+                file_id,
+                source,
+                source_file,
+                nodes,
+                edges,
+                seen_ids,
+                seen_edges,
+            );
+        }
+    }
+
+    walk(
+        root,
+        stem,
+        &file_id,
+        &source,
+        &source_file,
+        &mut extraction.nodes,
+        &mut extraction.edges,
+        &mut seen_ids,
+        &mut seen_edges,
+    );
+
+    Ok(extraction)
+}
+
+fn extract_julia_file(path: &Path) -> Result<Extraction> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_julia::LANGUAGE.into())
+        .map_err(|err| {
+            anyhow!(
+                "Failed to set parser language for {}: {err}",
+                path.display()
+            )
+        })?;
+    let source =
+        fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
+    let root = tree.root_node();
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+    let (mut extraction, mut seen_ids, file_id, source_file) = new_file_extraction(path);
+    let mut function_bodies: Vec<(String, TsNode<'_>)> = Vec::new();
+
+    fn func_name_from_signature(node: TsNode<'_>, source: &[u8]) -> Option<String> {
+        for child in all_children(node) {
+            if child.kind() != "call_expression" {
+                continue;
+            }
+            if let Some(callee) = child.child(0) {
+                if callee.kind() == "identifier" {
+                    return node_text(callee, source);
+                }
+            }
+        }
+        None
+    }
+
+    fn walk_calls(
+        node: TsNode<'_>,
+        func_id: &str,
+        stem: &str,
+        source: &[u8],
+        edges: &mut Vec<Edge>,
+        source_file: &str,
+    ) {
+        match node.kind() {
+            "function_definition" | "short_function_definition" => return,
+            "call_expression" => {
+                if let Some(callee) = node.child(0) {
+                    let target = match callee.kind() {
+                        "identifier" => {
+                            node_text(callee, source).map(|name| make_id(&format!("{stem}_{name}")))
+                        }
+                        "field_expression" => callee
+                            .child(callee.child_count().saturating_sub(1))
+                            .and_then(|child| node_text(child, source))
+                            .map(|name| make_id(&format!("{stem}_{name}"))),
+                        _ => None,
+                    };
+                    if let Some(target_id) = target {
+                        push_edge_with_confidence(
+                            edges,
+                            func_id.to_string(),
+                            target_id,
+                            "calls".to_string(),
+                            source_file,
+                            node.start_position().row + 1,
+                            "EXTRACTED",
+                            1.0,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        for child in all_children(node) {
+            walk_calls(child, func_id, stem, source, edges, source_file);
+        }
+    }
+
+    fn walk<'a>(
+        node: TsNode<'a>,
+        scope_id: &str,
+        stem: &str,
+        file_id: &str,
+        source: &[u8],
+        source_file: &str,
+        nodes: &mut Vec<Node>,
+        edges: &mut Vec<Edge>,
+        seen_ids: &mut HashSet<String>,
+        function_bodies: &mut Vec<(String, TsNode<'a>)>,
+    ) {
+        match node.kind() {
+            "module_definition" => {
+                let name = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "identifier")
+                    .and_then(|child| node_text(child, source));
+                if let Some(name) = name {
+                    let module_id = make_id(&format!("{stem}_{name}"));
+                    let line_no = node.start_position().row + 1;
+                    add_code_node(
+                        nodes,
+                        seen_ids,
+                        module_id.clone(),
+                        name,
+                        source_file,
+                        line_no,
+                    );
+                    push_edge(
+                        edges,
+                        EdgeSpec {
+                            source: file_id.to_string(),
+                            target: module_id.clone(),
+                            relation: "defines".to_string(),
+                            source_file: source_file.to_string(),
+                            line_no,
+                        },
+                    );
+                    for child in all_children(node) {
+                        walk(
+                            child,
+                            &module_id,
+                            stem,
+                            file_id,
+                            source,
+                            source_file,
+                            nodes,
+                            edges,
+                            seen_ids,
+                            function_bodies,
+                        );
+                    }
+                }
+                return;
+            }
+            "struct_definition" => {
+                let type_head = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "type_head");
+                if let Some(type_head) = type_head {
+                    let line_no = node.start_position().row + 1;
+                    if let Some(binary_expr) = all_children(type_head)
+                        .into_iter()
+                        .find(|child| child.kind() == "binary_expression")
+                    {
+                        let identifiers: Vec<TsNode<'_>> = all_children(binary_expr)
+                            .into_iter()
+                            .filter(|child| child.kind() == "identifier")
+                            .collect();
+                        if let Some(first) = identifiers
+                            .first()
+                            .and_then(|child| node_text(*child, source))
+                        {
+                            let struct_id = make_id(&format!("{stem}_{first}"));
+                            add_code_node(
+                                nodes,
+                                seen_ids,
+                                struct_id.clone(),
+                                first,
+                                source_file,
+                                line_no,
+                            );
+                            push_edge(
+                                edges,
+                                EdgeSpec {
+                                    source: scope_id.to_string(),
+                                    target: struct_id.clone(),
+                                    relation: "defines".to_string(),
+                                    source_file: source_file.to_string(),
+                                    line_no,
+                                },
+                            );
+                            if let Some(last) = identifiers
+                                .last()
+                                .and_then(|child| node_text(*child, source))
+                            {
+                                if identifiers.len() >= 2 {
+                                    push_edge(
+                                        edges,
+                                        EdgeSpec {
+                                            source: struct_id,
+                                            target: make_id(&format!("{stem}_{last}")),
+                                            relation: "inherits".to_string(),
+                                            source_file: source_file.to_string(),
+                                            line_no,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                    } else if let Some(name) = all_children(type_head)
+                        .into_iter()
+                        .find(|child| child.kind() == "identifier")
+                        .and_then(|child| node_text(child, source))
+                    {
+                        let struct_id = make_id(&format!("{stem}_{name}"));
+                        add_code_node(
+                            nodes,
+                            seen_ids,
+                            struct_id.clone(),
+                            name,
+                            source_file,
+                            line_no,
+                        );
+                        push_edge(
+                            edges,
+                            EdgeSpec {
+                                source: scope_id.to_string(),
+                                target: struct_id,
+                                relation: "defines".to_string(),
+                                source_file: source_file.to_string(),
+                                line_no,
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+            "abstract_definition" => {
+                if let Some(type_head) = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "type_head")
+                {
+                    if let Some(name) = all_children(type_head)
+                        .into_iter()
+                        .find(|child| child.kind() == "identifier")
+                        .and_then(|child| node_text(child, source))
+                    {
+                        let abs_id = make_id(&format!("{stem}_{name}"));
+                        let line_no = node.start_position().row + 1;
+                        add_code_node(nodes, seen_ids, abs_id.clone(), name, source_file, line_no);
+                        push_edge(
+                            edges,
+                            EdgeSpec {
+                                source: scope_id.to_string(),
+                                target: abs_id,
+                                relation: "defines".to_string(),
+                                source_file: source_file.to_string(),
+                                line_no,
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+            "function_definition" => {
+                if let Some(signature) = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "signature")
+                {
+                    if let Some(func_name) = func_name_from_signature(signature, source) {
+                        let func_id = make_id(&format!("{stem}_{func_name}"));
+                        let line_no = node.start_position().row + 1;
+                        add_code_node(
+                            nodes,
+                            seen_ids,
+                            func_id.clone(),
+                            format!("{func_name}()"),
+                            source_file,
+                            line_no,
+                        );
+                        push_edge(
+                            edges,
+                            EdgeSpec {
+                                source: scope_id.to_string(),
+                                target: func_id.clone(),
+                                relation: "defines".to_string(),
+                                source_file: source_file.to_string(),
+                                line_no,
+                            },
+                        );
+                        function_bodies.push((func_id, node));
+                    }
+                }
+                return;
+            }
+            "assignment" => {
+                if let Some(lhs) = node.child(0) {
+                    if lhs.kind() == "call_expression" {
+                        if let Some(callee) = lhs.child(0) {
+                            if callee.kind() == "identifier" {
+                                if let Some(func_name) = node_text(callee, source) {
+                                    let func_id = make_id(&format!("{stem}_{func_name}"));
+                                    let line_no = node.start_position().row + 1;
+                                    add_code_node(
+                                        nodes,
+                                        seen_ids,
+                                        func_id.clone(),
+                                        format!("{func_name}()"),
+                                        source_file,
+                                        line_no,
+                                    );
+                                    push_edge(
+                                        edges,
+                                        EdgeSpec {
+                                            source: scope_id.to_string(),
+                                            target: func_id.clone(),
+                                            relation: "defines".to_string(),
+                                            source_file: source_file.to_string(),
+                                            line_no,
+                                        },
+                                    );
+                                    if let Some(rhs) =
+                                        node.child(node.child_count().saturating_sub(1))
+                                    {
+                                        function_bodies.push((func_id, rhs));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            "using_statement" | "import_statement" => {
+                let line_no = node.start_position().row + 1;
+                for child in all_children(node) {
+                    match child.kind() {
+                        "identifier" => {
+                            if let Some(name) = node_text(child, source) {
+                                let import_id = make_id(&name);
+                                add_code_node(
+                                    nodes,
+                                    seen_ids,
+                                    import_id.clone(),
+                                    name,
+                                    source_file,
+                                    line_no,
+                                );
+                                push_edge(
+                                    edges,
+                                    EdgeSpec {
+                                        source: scope_id.to_string(),
+                                        target: import_id,
+                                        relation: "imports".to_string(),
+                                        source_file: source_file.to_string(),
+                                        line_no,
+                                    },
+                                );
+                            }
+                        }
+                        "selected_import" => {
+                            let identifiers: Vec<TsNode<'_>> = all_children(child)
+                                .into_iter()
+                                .filter(|sub| sub.kind() == "identifier")
+                                .collect();
+                            if let Some(name) =
+                                identifiers.first().and_then(|sub| node_text(*sub, source))
+                            {
+                                let import_id = make_id(&name);
+                                add_code_node(
+                                    nodes,
+                                    seen_ids,
+                                    import_id.clone(),
+                                    name,
+                                    source_file,
+                                    line_no,
+                                );
+                                push_edge(
+                                    edges,
+                                    EdgeSpec {
+                                        source: scope_id.to_string(),
+                                        target: import_id,
+                                        relation: "imports".to_string(),
+                                        source_file: source_file.to_string(),
+                                        line_no,
+                                    },
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        for child in all_children(node) {
+            walk(
+                child,
+                scope_id,
+                stem,
+                file_id,
+                source,
+                source_file,
+                nodes,
+                edges,
+                seen_ids,
+                function_bodies,
+            );
+        }
+    }
+
+    walk(
+        root,
+        &file_id,
+        stem,
+        &file_id,
+        &source,
+        &source_file,
+        &mut extraction.nodes,
+        &mut extraction.edges,
+        &mut seen_ids,
+        &mut function_bodies,
+    );
+
+    for (func_id, body_node) in function_bodies {
+        if body_node.kind() == "function_definition" {
+            for child in all_children(body_node) {
+                if child.kind() != "signature" {
+                    walk_calls(
+                        child,
+                        &func_id,
+                        stem,
+                        &source,
+                        &mut extraction.edges,
+                        &source_file,
+                    );
+                }
+            }
+        } else {
+            walk_calls(
+                body_node,
+                &func_id,
+                stem,
+                &source,
+                &mut extraction.edges,
+                &source_file,
+            );
+        }
+    }
+
+    Ok(extraction)
+}
+
+fn extract_zig_file(path: &Path) -> Result<Extraction> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_zig::LANGUAGE.into())
+        .map_err(|err| {
+            anyhow!(
+                "Failed to set parser language for {}: {err}",
+                path.display()
+            )
+        })?;
+    let source =
+        fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
+    let root = tree.root_node();
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+    let (mut extraction, mut seen_ids, file_id, source_file) = new_file_extraction(path);
+    let mut function_bodies: Vec<(String, TsNode<'_>)> = Vec::new();
+
+    fn extract_import(
+        node: TsNode<'_>,
+        file_id: &str,
+        source: &[u8],
+        source_file: &str,
+        edges: &mut Vec<Edge>,
+    ) {
+        for child in all_children(node) {
+            match child.kind() {
+                "builtin_function" => {
+                    let mut builtin = None;
+                    let mut arguments = None;
+                    for sub in all_children(child) {
+                        match sub.kind() {
+                            "builtin_identifier" => builtin = node_text(sub, source),
+                            "arguments" => arguments = Some(sub),
+                            _ => {}
+                        }
+                    }
+                    if matches!(builtin.as_deref(), Some("@import" | "@cImport")) {
+                        if let Some(arguments) = arguments {
+                            for arg in all_children(arguments) {
+                                if !matches!(arg.kind(), "string_literal" | "string") {
+                                    continue;
+                                }
+                                if let Some(raw) = node_text(arg, source) {
+                                    let module = raw
+                                        .trim_matches('"')
+                                        .split('/')
+                                        .next_back()
+                                        .unwrap_or(raw.as_str())
+                                        .split('.')
+                                        .next()
+                                        .unwrap_or(raw.as_str());
+                                    if !module.is_empty() {
+                                        push_edge(
+                                            edges,
+                                            EdgeSpec {
+                                                source: file_id.to_string(),
+                                                target: make_id(module),
+                                                relation: "imports_from".to_string(),
+                                                source_file: source_file.to_string(),
+                                                line_no: node.start_position().row + 1,
+                                            },
+                                        );
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                "field_expression" => {
+                    extract_import(child, file_id, source, source_file, edges);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn walk_calls(
+        node: TsNode<'_>,
+        caller_id: &str,
+        source: &[u8],
+        nodes: &[Node],
+        edges: &mut Vec<Edge>,
+        source_file: &str,
+        seen_pairs: &mut HashSet<(String, String)>,
+    ) {
+        if node.kind() == "function_declaration" {
+            return;
+        }
+        if node.kind() == "call_expression" {
+            if let Some(function_node) = node.child_by_field_name("function") {
+                if let Some(callee) = node_text(function_node, source) {
+                    let callee = callee.split('.').next_back().unwrap_or(callee.as_str());
+                    let target = nodes.iter().find_map(|node| {
+                        (node.label == format!("{callee}()")
+                            || node.label == format!(".{callee}()"))
+                        .then(|| node.id.clone())
+                    });
+                    if let Some(target_id) = target {
+                        let pair = (caller_id.to_string(), target_id.clone());
+                        if caller_id != target_id && seen_pairs.insert(pair.clone()) {
+                            push_edge_with_confidence(
+                                edges,
+                                pair.0,
+                                pair.1,
+                                "calls".to_string(),
+                                source_file,
+                                node.start_position().row + 1,
+                                "EXTRACTED",
+                                1.0,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for child in all_children(node) {
+            walk_calls(
+                child,
+                caller_id,
+                source,
+                nodes,
+                edges,
+                source_file,
+                seen_pairs,
+            );
+        }
+    }
+
+    fn walk<'a>(
+        node: TsNode<'a>,
+        parent_struct_id: Option<&str>,
+        stem: &str,
+        file_id: &str,
+        source: &[u8],
+        source_file: &str,
+        nodes: &mut Vec<Node>,
+        edges: &mut Vec<Edge>,
+        seen_ids: &mut HashSet<String>,
+        function_bodies: &mut Vec<(String, TsNode<'a>)>,
+    ) {
+        match node.kind() {
+            "function_declaration" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|child| node_text(child, source))
+                {
+                    let line_no = node.start_position().row + 1;
+                    let (func_id, label, relation, source_id) =
+                        if let Some(parent) = parent_struct_id {
+                            (
+                                make_id(&format!("{parent}_{name}")),
+                                format!(".{name}()"),
+                                "method".to_string(),
+                                parent.to_string(),
+                            )
+                        } else {
+                            (
+                                make_id(&format!("{stem}_{name}")),
+                                format!("{name}()"),
+                                "contains".to_string(),
+                                file_id.to_string(),
+                            )
+                        };
+                    add_code_node(
+                        nodes,
+                        seen_ids,
+                        func_id.clone(),
+                        label,
+                        source_file,
+                        line_no,
+                    );
+                    push_edge(
+                        edges,
+                        EdgeSpec {
+                            source: source_id,
+                            target: func_id.clone(),
+                            relation,
+                            source_file: source_file.to_string(),
+                            line_no,
+                        },
+                    );
+                    if let Some(body) = node.child_by_field_name("body") {
+                        function_bodies.push((func_id, body));
+                    }
+                }
+                return;
+            }
+            "variable_declaration" => {
+                let mut name_node = None;
+                let mut value_node = None;
+                for child in all_children(node) {
+                    match child.kind() {
+                        "identifier" => name_node = Some(child),
+                        "struct_declaration" | "enum_declaration" | "union_declaration"
+                        | "builtin_function" | "field_expression" => value_node = Some(child),
+                        _ => {}
+                    }
+                }
+
+                if let Some(value_node) = value_node {
+                    match value_node.kind() {
+                        "struct_declaration" => {
+                            if let Some(name) = name_node.and_then(|child| node_text(child, source))
+                            {
+                                let line_no = node.start_position().row + 1;
+                                let struct_id = make_id(&format!("{stem}_{name}"));
+                                add_code_node(
+                                    nodes,
+                                    seen_ids,
+                                    struct_id.clone(),
+                                    name,
+                                    source_file,
+                                    line_no,
+                                );
+                                push_edge(
+                                    edges,
+                                    EdgeSpec {
+                                        source: file_id.to_string(),
+                                        target: struct_id.clone(),
+                                        relation: "contains".to_string(),
+                                        source_file: source_file.to_string(),
+                                        line_no,
+                                    },
+                                );
+                                for child in all_children(value_node) {
+                                    walk(
+                                        child,
+                                        Some(&struct_id),
+                                        stem,
+                                        file_id,
+                                        source,
+                                        source_file,
+                                        nodes,
+                                        edges,
+                                        seen_ids,
+                                        function_bodies,
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                        "enum_declaration" | "union_declaration" => {
+                            if let Some(name) = name_node.and_then(|child| node_text(child, source))
+                            {
+                                let line_no = node.start_position().row + 1;
+                                let type_id = make_id(&format!("{stem}_{name}"));
+                                add_code_node(
+                                    nodes,
+                                    seen_ids,
+                                    type_id.clone(),
+                                    name,
+                                    source_file,
+                                    line_no,
+                                );
+                                push_edge(
+                                    edges,
+                                    EdgeSpec {
+                                        source: file_id.to_string(),
+                                        target: type_id,
+                                        relation: "contains".to_string(),
+                                        source_file: source_file.to_string(),
+                                        line_no,
+                                    },
+                                );
+                            }
+                            return;
+                        }
+                        "builtin_function" | "field_expression" => {
+                            extract_import(node, file_id, source, source_file, edges);
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        for child in all_children(node) {
+            walk(
+                child,
+                parent_struct_id,
+                stem,
+                file_id,
+                source,
+                source_file,
+                nodes,
+                edges,
+                seen_ids,
+                function_bodies,
+            );
+        }
+    }
+
+    walk(
+        root,
+        None,
+        stem,
+        &file_id,
+        &source,
+        &source_file,
+        &mut extraction.nodes,
+        &mut extraction.edges,
+        &mut seen_ids,
+        &mut function_bodies,
+    );
+
+    let mut seen_pairs = HashSet::new();
+    let nodes_snapshot = extraction.nodes.clone();
+    for (caller_id, body) in function_bodies {
+        walk_calls(
+            body,
+            &caller_id,
+            &source,
+            &nodes_snapshot,
+            &mut extraction.edges,
+            &source_file,
+            &mut seen_pairs,
+        );
+    }
+
+    extraction.edges.retain(|edge| {
+        seen_ids.contains(&edge.source)
+            && (seen_ids.contains(&edge.target) || edge.relation == "imports_from")
+    });
+    Ok(extraction)
+}
+
+fn extract_powershell_file(path: &Path) -> Result<Extraction> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_powershell::LANGUAGE.into())
+        .map_err(|err| {
+            anyhow!(
+                "Failed to set parser language for {}: {err}",
+                path.display()
+            )
+        })?;
+    let source =
+        fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
+    let root = tree.root_node();
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+    let (mut extraction, mut seen_ids, file_id, source_file) = new_file_extraction(path);
+    let mut function_bodies: Vec<(String, TsNode<'_>)> = Vec::new();
+    let skip_keywords: HashSet<&str> = HashSet::from([
+        "using", "return", "if", "else", "elseif", "foreach", "for", "while", "do", "switch",
+        "try", "catch", "finally", "throw", "break", "continue", "exit", "param", "begin",
+        "process", "end",
+    ]);
+
+    fn find_script_block_body(node: TsNode<'_>) -> Option<TsNode<'_>> {
+        for child in all_children(node) {
+            if child.kind() == "script_block" {
+                for sub in all_children(child) {
+                    if sub.kind() == "script_block_body" {
+                        return Some(sub);
+                    }
+                }
+                return Some(child);
+            }
+        }
+        None
+    }
+
+    fn walk_calls(
+        node: TsNode<'_>,
+        caller_id: &str,
+        source: &[u8],
+        label_to_id: &HashMap<String, String>,
+        skip_keywords: &HashSet<&str>,
+        edges: &mut Vec<Edge>,
+        source_file: &str,
+        seen_pairs: &mut HashSet<(String, String)>,
+    ) {
+        if matches!(node.kind(), "function_statement" | "class_statement") {
+            return;
+        }
+        if node.kind() == "command" {
+            let command_name = all_children(node)
+                .into_iter()
+                .find(|child| child.kind() == "command_name")
+                .and_then(|child| node_text(child, source));
+            if let Some(command_name) = command_name {
+                let lowered = command_name.to_lowercase();
+                if !skip_keywords.contains(lowered.as_str()) {
+                    if let Some(target_id) = label_to_id.get(&lowered) {
+                        let pair = (caller_id.to_string(), target_id.clone());
+                        if caller_id != target_id && seen_pairs.insert(pair.clone()) {
+                            push_edge_with_confidence(
+                                edges,
+                                pair.0,
+                                pair.1,
+                                "calls".to_string(),
+                                source_file,
+                                node.start_position().row + 1,
+                                "EXTRACTED",
+                                1.0,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for child in all_children(node) {
+            walk_calls(
+                child,
+                caller_id,
+                source,
+                label_to_id,
+                skip_keywords,
+                edges,
+                source_file,
+                seen_pairs,
+            );
+        }
+    }
+
+    fn walk<'a>(
+        node: TsNode<'a>,
+        parent_class_id: Option<&str>,
+        stem: &str,
+        file_id: &str,
+        source: &[u8],
+        source_file: &str,
+        nodes: &mut Vec<Node>,
+        edges: &mut Vec<Edge>,
+        seen_ids: &mut HashSet<String>,
+        function_bodies: &mut Vec<(String, TsNode<'a>)>,
+    ) {
+        match node.kind() {
+            "function_statement" => {
+                if let Some(name) = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "function_name")
+                    .and_then(|child| node_text(child, source))
+                {
+                    let line_no = node.start_position().row + 1;
+                    let func_id = make_id(&format!("{stem}_{name}"));
+                    add_code_node(
+                        nodes,
+                        seen_ids,
+                        func_id.clone(),
+                        format!("{name}()"),
+                        source_file,
+                        line_no,
+                    );
+                    push_edge(
+                        edges,
+                        EdgeSpec {
+                            source: file_id.to_string(),
+                            target: func_id.clone(),
+                            relation: "contains".to_string(),
+                            source_file: source_file.to_string(),
+                            line_no,
+                        },
+                    );
+                    if let Some(body) = find_script_block_body(node) {
+                        function_bodies.push((func_id, body));
+                    }
+                }
+                return;
+            }
+            "class_statement" => {
+                if let Some(name) = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "simple_name")
+                    .and_then(|child| node_text(child, source))
+                {
+                    let line_no = node.start_position().row + 1;
+                    let class_id = make_id(&format!("{stem}_{name}"));
+                    add_code_node(
+                        nodes,
+                        seen_ids,
+                        class_id.clone(),
+                        name,
+                        source_file,
+                        line_no,
+                    );
+                    push_edge(
+                        edges,
+                        EdgeSpec {
+                            source: file_id.to_string(),
+                            target: class_id.clone(),
+                            relation: "contains".to_string(),
+                            source_file: source_file.to_string(),
+                            line_no,
+                        },
+                    );
+                    for child in all_children(node) {
+                        walk(
+                            child,
+                            Some(&class_id),
+                            stem,
+                            file_id,
+                            source,
+                            source_file,
+                            nodes,
+                            edges,
+                            seen_ids,
+                            function_bodies,
+                        );
+                    }
+                }
+                return;
+            }
+            "class_method_definition" => {
+                if let Some(name) = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "simple_name")
+                    .and_then(|child| node_text(child, source))
+                {
+                    let line_no = node.start_position().row + 1;
+                    let (method_id, label, relation, source_id) =
+                        if let Some(parent) = parent_class_id {
+                            (
+                                make_id(&format!("{parent}_{name}")),
+                                format!(".{name}()"),
+                                "method".to_string(),
+                                parent.to_string(),
+                            )
+                        } else {
+                            (
+                                make_id(&format!("{stem}_{name}")),
+                                format!("{name}()"),
+                                "contains".to_string(),
+                                file_id.to_string(),
+                            )
+                        };
+                    add_code_node(
+                        nodes,
+                        seen_ids,
+                        method_id.clone(),
+                        label,
+                        source_file,
+                        line_no,
+                    );
+                    push_edge(
+                        edges,
+                        EdgeSpec {
+                            source: source_id,
+                            target: method_id.clone(),
+                            relation,
+                            source_file: source_file.to_string(),
+                            line_no,
+                        },
+                    );
+                    if let Some(body) = find_script_block_body(node) {
+                        function_bodies.push((method_id, body));
+                    }
+                }
+                return;
+            }
+            "command" => {
+                let command_name = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "command_name")
+                    .and_then(|child| node_text(child, source));
+                if command_name.as_deref() == Some("using") {
+                    let mut tokens = Vec::new();
+                    for child in all_children(node) {
+                        if child.kind() != "command_elements" {
+                            continue;
+                        }
+                        for element in all_children(child) {
+                            if element.kind() == "generic_token" {
+                                if let Some(token) = node_text(element, source) {
+                                    tokens.push(token);
+                                }
+                            }
+                        }
+                    }
+                    let module_tokens: Vec<String> = tokens
+                        .into_iter()
+                        .filter(|token| {
+                            !matches!(
+                                token.to_lowercase().as_str(),
+                                "namespace" | "module" | "assembly"
+                            )
+                        })
+                        .collect();
+                    if let Some(module) = module_tokens.last() {
+                        let module = module.split('.').next_back().unwrap_or(module.as_str());
+                        push_edge(
+                            edges,
+                            EdgeSpec {
+                                source: file_id.to_string(),
+                                target: make_id(module),
+                                relation: "imports_from".to_string(),
+                                source_file: source_file.to_string(),
+                                line_no: node.start_position().row + 1,
+                            },
+                        );
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        for child in all_children(node) {
+            walk(
+                child,
+                parent_class_id,
+                stem,
+                file_id,
+                source,
+                source_file,
+                nodes,
+                edges,
+                seen_ids,
+                function_bodies,
+            );
+        }
+    }
+
+    walk(
+        root,
+        None,
+        stem,
+        &file_id,
+        &source,
+        &source_file,
+        &mut extraction.nodes,
+        &mut extraction.edges,
+        &mut seen_ids,
+        &mut function_bodies,
+    );
+
+    let label_to_id = build_label_index(&extraction.nodes);
+    let mut seen_pairs = HashSet::new();
+    for (caller_id, body) in function_bodies {
+        walk_calls(
+            body,
+            &caller_id,
+            &source,
+            &label_to_id,
+            &skip_keywords,
+            &mut extraction.edges,
+            &source_file,
+            &mut seen_pairs,
+        );
+    }
+
+    extraction.edges.retain(|edge| {
+        seen_ids.contains(&edge.source)
+            && (seen_ids.contains(&edge.target) || edge.relation == "imports_from")
+    });
+    Ok(extraction)
+}
+
+fn extract_objc_file(path: &Path) -> Result<Extraction> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_objc::LANGUAGE.into())
+        .map_err(|err| {
+            anyhow!(
+                "Failed to set parser language for {}: {err}",
+                path.display()
+            )
+        })?;
+    let source =
+        fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
+    let root = tree.root_node();
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+    let (mut extraction, mut seen_ids, file_id, source_file) = new_file_extraction(path);
+    let mut method_bodies: Vec<(String, TsNode<'_>)> = Vec::new();
+
+    fn walk_calls(
+        node: TsNode<'_>,
+        caller_id: &str,
+        source: &[u8],
+        source_file: &str,
+        method_ids: &HashSet<String>,
+        edges: &mut Vec<Edge>,
+        seen_calls: &mut HashSet<(String, String)>,
+    ) {
+        if node.kind() == "message_expression" {
+            for child in all_children(node) {
+                if !matches!(child.kind(), "selector" | "keyword_argument_list") {
+                    continue;
+                }
+                let mut selector_parts = Vec::new();
+                if child.kind() == "selector" {
+                    if let Some(selector) = node_text(child, source) {
+                        selector_parts.push(selector);
+                    }
+                } else {
+                    for sub in all_children(child) {
+                        if sub.kind() != "keyword_argument" {
+                            continue;
+                        }
+                        for selector in all_children(sub) {
+                            if selector.kind() == "selector" {
+                                if let Some(part) = node_text(selector, source) {
+                                    selector_parts.push(part);
+                                }
+                            }
+                        }
+                    }
+                }
+                let method_name = selector_parts.join("");
+                if method_name.is_empty() {
+                    continue;
+                }
+                let suffix = make_id(&method_name);
+                for candidate in method_ids {
+                    if candidate.ends_with(suffix.trim_start_matches('_')) {
+                        let pair = (caller_id.to_string(), candidate.clone());
+                        if caller_id != candidate && seen_calls.insert(pair.clone()) {
+                            push_edge_with_confidence(
+                                edges,
+                                pair.0,
+                                pair.1,
+                                "calls".to_string(),
+                                source_file,
+                                node.start_position().row + 1,
+                                "EXTRACTED",
+                                1.0,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        for child in all_children(node) {
+            walk_calls(
+                child,
+                caller_id,
+                source,
+                source_file,
+                method_ids,
+                edges,
+                seen_calls,
+            );
+        }
+    }
+
+    fn walk<'a>(
+        node: TsNode<'a>,
+        parent_id: Option<&str>,
+        stem: &str,
+        file_id: &str,
+        source: &[u8],
+        source_file: &str,
+        nodes: &mut Vec<Node>,
+        edges: &mut Vec<Edge>,
+        seen_ids: &mut HashSet<String>,
+        method_bodies: &mut Vec<(String, TsNode<'a>)>,
+    ) {
+        let line_no = node.start_position().row + 1;
+        match node.kind() {
+            "preproc_include" => {
+                for child in all_children(node) {
+                    match child.kind() {
+                        "system_lib_string" => {
+                            if let Some(raw) = node_text(child, source) {
+                                let module = raw
+                                    .trim_matches('<')
+                                    .trim_matches('>')
+                                    .split('/')
+                                    .next_back()
+                                    .unwrap_or(raw.as_str())
+                                    .replace(".h", "");
+                                if !module.is_empty() {
+                                    push_edge(
+                                        edges,
+                                        EdgeSpec {
+                                            source: file_id.to_string(),
+                                            target: make_id(&module),
+                                            relation: "imports".to_string(),
+                                            source_file: source_file.to_string(),
+                                            line_no,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        "string_literal" => {
+                            for sub in all_children(child) {
+                                if sub.kind() != "string_content" {
+                                    continue;
+                                }
+                                if let Some(raw) = node_text(sub, source) {
+                                    let module = raw
+                                        .split('/')
+                                        .next_back()
+                                        .unwrap_or(raw.as_str())
+                                        .replace(".h", "");
+                                    if !module.is_empty() {
+                                        push_edge(
+                                            edges,
+                                            EdgeSpec {
+                                                source: file_id.to_string(),
+                                                target: make_id(&module),
+                                                relation: "imports".to_string(),
+                                                source_file: source_file.to_string(),
+                                                line_no,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            "class_interface" => {
+                let identifiers: Vec<TsNode<'_>> = all_children(node)
+                    .into_iter()
+                    .filter(|child| child.kind() == "identifier")
+                    .collect();
+                if identifiers.is_empty() {
+                    for child in all_children(node) {
+                        walk(
+                            child,
+                            parent_id,
+                            stem,
+                            file_id,
+                            source,
+                            source_file,
+                            nodes,
+                            edges,
+                            seen_ids,
+                            method_bodies,
+                        );
+                    }
+                    return;
+                }
+                let Some(name) = node_text(identifiers[0], source) else {
+                    return;
+                };
+                let class_id = make_id(&format!("{stem}_{name}"));
+                add_code_node(
+                    nodes,
+                    seen_ids,
+                    class_id.clone(),
+                    name,
+                    source_file,
+                    line_no,
+                );
+                push_edge(
+                    edges,
+                    EdgeSpec {
+                        source: file_id.to_string(),
+                        target: class_id.clone(),
+                        relation: "contains".to_string(),
+                        source_file: source_file.to_string(),
+                        line_no,
+                    },
+                );
+                let mut colon_seen = false;
+                for child in all_children(node) {
+                    match child.kind() {
+                        ":" => colon_seen = true,
+                        "identifier" if colon_seen => {
+                            if let Some(super_name) = node_text(child, source) {
+                                push_edge(
+                                    edges,
+                                    EdgeSpec {
+                                        source: class_id.clone(),
+                                        target: make_id(&super_name),
+                                        relation: "inherits".to_string(),
+                                        source_file: source_file.to_string(),
+                                        line_no,
+                                    },
+                                );
+                            }
+                            colon_seen = false;
+                        }
+                        "parameterized_arguments" => {
+                            for sub in all_children(child) {
+                                if sub.kind() != "type_name" {
+                                    continue;
+                                }
+                                for ty in all_children(sub) {
+                                    if ty.kind() == "type_identifier" {
+                                        if let Some(proto_name) = node_text(ty, source) {
+                                            push_edge(
+                                                edges,
+                                                EdgeSpec {
+                                                    source: class_id.clone(),
+                                                    target: make_id(&proto_name),
+                                                    relation: "imports".to_string(),
+                                                    source_file: source_file.to_string(),
+                                                    line_no,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "method_declaration" => {
+                            walk(
+                                child,
+                                Some(&class_id),
+                                stem,
+                                file_id,
+                                source,
+                                source_file,
+                                nodes,
+                                edges,
+                                seen_ids,
+                                method_bodies,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            "class_implementation" => {
+                let name = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "identifier")
+                    .and_then(|child| node_text(child, source));
+                let Some(name) = name else {
+                    for child in all_children(node) {
+                        walk(
+                            child,
+                            parent_id,
+                            stem,
+                            file_id,
+                            source,
+                            source_file,
+                            nodes,
+                            edges,
+                            seen_ids,
+                            method_bodies,
+                        );
+                    }
+                    return;
+                };
+                let impl_id = make_id(&format!("{stem}_{name}"));
+                if !seen_ids.contains(&impl_id) {
+                    add_code_node(nodes, seen_ids, impl_id.clone(), name, source_file, line_no);
+                    push_edge(
+                        edges,
+                        EdgeSpec {
+                            source: file_id.to_string(),
+                            target: impl_id.clone(),
+                            relation: "contains".to_string(),
+                            source_file: source_file.to_string(),
+                            line_no,
+                        },
+                    );
+                }
+                for child in all_children(node) {
+                    if child.kind() == "implementation_definition" {
+                        for sub in all_children(child) {
+                            walk(
+                                sub,
+                                Some(&impl_id),
+                                stem,
+                                file_id,
+                                source,
+                                source_file,
+                                nodes,
+                                edges,
+                                seen_ids,
+                                method_bodies,
+                            );
+                        }
+                    }
+                }
+                return;
+            }
+            "protocol_declaration" => {
+                if let Some(name) = all_children(node)
+                    .into_iter()
+                    .find(|child| child.kind() == "identifier")
+                    .and_then(|child| node_text(child, source))
+                {
+                    let proto_id = make_id(&format!("{stem}_{name}"));
+                    add_code_node(
+                        nodes,
+                        seen_ids,
+                        proto_id.clone(),
+                        format!("<{name}>"),
+                        source_file,
+                        line_no,
+                    );
+                    push_edge(
+                        edges,
+                        EdgeSpec {
+                            source: file_id.to_string(),
+                            target: proto_id.clone(),
+                            relation: "contains".to_string(),
+                            source_file: source_file.to_string(),
+                            line_no,
+                        },
+                    );
+                    for child in all_children(node) {
+                        walk(
+                            child,
+                            Some(&proto_id),
+                            stem,
+                            file_id,
+                            source,
+                            source_file,
+                            nodes,
+                            edges,
+                            seen_ids,
+                            method_bodies,
+                        );
+                    }
+                }
+                return;
+            }
+            "method_declaration" | "method_definition" => {
+                let container = parent_id.unwrap_or(file_id);
+                let mut parts = Vec::new();
+                for child in all_children(node) {
+                    if child.kind() == "identifier" {
+                        if let Some(part) = node_text(child, source) {
+                            parts.push(part);
+                        }
+                    }
+                }
+                let method_name = parts.join("");
+                if method_name.is_empty() {
+                    return;
+                }
+                let method_id = make_id(&format!("{container}_{method_name}"));
+                add_code_node(
+                    nodes,
+                    seen_ids,
+                    method_id.clone(),
+                    format!("-{method_name}"),
+                    source_file,
+                    line_no,
+                );
+                push_edge(
+                    edges,
+                    EdgeSpec {
+                        source: container.to_string(),
+                        target: method_id.clone(),
+                        relation: "method".to_string(),
+                        source_file: source_file.to_string(),
+                        line_no,
+                    },
+                );
+                if node.kind() == "method_definition" {
+                    method_bodies.push((method_id, node));
+                }
+                return;
+            }
+            _ => {}
+        }
+
+        for child in all_children(node) {
+            walk(
+                child,
+                parent_id,
+                stem,
+                file_id,
+                source,
+                source_file,
+                nodes,
+                edges,
+                seen_ids,
+                method_bodies,
+            );
+        }
+    }
+
+    walk(
+        root,
+        None,
+        stem,
+        &file_id,
+        &source,
+        &source_file,
+        &mut extraction.nodes,
+        &mut extraction.edges,
+        &mut seen_ids,
+        &mut method_bodies,
+    );
+
+    let method_ids: HashSet<String> = extraction
+        .nodes
+        .iter()
+        .filter(|node| node.id != file_id)
+        .map(|node| node.id.clone())
+        .collect();
+    let mut seen_calls = HashSet::new();
+    for (caller_id, body) in method_bodies {
+        walk_calls(
+            body,
+            &caller_id,
+            &source,
+            &source_file,
+            &method_ids,
+            &mut extraction.edges,
+            &mut seen_calls,
+        );
+    }
+
+    Ok(extraction)
+}
+
+fn extract_elixir_file(path: &Path) -> Result<Extraction> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_elixir::LANGUAGE.into())
+        .map_err(|err| {
+            anyhow!(
+                "Failed to set parser language for {}: {err}",
+                path.display()
+            )
+        })?;
+    let source =
+        fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
+    let root = tree.root_node();
+
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+    let (mut extraction, mut seen_ids, file_id, source_file) = new_file_extraction(path);
+    let mut function_bodies: Vec<(String, TsNode<'_>)> = Vec::new();
+    let import_keywords: HashSet<&str> = HashSet::from(["alias", "import", "require", "use"]);
+    let skip_keywords: HashSet<&str> = HashSet::from([
+        "def",
+        "defp",
+        "defmodule",
+        "defmacro",
+        "defmacrop",
+        "defstruct",
+        "defprotocol",
+        "defimpl",
+        "defguard",
+        "alias",
+        "import",
+        "require",
+        "use",
+        "if",
+        "unless",
+        "case",
+        "cond",
+        "with",
+        "for",
+    ]);
+
+    fn alias_text(node: TsNode<'_>, source: &[u8]) -> Option<String> {
+        all_children(node)
+            .into_iter()
+            .find(|child| child.kind() == "alias")
+            .and_then(|child| node_text(child, source))
+    }
+
+    fn walk_calls(
+        node: TsNode<'_>,
+        caller_id: &str,
+        source: &[u8],
+        label_to_id: &HashMap<String, String>,
+        skip_keywords: &HashSet<&str>,
+        edges: &mut Vec<Edge>,
+        source_file: &str,
+        seen_pairs: &mut HashSet<(String, String)>,
+    ) {
+        if node.kind() != "call" {
+            for child in all_children(node) {
+                walk_calls(
+                    child,
+                    caller_id,
+                    source,
+                    label_to_id,
+                    skip_keywords,
+                    edges,
+                    source_file,
+                    seen_pairs,
+                );
+            }
+            return;
+        }
+
+        for child in all_children(node) {
+            if child.kind() == "identifier" {
+                if let Some(keyword) = node_text(child, source) {
+                    if skip_keywords.contains(keyword.as_str()) {
+                        for nested in all_children(node) {
+                            walk_calls(
+                                nested,
+                                caller_id,
+                                source,
+                                label_to_id,
+                                skip_keywords,
+                                edges,
+                                source_file,
+                                seen_pairs,
+                            );
+                        }
+                        return;
+                    }
+                    break;
+                }
+            }
+        }
+
+        let mut callee_name = None;
+        for child in all_children(node) {
+            match child.kind() {
+                "dot" => {
+                    if let Some(dot_text) = node_text(child, source) {
+                        let parts: Vec<&str> = dot_text.trim_end_matches('.').split('.').collect();
+                        if let Some(last) = parts.last() {
+                            callee_name = Some((*last).to_string());
+                        }
+                    }
+                    break;
+                }
+                "identifier" => {
+                    callee_name = node_text(child, source);
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(callee_name) = callee_name {
+            if let Some(target_id) = label_to_id.get(&callee_name.to_lowercase()) {
+                let pair = (caller_id.to_string(), target_id.clone());
+                if caller_id != target_id && seen_pairs.insert(pair.clone()) {
+                    push_edge_with_confidence(
+                        edges,
+                        pair.0,
+                        pair.1,
+                        "calls".to_string(),
+                        source_file,
+                        node.start_position().row + 1,
+                        "EXTRACTED",
+                        1.0,
+                    );
+                }
+            }
+        }
+
+        for child in all_children(node) {
+            walk_calls(
+                child,
+                caller_id,
+                source,
+                label_to_id,
+                skip_keywords,
+                edges,
+                source_file,
+                seen_pairs,
+            );
+        }
+    }
+
+    fn walk<'a>(
+        node: TsNode<'a>,
+        parent_module_id: Option<&str>,
+        stem: &str,
+        file_id: &str,
+        source: &[u8],
+        source_file: &str,
+        import_keywords: &HashSet<&str>,
+        nodes: &mut Vec<Node>,
+        edges: &mut Vec<Edge>,
+        seen_ids: &mut HashSet<String>,
+        function_bodies: &mut Vec<(String, TsNode<'a>)>,
+    ) {
+        if node.kind() != "call" {
+            for child in all_children(node) {
+                walk(
+                    child,
+                    parent_module_id,
+                    stem,
+                    file_id,
+                    source,
+                    source_file,
+                    import_keywords,
+                    nodes,
+                    edges,
+                    seen_ids,
+                    function_bodies,
+                );
+            }
+            return;
+        }
+
+        let mut identifier_node = None;
+        let mut arguments_node = None;
+        let mut do_block_node = None;
+        for child in all_children(node) {
+            match child.kind() {
+                "identifier" => identifier_node = Some(child),
+                "arguments" => arguments_node = Some(child),
+                "do_block" => do_block_node = Some(child),
+                _ => {}
+            }
+        }
+
+        let Some(identifier_node) = identifier_node else {
+            for child in all_children(node) {
+                walk(
+                    child,
+                    parent_module_id,
+                    stem,
+                    file_id,
+                    source,
+                    source_file,
+                    import_keywords,
+                    nodes,
+                    edges,
+                    seen_ids,
+                    function_bodies,
+                );
+            }
+            return;
+        };
+
+        let Some(keyword) = node_text(identifier_node, source) else {
+            return;
+        };
+        let line_no = node.start_position().row + 1;
+
+        if keyword == "defmodule" {
+            let module_name = arguments_node.and_then(|node| alias_text(node, source));
+            if let Some(module_name) = module_name {
+                let module_id = make_id(&format!("{stem}_{module_name}"));
+                add_code_node(
+                    nodes,
+                    seen_ids,
+                    module_id.clone(),
+                    module_name,
+                    source_file,
+                    line_no,
+                );
+                push_edge(
+                    edges,
+                    EdgeSpec {
+                        source: file_id.to_string(),
+                        target: module_id.clone(),
+                        relation: "contains".to_string(),
+                        source_file: source_file.to_string(),
+                        line_no,
+                    },
+                );
+                if let Some(do_block) = do_block_node {
+                    for child in all_children(do_block) {
+                        walk(
+                            child,
+                            Some(&module_id),
+                            stem,
+                            file_id,
+                            source,
+                            source_file,
+                            import_keywords,
+                            nodes,
+                            edges,
+                            seen_ids,
+                            function_bodies,
+                        );
+                    }
+                }
+            }
+            return;
+        }
+
+        if matches!(keyword.as_str(), "def" | "defp") {
+            let mut func_name = None;
+            if let Some(arguments) = arguments_node {
+                for child in all_children(arguments) {
+                    match child.kind() {
+                        "call" => {
+                            for sub in all_children(child) {
+                                if sub.kind() == "identifier" {
+                                    func_name = node_text(sub, source);
+                                    break;
+                                }
+                            }
+                        }
+                        "identifier" => {
+                            func_name = node_text(child, source);
+                        }
+                        _ => {}
+                    }
+                    if func_name.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some(func_name) = func_name {
+                let container = parent_module_id.unwrap_or(file_id);
+                let func_id = make_id(&format!("{container}_{func_name}"));
+                add_code_node(
+                    nodes,
+                    seen_ids,
+                    func_id.clone(),
+                    format!("{func_name}()"),
+                    source_file,
+                    line_no,
+                );
+                push_edge(
+                    edges,
+                    EdgeSpec {
+                        source: container.to_string(),
+                        target: func_id.clone(),
+                        relation: if parent_module_id.is_some() {
+                            "method".to_string()
+                        } else {
+                            "contains".to_string()
+                        },
+                        source_file: source_file.to_string(),
+                        line_no,
+                    },
+                );
+                if let Some(do_block) = do_block_node {
+                    function_bodies.push((func_id, do_block));
+                }
+            }
+            return;
+        }
+
+        if import_keywords.contains(keyword.as_str()) {
+            if let Some(arguments) = arguments_node {
+                if let Some(module_name) = alias_text(arguments, source) {
+                    push_edge(
+                        edges,
+                        EdgeSpec {
+                            source: file_id.to_string(),
+                            target: make_id(&module_name),
+                            relation: "imports".to_string(),
+                            source_file: source_file.to_string(),
+                            line_no,
+                        },
+                    );
+                }
+            }
+            return;
+        }
+
+        for child in all_children(node) {
+            walk(
+                child,
+                parent_module_id,
+                stem,
+                file_id,
+                source,
+                source_file,
+                import_keywords,
+                nodes,
+                edges,
+                seen_ids,
+                function_bodies,
+            );
+        }
+    }
+
+    walk(
+        root,
+        None,
+        stem,
+        &file_id,
+        &source,
+        &source_file,
+        &import_keywords,
+        &mut extraction.nodes,
+        &mut extraction.edges,
+        &mut seen_ids,
+        &mut function_bodies,
+    );
+
+    let label_to_id = build_label_index(&extraction.nodes);
+    let mut seen_pairs = HashSet::new();
+    for (caller_id, body) in function_bodies {
+        walk_calls(
+            body,
+            &caller_id,
+            &source,
+            &label_to_id,
+            &skip_keywords,
+            &mut extraction.edges,
+            &source_file,
+            &mut seen_pairs,
+        );
+    }
+
+    extraction.edges.retain(|edge| {
+        seen_ids.contains(&edge.source)
+            && (seen_ids.contains(&edge.target) || edge.relation == "imports")
+    });
+    Ok(extraction)
+}
+
+fn extract_swift_file(path: &Path) -> Result<Extraction> {
+    let mut extraction = extract_generic(path, &swift_cfg())?;
+    let source =
+        fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_swift::LANGUAGE.into())
+        .map_err(|err| {
+            anyhow!(
+                "Failed to set parser language for {}: {err}",
+                path.display()
+            )
+        })?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
+    let root = tree.root_node();
+    let source_file = path.to_string_lossy().to_string();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+
+    let mut seen_ids: HashSet<String> = extraction
+        .nodes
+        .iter()
+        .map(|node| node.id.clone())
+        .collect();
+    let mut seen_edges: HashSet<(String, String, String, Option<String>)> =
+        extraction.edges.iter().map(edge_signature).collect();
+    let extension_re =
+        Regex::new(r"extension\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*([A-Za-z0-9_,\s]+))?")
+            .map_err(|err| anyhow!("Failed to compile Swift extension regex: {err}"))?;
+
+    fn find_swift_name(node: TsNode<'_>, source: &[u8]) -> Option<String> {
+        node.child_by_field_name("name")
+            .and_then(|child| node_text(child, source))
+            .or_else(|| {
+                all_children(node)
+                    .into_iter()
+                    .find(|child| {
+                        matches!(
+                            child.kind(),
+                            "simple_identifier" | "type_identifier" | "user_type" | "identifier"
+                        )
+                    })
+                    .and_then(|child| node_text(child, source))
+            })
+    }
+
+    fn insert_edge_once(
+        edges: &mut Vec<Edge>,
+        seen_edges: &mut HashSet<(String, String, String, Option<String>)>,
+        edge: Edge,
+    ) {
+        if seen_edges.insert(edge_signature(&edge)) {
+            edges.push(edge);
+        }
+    }
+
+    fn walk(
+        node: TsNode<'_>,
+        parent_type_id: Option<&str>,
+        stem: &str,
+        source: &[u8],
+        source_file: &str,
+        extension_re: &Regex,
+        nodes: &mut Vec<Node>,
+        edges: &mut Vec<Edge>,
+        seen_ids: &mut HashSet<String>,
+        seen_edges: &mut HashSet<(String, String, String, Option<String>)>,
+    ) {
+        match node.kind() {
+            "class_declaration"
+            | "protocol_declaration"
+            | "struct_declaration"
+            | "enum_declaration"
+            | "actor_declaration" => {
+                if let Some(type_name) = find_swift_name(node, source) {
+                    let line_no = node.start_position().row + 1;
+                    let type_id = make_id(&format!("{stem}_{type_name}"));
+                    add_code_node(
+                        nodes,
+                        seen_ids,
+                        type_id.clone(),
+                        type_name,
+                        source_file,
+                        line_no,
+                    );
+                    for child in all_children(node) {
+                        walk(
+                            child,
+                            Some(&type_id),
+                            stem,
+                            source,
+                            source_file,
+                            extension_re,
+                            nodes,
+                            edges,
+                            seen_ids,
+                            seen_edges,
+                        );
+                    }
+                    return;
+                }
+            }
+            "extension_declaration" => {
+                if let Some(raw) = node_text(node, source) {
+                    if let Some(caps) = extension_re.captures(&raw) {
+                        let type_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                        if !type_name.is_empty() {
+                            let line_no = node.start_position().row + 1;
+                            let type_id = make_id(&format!("{stem}_{type_name}"));
+                            add_code_node(
+                                nodes,
+                                seen_ids,
+                                type_id.clone(),
+                                type_name.to_string(),
+                                source_file,
+                                line_no,
+                            );
+                            if let Some(conformance) = caps.get(2) {
+                                for base in conformance
+                                    .as_str()
+                                    .split(',')
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                {
+                                    let edge = Edge {
+                                        source: type_id.clone(),
+                                        target: make_id(&format!("{stem}_{base}")),
+                                        relation: "inherits".to_string(),
+                                        confidence: "EXTRACTED".to_string(),
+                                        source_file: source_file.to_string(),
+                                        original_source: None,
+                                        original_target: None,
+                                        source_location: Some(format!("L{line_no}")),
+                                        confidence_score: Some(1.0),
+                                        confidence_score_present: true,
+                                        weight: 1.0,
+                                        extra: Default::default(),
+                                    };
+                                    insert_edge_once(edges, seen_edges, edge);
+                                }
+                            }
+                            for child in all_children(node) {
+                                walk(
+                                    child,
+                                    Some(&type_id),
+                                    stem,
+                                    source,
+                                    source_file,
+                                    extension_re,
+                                    nodes,
+                                    edges,
+                                    seen_ids,
+                                    seen_edges,
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            "enum_entry" => {
+                if let Some(parent_type_id) = parent_type_id {
+                    let line_no = node.start_position().row + 1;
+                    for child in all_children(node) {
+                        if child.kind() == "simple_identifier" {
+                            if let Some(case_name) = node_text(child, source) {
+                                let case_id = make_id(&format!("{parent_type_id}_{case_name}"));
+                                add_code_node(
+                                    nodes,
+                                    seen_ids,
+                                    case_id.clone(),
+                                    case_name,
+                                    source_file,
+                                    line_no,
+                                );
+                                let edge = Edge {
+                                    source: parent_type_id.to_string(),
+                                    target: case_id,
+                                    relation: "case_of".to_string(),
+                                    confidence: "EXTRACTED".to_string(),
+                                    source_file: source_file.to_string(),
+                                    original_source: None,
+                                    original_target: None,
+                                    source_location: Some(format!("L{line_no}")),
+                                    confidence_score: Some(1.0),
+                                    confidence_score_present: true,
+                                    weight: 1.0,
+                                    extra: Default::default(),
+                                };
+                                insert_edge_once(edges, seen_edges, edge);
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+            "deinit_declaration" | "subscript_declaration" => {
+                if let Some(parent_type_id) = parent_type_id {
+                    let line_no = node.start_position().row + 1;
+                    let func_name = if node.kind() == "deinit_declaration" {
+                        "deinit".to_string()
+                    } else {
+                        "subscript".to_string()
+                    };
+                    let func_id = make_id(&format!("{parent_type_id}_{func_name}"));
+                    add_code_node(
+                        nodes,
+                        seen_ids,
+                        func_id.clone(),
+                        format!(".{func_name}()"),
+                        source_file,
+                        line_no,
+                    );
+                    let edge = Edge {
+                        source: parent_type_id.to_string(),
+                        target: func_id,
+                        relation: "method".to_string(),
+                        confidence: "EXTRACTED".to_string(),
+                        source_file: source_file.to_string(),
+                        original_source: None,
+                        original_target: None,
+                        source_location: Some(format!("L{line_no}")),
+                        confidence_score: Some(1.0),
+                        confidence_score_present: true,
+                        weight: 1.0,
+                        extra: Default::default(),
+                    };
+                    insert_edge_once(edges, seen_edges, edge);
+                    return;
+                }
+            }
+            "function_declaration" => {
+                if let Some(parent_type_id) = parent_type_id {
+                    if let Some(func_name) = find_swift_name(node, source) {
+                        let line_no = node.start_position().row + 1;
+                        let func_id = make_id(&format!("{parent_type_id}_{func_name}"));
+                        add_code_node(
+                            nodes,
+                            seen_ids,
+                            func_id.clone(),
+                            format!(".{func_name}()"),
+                            source_file,
+                            line_no,
+                        );
+                        let edge = Edge {
+                            source: parent_type_id.to_string(),
+                            target: func_id,
+                            relation: "method".to_string(),
+                            confidence: "EXTRACTED".to_string(),
+                            source_file: source_file.to_string(),
+                            original_source: None,
+                            original_target: None,
+                            source_location: Some(format!("L{line_no}")),
+                            confidence_score: Some(1.0),
+                            confidence_score_present: true,
+                            weight: 1.0,
+                            extra: Default::default(),
+                        };
+                        insert_edge_once(edges, seen_edges, edge);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        for child in all_children(node) {
+            walk(
+                child,
+                parent_type_id,
+                stem,
+                source,
+                source_file,
+                extension_re,
+                nodes,
+                edges,
+                seen_ids,
+                seen_edges,
+            );
+        }
+    }
+
+    walk(
+        root,
+        None,
+        stem,
+        &source,
+        &source_file,
+        &extension_re,
+        &mut extraction.nodes,
+        &mut extraction.edges,
+        &mut seen_ids,
+        &mut seen_edges,
+    );
+
+    let invalid_ids: HashSet<String> = extraction
+        .nodes
+        .iter()
+        .filter(|node| node.label == ".String?()" || node.label == "String?()")
+        .map(|node| node.id.clone())
+        .collect();
+    if !invalid_ids.is_empty() {
+        extraction
+            .nodes
+            .retain(|node| !invalid_ids.contains(&node.id));
+        extraction.edges.retain(|edge| {
+            !invalid_ids.contains(&edge.source) && !invalid_ids.contains(&edge.target)
+        });
+    }
+
+    Ok(extraction)
+}
+
+fn extract_php_file(path: &Path) -> Result<Extraction> {
+    let mut extraction = extract_generic(path, &php_cfg())?;
+    let source =
+        fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?;
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+        .map_err(|err| {
+            anyhow!(
+                "Failed to set parser language for {}: {err}",
+                path.display()
+            )
+        })?;
+    let tree = parser
+        .parse(&source, None)
+        .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
+    let root = tree.root_node();
+    let source_file = path.to_string_lossy().to_string();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("module");
+    let label_to_id = build_label_index(&extraction.nodes);
+    let mut seen_edges: HashSet<(String, String, String, Option<String>)> =
+        extraction.edges.iter().map(edge_signature).collect();
+    let mut seen_relation_pairs: HashSet<(String, String, String)> = HashSet::new();
+
+    let config_call_re = Regex::new(r#"config\s*\(\s*['"]([^'"]+)['"]"#)
+        .map_err(|err| anyhow!("Failed to compile PHP config regex: {err}"))?;
+    let static_prop_re = Regex::new(r#"([A-Za-z_\\][A-Za-z0-9_\\]*)::\$[A-Za-z_][A-Za-z0-9_]*"#)
+        .map_err(|err| anyhow!("Failed to compile PHP static property regex: {err}"))?;
+    let bind_re = Regex::new(
+        r#"->(?:bind|singleton|scoped|instance)\s*\(\s*([A-Za-z_\\][A-Za-z0-9_\\]*)::class\s*,\s*([A-Za-z_\\][A-Za-z0-9_\\]*)::class"#,
+    )
+    .map_err(|err| anyhow!("Failed to compile PHP bind regex: {err}"))?;
+    let listen_entry_re = Regex::new(r#"(?s)([A-Za-z_\\][A-Za-z0-9_\\]*)::class\s*=>\s*\[(.*?)\]"#)
+        .map_err(|err| anyhow!("Failed to compile PHP listener entry regex: {err}"))?;
+    let class_const_re = Regex::new(r#"([A-Za-z_\\][A-Za-z0-9_\\]*)::class"#)
+        .map_err(|err| anyhow!("Failed to compile PHP class constant regex: {err}"))?;
+    let const_access_re =
+        Regex::new(r#"([A-Za-z_\\][A-Za-z0-9_\\]*)::([A-Za-z_][A-Za-z0-9_]*)"#)
+            .map_err(|err| anyhow!("Failed to compile PHP constant access regex: {err}"))?;
+
+    fn insert_edge_once(
+        edges: &mut Vec<Edge>,
+        seen_edges: &mut HashSet<(String, String, String, Option<String>)>,
+        edge: Edge,
+    ) {
+        if seen_edges.insert(edge_signature(&edge)) {
+            edges.push(edge);
+        }
+    }
+
+    fn scan_php_body(
+        body: TsNode<'_>,
+        caller_id: &str,
+        source: &[u8],
+        source_file: &str,
+        label_to_id: &HashMap<String, String>,
+        edges: &mut Vec<Edge>,
+        seen_edges: &mut HashSet<(String, String, String, Option<String>)>,
+        seen_relation_pairs: &mut HashSet<(String, String, String)>,
+        config_call_re: &Regex,
+        static_prop_re: &Regex,
+        bind_re: &Regex,
+        const_access_re: &Regex,
+    ) {
+        let Ok(text) = body.utf8_text(source) else {
+            return;
+        };
+        let start_line = body.start_position().row + 1;
+
+        for captures in config_call_re.captures_iter(text) {
+            let Some(full) = captures.get(0) else {
+                continue;
+            };
+            let Some(key) = captures.get(1) else {
+                continue;
+            };
+            let segment = key
+                .as_str()
+                .split('.')
+                .next()
+                .unwrap_or(key.as_str())
+                .to_lowercase();
+            let Some(target_id) = label_to_id
+                .get(&segment)
+                .or_else(|| label_to_id.get(&format!("{segment}.php")))
+            else {
+                continue;
+            };
+            if target_id == caller_id {
+                continue;
+            }
+            let line_no = line_no_from_offset(text, start_line, full.start());
+            insert_edge_once(
+                edges,
+                seen_edges,
+                Edge {
+                    source: caller_id.to_string(),
+                    target: target_id.clone(),
+                    relation: "uses_config".to_string(),
+                    confidence: "EXTRACTED".to_string(),
+                    source_file: source_file.to_string(),
+                    original_source: None,
+                    original_target: None,
+                    source_location: Some(format!("L{line_no}")),
+                    confidence_score: Some(1.0),
+                    confidence_score_present: true,
+                    weight: 1.0,
+                    extra: Default::default(),
+                },
+            );
+        }
+
+        for captures in static_prop_re.captures_iter(text) {
+            let Some(full) = captures.get(0) else {
+                continue;
+            };
+            let Some(class_name) = captures.get(1) else {
+                continue;
+            };
+            let key = php_basename(class_name.as_str()).to_lowercase();
+            let Some(target_id) = label_to_id.get(&key) else {
+                continue;
+            };
+            if target_id == caller_id {
+                continue;
+            }
+            let pair = (
+                caller_id.to_string(),
+                target_id.clone(),
+                "uses_static_prop".to_string(),
+            );
+            if !seen_relation_pairs.insert(pair) {
+                continue;
+            }
+            let line_no = line_no_from_offset(text, start_line, full.start());
+            insert_edge_once(
+                edges,
+                seen_edges,
+                Edge {
+                    source: caller_id.to_string(),
+                    target: target_id.clone(),
+                    relation: "uses_static_prop".to_string(),
+                    confidence: "EXTRACTED".to_string(),
+                    source_file: source_file.to_string(),
+                    original_source: None,
+                    original_target: None,
+                    source_location: Some(format!("L{line_no}")),
+                    confidence_score: Some(1.0),
+                    confidence_score_present: true,
+                    weight: 1.0,
+                    extra: Default::default(),
+                },
+            );
+        }
+
+        for captures in bind_re.captures_iter(text) {
+            let Some(full) = captures.get(0) else {
+                continue;
+            };
+            let Some(contract_name) = captures.get(1) else {
+                continue;
+            };
+            let Some(impl_name) = captures.get(2) else {
+                continue;
+            };
+            let contract_key = php_basename(contract_name.as_str()).to_lowercase();
+            let impl_key = php_basename(impl_name.as_str()).to_lowercase();
+            let (Some(contract_id), Some(impl_id)) =
+                (label_to_id.get(&contract_key), label_to_id.get(&impl_key))
+            else {
+                continue;
+            };
+            if contract_id == impl_id {
+                continue;
+            }
+            let pair = (contract_id.clone(), impl_id.clone(), "bound_to".to_string());
+            if !seen_relation_pairs.insert(pair) {
+                continue;
+            }
+            let line_no = line_no_from_offset(text, start_line, full.start());
+            insert_edge_once(
+                edges,
+                seen_edges,
+                Edge {
+                    source: contract_id.clone(),
+                    target: impl_id.clone(),
+                    relation: "bound_to".to_string(),
+                    confidence: "EXTRACTED".to_string(),
+                    source_file: source_file.to_string(),
+                    original_source: None,
+                    original_target: None,
+                    source_location: Some(format!("L{line_no}")),
+                    confidence_score: Some(1.0),
+                    confidence_score_present: true,
+                    weight: 1.0,
+                    extra: Default::default(),
+                },
+            );
+        }
+
+        for captures in const_access_re.captures_iter(text) {
+            let Some(full) = captures.get(0) else {
+                continue;
+            };
+            let Some(class_name) = captures.get(1) else {
+                continue;
+            };
+            let key = php_basename(class_name.as_str()).to_lowercase();
+            let Some(target_id) = label_to_id.get(&key) else {
+                continue;
+            };
+            if target_id == caller_id {
+                continue;
+            }
+            let pair = (
+                caller_id.to_string(),
+                target_id.clone(),
+                "references_constant".to_string(),
+            );
+            if !seen_relation_pairs.insert(pair) {
+                continue;
+            }
+            let line_no = line_no_from_offset(text, start_line, full.start());
+            insert_edge_once(
+                edges,
+                seen_edges,
+                Edge {
+                    source: caller_id.to_string(),
+                    target: target_id.clone(),
+                    relation: "references_constant".to_string(),
+                    confidence: "EXTRACTED".to_string(),
+                    source_file: source_file.to_string(),
+                    original_source: None,
+                    original_target: None,
+                    source_location: Some(format!("L{line_no}")),
+                    confidence_score: Some(1.0),
+                    confidence_score_present: true,
+                    weight: 1.0,
+                    extra: Default::default(),
+                },
+            );
+        }
+    }
+
+    fn scan_php_listeners(
+        node: TsNode<'_>,
+        source: &[u8],
+        source_file: &str,
+        label_to_id: &HashMap<String, String>,
+        edges: &mut Vec<Edge>,
+        seen_edges: &mut HashSet<(String, String, String, Option<String>)>,
+        listen_entry_re: &Regex,
+        class_const_re: &Regex,
+    ) {
+        let Ok(text) = node.utf8_text(source) else {
+            return;
+        };
+        if !(text.contains("$listen") || text.contains("$subscribe")) {
+            return;
+        }
+        let start_line = node.start_position().row + 1;
+
+        for captures in listen_entry_re.captures_iter(text) {
+            let Some(event_name) = captures.get(1) else {
+                continue;
+            };
+            let Some(listener_block) = captures.get(2) else {
+                continue;
+            };
+            let event_key = php_basename(event_name.as_str()).to_lowercase();
+            let Some(event_id) = label_to_id.get(&event_key) else {
+                continue;
+            };
+            for listener_cap in class_const_re.captures_iter(listener_block.as_str()) {
+                let Some(listener_name) = listener_cap.get(1) else {
+                    continue;
+                };
+                let listener_key = php_basename(listener_name.as_str()).to_lowercase();
+                let Some(listener_id) = label_to_id.get(&listener_key) else {
+                    continue;
+                };
+                if listener_id == event_id {
+                    continue;
+                }
+                let Some(listener_match) = listener_cap.get(0) else {
+                    continue;
+                };
+                let absolute_offset = listener_block.start() + listener_match.start();
+                let line_no = line_no_from_offset(text, start_line, absolute_offset);
+                insert_edge_once(
+                    edges,
+                    seen_edges,
+                    Edge {
+                        source: event_id.clone(),
+                        target: listener_id.clone(),
+                        relation: "listened_by".to_string(),
+                        confidence: "EXTRACTED".to_string(),
+                        source_file: source_file.to_string(),
+                        original_source: None,
+                        original_target: None,
+                        source_location: Some(format!("L{line_no}")),
+                        confidence_score: Some(1.0),
+                        confidence_score_present: true,
+                        weight: 1.0,
+                        extra: Default::default(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn walk(
+        node: TsNode<'_>,
+        parent_class_id: Option<&str>,
+        stem: &str,
+        source: &[u8],
+        source_file: &str,
+        label_to_id: &HashMap<String, String>,
+        edges: &mut Vec<Edge>,
+        seen_edges: &mut HashSet<(String, String, String, Option<String>)>,
+        seen_relation_pairs: &mut HashSet<(String, String, String)>,
+        config_call_re: &Regex,
+        static_prop_re: &Regex,
+        bind_re: &Regex,
+        const_access_re: &Regex,
+        listen_entry_re: &Regex,
+        class_const_re: &Regex,
+    ) {
+        match node.kind() {
+            "class_declaration" => {
+                if let Some(class_name) = resolve_name(node, source, &php_cfg()) {
+                    let class_id = make_id(&format!("{stem}_{class_name}"));
+                    for child in all_children(node) {
+                        walk(
+                            child,
+                            Some(&class_id),
+                            stem,
+                            source,
+                            source_file,
+                            label_to_id,
+                            edges,
+                            seen_edges,
+                            seen_relation_pairs,
+                            config_call_re,
+                            static_prop_re,
+                            bind_re,
+                            const_access_re,
+                            listen_entry_re,
+                            class_const_re,
+                        );
+                    }
+                    return;
+                }
+            }
+            "method_declaration" | "function_definition" => {
+                if let Some(func_name) = resolve_name(node, source, &php_cfg()) {
+                    let caller_id = if let Some(parent_class_id) = parent_class_id {
+                        make_id(&format!("{parent_class_id}_{func_name}"))
+                    } else {
+                        make_id(&format!("{stem}_{func_name}"))
+                    };
+                    if let Some(body) = find_body(node, &php_cfg()) {
+                        scan_php_body(
+                            body,
+                            &caller_id,
+                            source,
+                            source_file,
+                            label_to_id,
+                            edges,
+                            seen_edges,
+                            seen_relation_pairs,
+                            config_call_re,
+                            static_prop_re,
+                            bind_re,
+                            const_access_re,
+                        );
+                    }
+                    return;
+                }
+            }
+            "property_declaration" => {
+                scan_php_listeners(
+                    node,
+                    source,
+                    source_file,
+                    label_to_id,
+                    edges,
+                    seen_edges,
+                    listen_entry_re,
+                    class_const_re,
+                );
+            }
+            _ => {}
+        }
+
+        for child in all_children(node) {
+            walk(
+                child,
+                parent_class_id,
+                stem,
+                source,
+                source_file,
+                label_to_id,
+                edges,
+                seen_edges,
+                seen_relation_pairs,
+                config_call_re,
+                static_prop_re,
+                bind_re,
+                const_access_re,
+                listen_entry_re,
+                class_const_re,
+            );
+        }
+    }
+
+    walk(
+        root,
+        None,
+        stem,
+        &source,
+        &source_file,
+        &label_to_id,
+        &mut extraction.edges,
+        &mut seen_edges,
+        &mut seen_relation_pairs,
+        &config_call_re,
+        &static_prop_re,
+        &bind_re,
+        &const_access_re,
+        &listen_entry_re,
+        &class_const_re,
+    );
+
+    Ok(extraction)
+}
+
 // ── Text document extraction ──────────────────────────────────────────────────
 
 fn extract_text_document(path: &Path) -> Result<Extraction> {
@@ -2596,14 +5716,18 @@ mod tests {
         let result = extract_paths(&[path.to_string_lossy().to_string()]).unwrap();
         let text_node = result.nodes.iter().find(|node| node.label == "text()");
         assert!(text_node.is_some());
-        assert!(result
-            .edges
-            .iter()
-            .any(|edge| edge.relation == "contains" && edge.target == "sample_text"));
-        assert!(result
-            .edges
-            .iter()
-            .all(|edge| !(edge.relation == "method" && edge.target == "sample_text")));
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|edge| edge.relation == "contains" && edge.target == "sample_text")
+        );
+        assert!(
+            result
+                .edges
+                .iter()
+                .all(|edge| !(edge.relation == "method" && edge.target == "sample_text"))
+        );
     }
 
     #[test]
@@ -2691,21 +5815,13 @@ def normalize(value):
             models_path.to_string_lossy().to_string(),
         ];
         let result = extract_paths(&paths).unwrap();
-        let models_file_id = result
-            .nodes
-            .iter()
-            .find(|node| {
-                node.node_type.as_deref() == Some("file")
-                    && node.source_file == models_path.to_string_lossy()
-            })
-            .map(|node| node.id.clone())
-            .unwrap();
+        let models_module_id = make_id("models");
 
         assert!(
             result
                 .edges
                 .iter()
-                .any(|edge| edge.relation == "imports_from" && edge.target == models_file_id)
+                .any(|edge| edge.relation == "imports_from" && edge.target == models_module_id)
         );
         assert!(result.edges.iter().any(|edge| {
             edge.relation == "uses" && edge.confidence == "INFERRED" && edge.weight == 0.8
@@ -2713,7 +5829,96 @@ def normalize(value):
     }
 
     #[test]
-    fn extracts_python_plain_import_edges_to_file_nodes() {
+    fn infers_python_cross_file_uses_from_rationale_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("auth.py");
+        let models_path = dir.path().join("models.py");
+        fs::write(&models_path, "class Response:\n    pass\n").unwrap();
+        fs::write(
+            &auth_path,
+            "\"\"\"Authentication handlers describe how requests use shared response models.\"\"\"\nfrom models import Response\n\nclass DigestAuth:\n    \"\"\"Digest auth relies on the shared response model for challenge handling.\"\"\"\n    pass\n",
+        )
+        .unwrap();
+
+        let paths = vec![
+            auth_path.to_string_lossy().to_string(),
+            models_path.to_string_lossy().to_string(),
+        ];
+        let result = extract_paths(&paths).unwrap();
+        let response_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "Response")
+            .map(|node| node.id.clone())
+            .unwrap();
+        let rationale_ids: HashSet<String> = result
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.source_file == auth_path.to_string_lossy() && node.file_type == "rationale"
+            })
+            .map(|node| node.id.clone())
+            .collect();
+
+        assert!(!rationale_ids.is_empty());
+        assert!(result.edges.iter().any(|edge| {
+            rationale_ids.contains(&edge.source)
+                && edge.target == response_id
+                && edge.relation == "uses"
+                && edge.confidence == "INFERRED"
+        }));
+    }
+
+    #[test]
+    fn extracts_python_inheritance_to_external_placeholder_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.py");
+        fs::write(&path, "class BasicAuth(Auth):\n    pass\n").unwrap();
+
+        let result = extract_paths(&[path.to_string_lossy().to_string()]).unwrap();
+        let basic_auth_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "BasicAuth")
+            .map(|node| node.id.clone())
+            .unwrap();
+        let auth_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "Auth" && node.source_file.is_empty())
+            .map(|node| node.id.clone())
+            .unwrap();
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.source == basic_auth_id
+                && edge.target == auth_id
+                && edge.relation == "inherits"
+                && edge.confidence == "EXTRACTED"
+        }));
+    }
+
+    #[test]
+    fn ignores_python_dotted_superclasses_like_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("security.py");
+        fs::write(
+            &path,
+            "class Handler(urllib.request.HTTPRedirectHandler):\n    pass\n",
+        )
+        .unwrap();
+
+        let result = extract_paths(&[path.to_string_lossy().to_string()]).unwrap();
+        assert!(!result.edges.iter().any(|edge| edge.relation == "inherits"));
+        assert!(
+            !result
+                .nodes
+                .iter()
+                .any(|node| node.label == "HTTPRedirectHandler" && node.source_file.is_empty())
+        );
+    }
+
+    #[test]
+    fn extracts_python_plain_import_edges_to_module_nodes() {
         let dir = tempfile::tempdir().unwrap();
         let auth_path = dir.path().join("auth.py");
         let models_path = dir.path().join("models.py");
@@ -2725,22 +5930,94 @@ def normalize(value):
             models_path.to_string_lossy().to_string(),
         ];
         let result = extract_paths(&paths).unwrap();
-        let models_file_id = result
-            .nodes
-            .iter()
-            .find(|node| {
-                node.node_type.as_deref() == Some("file")
-                    && node.source_file == models_path.to_string_lossy()
-            })
-            .map(|node| node.id.clone())
-            .unwrap();
+        let models_module_id = make_id("models");
 
         assert!(
             result
                 .edges
                 .iter()
-                .any(|edge| edge.relation == "imports" && edge.target == models_file_id)
+                .any(|edge| edge.relation == "imports" && edge.target == models_module_id)
         );
+    }
+
+    #[test]
+    fn extracts_python_aliased_dotted_imports_like_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("security.py");
+        fs::write(
+            &path,
+            "import urllib.error as urllib_error\nimport urllib.request as urllib_request\n",
+        )
+        .unwrap();
+
+        let result = extract_paths(&[path.to_string_lossy().to_string()]).unwrap();
+        assert!(
+            result.edges.iter().any(|edge| {
+                edge.relation == "imports" && edge.target == make_id("urllib.error")
+            })
+        );
+        assert!(result.edges.iter().any(|edge| {
+            edge.relation == "imports" && edge.target == make_id("urllib.request")
+        }));
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|edge| edge.relation == "imports" && edge.target == make_id("urllib"))
+        );
+    }
+
+    #[test]
+    fn infers_cross_file_calls_for_generic_extractors() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller_path = dir.path().join("caller.js");
+        let callee_path = dir.path().join("callee.js");
+        fs::write(
+            &caller_path,
+            r#"
+function start() {
+  return helper();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &callee_path,
+            r#"
+function helper() {
+  return 1;
+}
+"#,
+        )
+        .unwrap();
+
+        let result = extract_paths(&[
+            caller_path.to_string_lossy().to_string(),
+            callee_path.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+
+        let start_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "start()")
+            .map(|node| node.id.clone())
+            .unwrap();
+        let helper_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "helper()")
+            .map(|node| node.id.clone())
+            .unwrap();
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.source == start_id
+                && edge.target == helper_id
+                && edge.relation == "calls"
+                && edge.confidence == "INFERRED"
+                && edge.confidence_score == Some(0.8)
+        }));
+        assert!(result.raw_calls.is_empty());
     }
 
     #[test]
@@ -2832,6 +6109,137 @@ pub fn run() {
         let labels: Vec<&str> = result.nodes.iter().map(|n| n.label.as_str()).collect();
         assert!(labels.iter().any(|l| *l == "Config"));
         assert!(labels.iter().any(|l| *l == "run()"));
+    }
+
+    #[test]
+    fn extracts_rust_use_declarations_like_python() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rs");
+        fs::write(
+            &path,
+            r#"
+use std::{collections::HashMap, fmt::Debug};
+
+pub fn run() {}
+"#,
+        )
+        .unwrap();
+
+        let result = extract_paths(&[path.to_string_lossy().to_string()]).unwrap();
+        let std_id = make_id("std");
+        let hashmap_id = make_id("HashMap");
+        let debug_id = make_id("Debug");
+
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|edge| edge.relation == "imports_from" && edge.target == std_id)
+        );
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|edge| edge.relation == "imports_from" && edge.target == hashmap_id)
+        );
+        assert!(
+            !result
+                .edges
+                .iter()
+                .any(|edge| edge.relation == "imports_from" && edge.target == debug_id)
+        );
+    }
+
+    #[test]
+    fn extracts_rust_trait_impl_methods_under_implemented_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lib.rs");
+        fs::write(
+            &path,
+            r#"
+trait CreateDirAll {
+    fn mkdir_parents(&self);
+}
+
+struct Path;
+
+impl CreateDirAll for Path {
+    fn mkdir_parents(&self) {}
+}
+"#,
+        )
+        .unwrap();
+
+        let result = extract_paths(&[path.to_string_lossy().to_string()]).unwrap();
+        let path_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "Path")
+            .map(|node| node.id.clone())
+            .unwrap();
+        let mkdir_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == ".mkdir_parents()")
+            .map(|node| node.id.clone())
+            .unwrap();
+
+        assert_eq!(mkdir_id, make_id("lib_path_mkdir_parents"));
+        assert!(result.edges.iter().any(|edge| {
+            edge.source == path_id && edge.target == mkdir_id && edge.relation == "method"
+        }));
+    }
+
+    #[test]
+    fn does_not_infer_cross_file_rust_method_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        let defs = dir.path().join("defs.rs");
+        let main = dir.path().join("main.rs");
+        fs::write(
+            &defs,
+            r#"
+pub struct DetectFileType;
+
+impl DetectFileType {
+    pub fn as_str(&self) -> &str {
+        "rs"
+    }
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &main,
+            r#"
+pub fn build() {
+    let kind = "rs";
+    let _ = kind.as_str();
+}
+"#,
+        )
+        .unwrap();
+
+        let result = extract_paths(&[
+            defs.to_string_lossy().to_string(),
+            main.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        let build_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "build()")
+            .map(|node| node.id.clone())
+            .unwrap();
+        let as_str_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == ".as_str()" && node.source_file == defs.to_string_lossy())
+            .map(|node| node.id.clone())
+            .unwrap();
+
+        assert!(!result.edges.iter().any(|edge| {
+            edge.source == build_id && edge.target == as_str_id && edge.relation == "calls"
+        }));
     }
 
     #[test]
@@ -2994,6 +6402,48 @@ fun createClient(baseUrl: String): HttpClient {
         assert!(labels.iter().any(|l| *l == "createClient()"));
         assert!(!result.edges.iter().any(|edge| edge.relation == "imports"));
         assert!(!result.edges.iter().any(|edge| edge.relation == "calls"));
+    }
+
+    #[test]
+    fn extracts_php_constant_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.php");
+        fs::write(
+            &path,
+            r#"<?php
+class Config {
+    const VERSION = '1.0';
+}
+
+class App {
+    public function boot() {
+        return Config::VERSION;
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let result = extract_paths(&[path.to_string_lossy().to_string()]).unwrap();
+        let config_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "Config")
+            .map(|node| node.id.clone())
+            .unwrap();
+        let boot_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == ".boot()")
+            .map(|node| node.id.clone())
+            .unwrap();
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.source == boot_id
+                && edge.target == config_id
+                && edge.relation == "references_constant"
+                && edge.confidence == "EXTRACTED"
+        }));
     }
 
     #[test]

@@ -7,7 +7,6 @@ use std::{
 };
 
 use crate::schema::{Edge, Node};
-
 // ── Graph building ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -24,7 +23,60 @@ pub struct Graph {
     pub output_tokens: u32,
 }
 
-/// Merge multiple extraction dicts into one, deduplicating nodes by ID.
+fn normalize_graph(mut graph: Graph) -> Graph {
+    let node_ids: Vec<String> = graph.nodes.iter().map(|node| node.id.clone()).collect();
+    let node_index: HashMap<String, usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| (node.id.clone(), idx))
+        .collect();
+    let mut pair_to_pos: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut normalized_edges: Vec<Edge> = Vec::new();
+
+    for mut edge in graph.edges.drain(..) {
+        let Some(&src) = node_index.get(edge.source.as_str()) else {
+            continue;
+        };
+        let Some(&tgt) = node_index.get(edge.target.as_str()) else {
+            continue;
+        };
+        let pair = if src <= tgt { (src, tgt) } else { (tgt, src) };
+        edge.source = node_ids[pair.0].clone();
+        edge.target = node_ids[pair.1].clone();
+        if edge.original_source.is_none() {
+            edge.original_source = Some(node_ids[src].clone());
+        }
+        if edge.original_target.is_none() {
+            edge.original_target = Some(node_ids[tgt].clone());
+        }
+
+        if let Some(&pos) = pair_to_pos.get(&pair) {
+            normalized_edges[pos] = edge;
+        } else {
+            pair_to_pos.insert(pair, normalized_edges.len());
+            normalized_edges.push(edge);
+        }
+    }
+
+    normalized_edges.sort_by_key(|edge| {
+        (
+            node_index
+                .get(edge.source.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            node_index
+                .get(edge.target.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+        )
+    });
+
+    graph.edges = normalized_edges;
+    graph
+}
+
+/// Merge multiple extraction dicts into one, deduplicating nodes by ID and edges by undirected pair.
 pub fn merge_extractions(extractions: &[serde_json::Value]) -> Graph {
     let mut nodes: Vec<Node> = Vec::new();
     let mut node_positions: HashMap<String, usize> = HashMap::new();
@@ -68,19 +120,29 @@ pub fn merge_extractions(extractions: &[serde_json::Value]) -> Graph {
             .unwrap_or(0) as u32;
     }
 
-    let node_ids: HashSet<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
-    let edges: Vec<Edge> = all_edges
-        .into_iter()
-        .filter(|e| node_ids.contains(e.source.as_str()) && node_ids.contains(e.target.as_str()))
-        .collect();
-
-    Graph {
+    normalize_graph(Graph {
         nodes,
-        edges,
+        edges: all_edges,
         hyperedges,
         neighbor_order: BTreeMap::new(),
         input_tokens,
         output_tokens,
+    })
+}
+
+pub fn coerce_graph(value: &serde_json::Value) -> Result<Graph, serde_json::Error> {
+    match value.as_array() {
+        Some(extractions) => Ok(merge_extractions(extractions)),
+        None => {
+            if value
+                .as_object()
+                .is_some_and(|object| object.contains_key("neighbor_order"))
+            {
+                serde_json::from_value(value.clone()).map(normalize_graph)
+            } else {
+                Ok(merge_extractions(std::slice::from_ref(value)))
+            }
+        }
     }
 }
 
@@ -115,6 +177,9 @@ const LOUVAIN_RESOLUTION: f64 = 1.0;
 const LOUVAIN_THRESHOLD: f64 = 1e-4;
 const LOUVAIN_MAX_LEVEL: usize = 10;
 const LOUVAIN_SEED: u64 = 42;
+const MAX_COMMUNITY_FRACTION: f64 = 0.25;
+const MIN_SPLIT_SIZE: usize = 10;
+const BOUNDARY_REFINEMENT_MAX_DEGREE: usize = 2;
 
 #[derive(Debug, Clone)]
 struct WeightedGraphLevel {
@@ -146,8 +211,6 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
             .collect();
     }
 
-    // Match the Python implementation: cluster each non-isolate connected
-    // component separately, then add isolates back as singleton communities.
     let mut communities: Vec<Vec<String>> = Vec::new();
     let connected_nodes: Vec<usize> = adj
         .iter()
@@ -172,8 +235,7 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
         }
     }
 
-    // Split oversized communities (> 25% of graph, min 10 nodes)
-    let max_size = std::cmp::max(10, (n as f64 * 0.25) as usize);
+    let max_size = std::cmp::max(MIN_SPLIT_SIZE, (n as f64 * MAX_COMMUNITY_FRACTION) as usize);
     let mut final_communities: Vec<Vec<String>> = Vec::new();
 
     for nodes in communities {
@@ -189,9 +251,33 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
         }
     }
 
-    final_communities.iter_mut().for_each(|v| v.sort());
-    final_communities.sort_by_key(|nodes| Reverse(nodes.len()));
-    final_communities.into_iter().enumerate().collect()
+    let mut indexed_communities: Vec<Vec<usize>> = final_communities
+        .into_iter()
+        .map(|nodes| {
+            let mut members: Vec<usize> = nodes
+                .into_iter()
+                .filter_map(|id| node_index.get(id.as_str()).copied())
+                .collect();
+            members.sort_unstable();
+            members
+        })
+        .collect();
+    refine_boundary_nodes(graph, &mut indexed_communities);
+
+    let mut named_communities: Vec<Vec<String>> = indexed_communities
+        .into_iter()
+        .filter(|members| !members.is_empty())
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|idx| graph.nodes[idx].id.clone())
+                .collect()
+        })
+        .collect();
+    named_communities.iter_mut().for_each(|v| v.sort());
+    named_communities
+        .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    named_communities.into_iter().enumerate().collect()
 }
 
 fn weighted_graph_level(graph: &Graph) -> WeightedGraphLevel {
@@ -231,11 +317,9 @@ fn weighted_graph_level(graph: &Graph) -> WeightedGraphLevel {
             continue;
         };
         let pair = if src <= tgt { (src, tgt) } else { (tgt, src) };
-        if seen_pairs.insert(pair) {
-            if src != tgt && graph.neighbor_order.is_empty() {
-                neighbor_order[src].push(tgt);
-                neighbor_order[tgt].push(src);
-            }
+        if seen_pairs.insert(pair) && src != tgt && graph.neighbor_order.is_empty() {
+            neighbor_order[src].push(tgt);
+            neighbor_order[tgt].push(src);
         }
         pair_weights.insert(pair, normalize_weight(edge.weight));
     }
@@ -334,11 +418,9 @@ fn induced_weighted_subgraph(level: &WeightedGraphLevel, nodes: &[usize]) -> Wei
             (local_v, local_u)
         };
         pair_weights.insert(pair, normalize_weight(weight));
-        if seen_pairs.insert(pair) {
-            if local_u != local_v {
-                neighbor_order[local_u].push(local_v);
-                neighbor_order[local_v].push(local_u);
-            }
+        if seen_pairs.insert(pair) && local_u != local_v {
+            neighbor_order[local_u].push(local_v);
+            neighbor_order[local_v].push(local_u);
         }
     }
 
@@ -433,26 +515,24 @@ fn louvain_one_level(
         moves = 0;
         for &node in &order {
             let current_community = node_to_community[node];
-            let weights_to_community =
-                neighbor_community_weights(node, graph, &node_to_community);
+            let weights_to_community = neighbor_community_weights(node, graph, &node_to_community);
             let degree = graph.degrees[node];
             community_degree[current_community] -= degree;
             let current_weight = weights_to_community
                 .iter()
-                .find_map(|(community, weight)| (*community == current_community).then_some(*weight))
+                .find_map(|(community, weight)| {
+                    (*community == current_community).then_some(*weight)
+                })
                 .unwrap_or(0.0);
             let remove_cost = -current_weight / graph.total_weight
-                + LOUVAIN_RESOLUTION
-                    * (community_degree[current_community] * degree)
+                + LOUVAIN_RESOLUTION * (community_degree[current_community] * degree)
                     / (2.0 * graph.total_weight * graph.total_weight);
 
             let mut best_gain = 0.0f64;
             let mut best_community = current_community;
             for (candidate_community, weight) in &weights_to_community {
-                let gain = remove_cost
-                    + weight / graph.total_weight
-                    - LOUVAIN_RESOLUTION
-                        * (community_degree[*candidate_community] * degree)
+                let gain = remove_cost + weight / graph.total_weight
+                    - LOUVAIN_RESOLUTION * (community_degree[*candidate_community] * degree)
                         / (2.0 * graph.total_weight * graph.total_weight);
                 if gain > best_gain {
                     best_gain = gain;
@@ -476,7 +556,14 @@ fn louvain_one_level(
 
     partition.retain(|community| !community.is_empty());
     inner_partition.retain(|community| !community.is_empty());
-    (partition, inner_partition, node_to_community.iter().enumerate().any(|(idx, cid)| *cid != idx))
+    (
+        partition,
+        inner_partition,
+        node_to_community
+            .iter()
+            .enumerate()
+            .any(|(idx, cid)| *cid != idx),
+    )
 }
 
 fn neighbor_community_weights(
@@ -517,8 +604,7 @@ fn modularity(graph: &WeightedGraphLevel, communities: &[HashSet<usize>]) -> f64
             }
         }
         score += intra_weight / graph.total_weight
-            - LOUVAIN_RESOLUTION
-                * (total_degree / (2.0 * graph.total_weight)).powi(2);
+            - LOUVAIN_RESOLUTION * (total_degree / (2.0 * graph.total_weight)).powi(2);
     }
     score
 }
@@ -556,11 +642,9 @@ fn coarse_grain_graph(
         };
         let entry = pair_weights.entry(pair).or_insert(0.0);
         *entry = normalize_weight(*entry + weight);
-        if seen_pairs.insert(pair) {
-            if community_u != community_v {
-                neighbor_order[community_u].push(community_v);
-                neighbor_order[community_v].push(community_u);
-            }
+        if seen_pairs.insert(pair) && community_u != community_v {
+            neighbor_order[community_u].push(community_v);
+            neighbor_order[community_v].push(community_u);
         }
     }
 
@@ -711,13 +795,134 @@ fn split_community(
         .map(|members| {
             let mut community: Vec<String> = members
                 .into_iter()
-                .map(|global_i| weighted.members[global_i].iter().next().copied().unwrap_or(global_i))
-                .map(|global_i| nodes[local_global.iter().position(|&idx| idx == global_i).unwrap()].clone())
+                .map(|global_i| {
+                    weighted.members[global_i]
+                        .iter()
+                        .next()
+                        .copied()
+                        .unwrap_or(global_i)
+                })
+                .map(|global_i| {
+                    nodes[local_global
+                        .iter()
+                        .position(|&idx| idx == global_i)
+                        .unwrap()]
+                    .clone()
+                })
                 .collect();
             community.sort();
             community
         })
         .collect()
+}
+
+fn refine_boundary_nodes(graph: &Graph, communities: &mut [Vec<usize>]) {
+    let (_, adj, edge_lookup) = graph_adjacency(graph);
+    let mut node_to_community = vec![usize::MAX; graph.nodes.len()];
+    for (cid, members) in communities.iter().enumerate() {
+        for &node_idx in members {
+            node_to_community[node_idx] = cid;
+        }
+    }
+
+    for node_idx in 0..graph.nodes.len() {
+        let node = &graph.nodes[node_idx];
+        if adj[node_idx].is_empty()
+            || adj[node_idx].len() > BOUNDARY_REFINEMENT_MAX_DEGREE
+            || node.source_file.is_empty()
+            || node_to_community[node_idx] == usize::MAX
+        {
+            continue;
+        }
+
+        let current_cid = node_to_community[node_idx];
+        let mut weight_by_community: BTreeMap<usize, f64> = BTreeMap::new();
+        for &neighbor_idx in &adj[node_idx] {
+            let neighbor_cid = node_to_community[neighbor_idx];
+            if neighbor_cid == usize::MAX {
+                continue;
+            }
+            let pair = if node_idx <= neighbor_idx {
+                (node_idx, neighbor_idx)
+            } else {
+                (neighbor_idx, node_idx)
+            };
+            let weight = edge_lookup
+                .get(&pair)
+                .map(|edge| normalize_weight(edge.weight))
+                .unwrap_or(1.0);
+            *weight_by_community.entry(neighbor_cid).or_default() += weight;
+        }
+        if weight_by_community.len() < 2 {
+            continue;
+        }
+
+        let best_weight = weight_by_community.values().copied().fold(0.0, f64::max);
+        let tied_communities: Vec<usize> = weight_by_community
+            .iter()
+            .filter_map(|(&cid, &weight)| {
+                ((weight - best_weight).abs() <= f64::EPSILON).then_some(cid)
+            })
+            .collect();
+        if tied_communities.len() < 2 || !tied_communities.contains(&current_cid) {
+            continue;
+        }
+
+        let current_score =
+            boundary_affinity_score(graph, communities, &adj, node_idx, current_cid);
+        let mut best_cid = current_cid;
+        let mut best_score = current_score;
+        for cid in tied_communities {
+            if cid == current_cid {
+                continue;
+            }
+            let candidate_score = boundary_affinity_score(graph, communities, &adj, node_idx, cid);
+            if candidate_score > best_score {
+                best_cid = cid;
+                best_score = candidate_score;
+            }
+        }
+
+        if best_cid != current_cid {
+            communities[current_cid].retain(|&member| member != node_idx);
+            communities[best_cid].push(node_idx);
+            communities[best_cid].sort_unstable();
+            node_to_community[node_idx] = best_cid;
+        }
+    }
+}
+
+fn boundary_affinity_score(
+    graph: &Graph,
+    communities: &[Vec<usize>],
+    adj: &[Vec<usize>],
+    node_idx: usize,
+    candidate_cid: usize,
+) -> (usize, usize, usize) {
+    let node = &graph.nodes[node_idx];
+    let source_file = node.source_file.as_str();
+    let mut same_file_count = 0usize;
+    let mut file_anchor_count = 0usize;
+    let mut direct_neighbor_count = 0usize;
+    let neighbor_set: HashSet<usize> = adj[node_idx].iter().copied().collect();
+
+    for &member_idx in &communities[candidate_cid] {
+        if member_idx == node_idx {
+            continue;
+        }
+        let member = &graph.nodes[member_idx];
+        if member.source_file == source_file {
+            same_file_count += 1;
+            if member.node_type.as_deref() == Some("file") {
+                file_anchor_count += 1;
+            }
+        }
+        if neighbor_set.contains(&member_idx) {
+            direct_neighbor_count += 1;
+        }
+    }
+
+    (file_anchor_count, same_file_count, direct_neighbor_count)
 }
 
 // ── Analysis ──────────────────────────────────────────────────────────────────
@@ -726,7 +931,7 @@ fn split_community(
 pub struct GodNode {
     pub id: String,
     pub label: String,
-    pub edges: usize,
+    pub degree: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -788,12 +993,21 @@ fn is_concept_node(node: &Node) -> bool {
 }
 
 fn compute_degrees(graph: &Graph) -> HashMap<String, usize> {
+    let edges = collapsed_undirected_edges(graph);
+    compute_degrees_from_edges(&edges)
+}
+
+fn compute_degrees_from_edges(edges: &[Edge]) -> HashMap<String, usize> {
     let mut deg: HashMap<String, usize> = HashMap::new();
-    for edge in &graph.edges {
+    for edge in edges {
         *deg.entry(edge.source.clone()).or_default() += 1;
         *deg.entry(edge.target.clone()).or_default() += 1;
     }
     deg
+}
+
+fn collapsed_undirected_edges(graph: &Graph) -> Vec<Edge> {
+    graph.edges.clone()
 }
 
 fn graph_adjacency(
@@ -825,7 +1039,7 @@ fn graph_adjacency(
         let pair = if src < tgt { (src, tgt) } else { (tgt, src) };
         adj_sets[src].insert(tgt);
         adj_sets[tgt].insert(src);
-        edge_map.entry(pair).or_insert(edge);
+        edge_map.insert(pair, edge);
     }
 
     let adjacency = adj_sets
@@ -915,6 +1129,104 @@ fn brandes_centrality(graph: &Graph) -> (Vec<f64>, HashMap<(usize, usize), f64>)
     (node_scores, edge_scores)
 }
 
+fn sampled_source_indices(node_count: usize, sample_count: usize) -> Vec<usize> {
+    if sample_count >= node_count {
+        return (0..node_count).collect();
+    }
+
+    let step = node_count as f64 / sample_count as f64;
+    let mut indices = Vec::with_capacity(sample_count);
+    let mut seen = HashSet::new();
+
+    for sample_idx in 0..sample_count {
+        let mut idx = ((sample_idx as f64 + 0.5) * step).floor() as usize;
+        if idx >= node_count {
+            idx = node_count - 1;
+        }
+        if seen.insert(idx) {
+            indices.push(idx);
+        }
+    }
+
+    if indices.len() < sample_count {
+        for idx in 0..node_count {
+            if seen.insert(idx) {
+                indices.push(idx);
+                if indices.len() >= sample_count {
+                    break;
+                }
+            }
+        }
+    }
+
+    indices
+}
+
+fn brandes_node_centrality_sampled(graph: &Graph, sample_count: usize) -> Vec<f64> {
+    let node_count = graph.nodes.len();
+    if node_count == 0 {
+        return Vec::new();
+    }
+
+    let (_, adjacency, _) = graph_adjacency(graph);
+    let sources = sampled_source_indices(node_count, sample_count.max(1));
+    let mut node_scores = vec![0.0; node_count];
+
+    for &source in &sources {
+        let mut stack: Vec<usize> = Vec::new();
+        let mut predecessors: Vec<Vec<usize>> = vec![Vec::new(); node_count];
+        let mut sigma = vec![0.0; node_count];
+        let mut distance = vec![-1isize; node_count];
+        let mut queue = VecDeque::new();
+
+        sigma[source] = 1.0;
+        distance[source] = 0;
+        queue.push_back(source);
+
+        while let Some(vertex) = queue.pop_front() {
+            stack.push(vertex);
+            for &neighbor in &adjacency[vertex] {
+                if distance[neighbor] < 0 {
+                    queue.push_back(neighbor);
+                    distance[neighbor] = distance[vertex] + 1;
+                }
+                if distance[neighbor] == distance[vertex] + 1 {
+                    sigma[neighbor] += sigma[vertex];
+                    predecessors[neighbor].push(vertex);
+                }
+            }
+        }
+
+        let mut delta = vec![0.0; node_count];
+        while let Some(vertex) = stack.pop() {
+            for &predecessor in &predecessors[vertex] {
+                if sigma[vertex] == 0.0 {
+                    continue;
+                }
+                let contribution = (sigma[predecessor] / sigma[vertex]) * (1.0 + delta[vertex]);
+                delta[predecessor] += contribution;
+            }
+            if vertex != source {
+                node_scores[vertex] += delta[vertex];
+            }
+        }
+    }
+
+    for score in &mut node_scores {
+        *score /= 2.0;
+    }
+
+    let sample_scale = node_count as f64 / sources.len() as f64;
+    if node_count > 2 {
+        let normalization = 2.0 / ((node_count as f64 - 1.0) * (node_count as f64 - 2.0));
+        for score in &mut node_scores {
+            *score *= sample_scale * normalization;
+        }
+    }
+
+    node_scores
+}
+
 pub fn god_nodes(graph: &Graph, top_n: usize) -> Vec<GodNode> {
     let degree = compute_degrees(graph);
     let mut result: Vec<GodNode> = Vec::new();
@@ -930,7 +1242,7 @@ pub fn god_nodes(graph: &Graph, top_n: usize) -> Vec<GodNode> {
         result.push(GodNode {
             id: node.id.clone(),
             label: node.label.clone(),
-            edges: deg,
+            degree: deg,
         });
         if result.len() >= top_n {
             break;
@@ -1129,6 +1441,9 @@ fn cross_community_surprises(
     top_n: usize,
 ) -> Vec<SurprisingConnection> {
     if communities.is_empty() {
+        if graph.edges.is_empty() || graph.nodes.len() > 5000 {
+            return Vec::new();
+        }
         let (_, edge_scores) = brandes_centrality(graph);
         let node_map: HashMap<&str, &Node> =
             graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
@@ -1648,7 +1963,7 @@ fn html_escape(text: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+        .replace('\'', "&#x27;")
 }
 
 fn js_safe_json<T: Serialize>(value: &T) -> String {
@@ -1697,7 +2012,12 @@ pub fn suggest_questions(
 
     // 2. Bridge nodes (high betweenness) -> cross-cutting concern questions
     if !communities.is_empty() && !graph.edges.is_empty() {
-        let (node_scores, _) = brandes_centrality(graph);
+        let node_scores = if graph.nodes.len() > 1000 {
+            brandes_node_centrality_sampled(graph, graph.nodes.len().min(100))
+        } else {
+            let (scores, _) = brandes_centrality(graph);
+            scores
+        };
         let mut bridges: Vec<(usize, f64)> = node_scores
             .into_iter()
             .enumerate()
@@ -1857,8 +2177,10 @@ pub fn suggest_questions(
     }
 
     // 5. Low-cohesion communities
-    let mut sorted_communities: Vec<(usize, &Vec<String>)> =
-        communities.iter().map(|(&cid, nodes)| (cid, nodes)).collect();
+    let mut sorted_communities: Vec<(usize, &Vec<String>)> = communities
+        .iter()
+        .map(|(&cid, nodes)| (cid, nodes))
+        .collect();
     sorted_communities.sort_by_key(|(cid, _)| *cid);
     for (cid, nodes) in sorted_communities {
         let score = cohesion_score(graph, nodes);
@@ -1919,8 +2241,9 @@ pub fn generate_report(
     today: Option<&str>,
 ) -> String {
     let today = today.unwrap_or("unknown-date");
-    let degree = compute_degrees(graph);
-    let confidences: Vec<&str> = graph.edges.iter().map(|e| e.confidence.as_str()).collect();
+    let report_edges = collapsed_undirected_edges(graph);
+    let degree = compute_degrees_from_edges(&report_edges);
+    let confidences: Vec<&str> = report_edges.iter().map(|e| e.confidence.as_str()).collect();
     let total = usize::max(confidences.len(), 1) as f64;
     let ext_pct = ((confidences.iter().filter(|&&c| c == "EXTRACTED").count() as f64 / total)
         * 100.0)
@@ -1932,8 +2255,7 @@ pub fn generate_report(
         * 100.0)
         .round() as usize;
 
-    let inferred_edges: Vec<&Edge> = graph
-        .edges
+    let inferred_edges: Vec<&Edge> = report_edges
         .iter()
         .filter(|edge| edge.confidence == "INFERRED")
         .collect();
@@ -1999,7 +2321,7 @@ pub fn generate_report(
         format!(
             "- {} nodes · {} edges · {} communities detected",
             graph.nodes.len(),
-            graph.edges.len(),
+            report_edges.len(),
             communities.len()
         ),
         extraction_line,
@@ -2032,10 +2354,10 @@ pub fn generate_report(
     lines.push("## God Nodes (most connected - your core abstractions)".to_string());
     for (idx, node) in god_node_list.iter().enumerate() {
         lines.push(format!(
-            "{}. `{}` - {} edges",
+            "{}. `{}` - {} degree",
             idx + 1,
             node.label,
-            node.edges
+            node.degree
         ));
     }
 
@@ -2309,8 +2631,8 @@ pub fn export_json_data(
             value
         })
         .collect();
-    let links: Vec<serde_json::Value> = graph
-        .edges
+    let export_edges = collapsed_undirected_edges(graph);
+    let links: Vec<serde_json::Value> = export_edges
         .iter()
         .map(|edge| {
             let mut value = serde_json::to_value(edge).unwrap_or_else(|_| serde_json::json!({}));
@@ -2351,11 +2673,12 @@ pub fn export_html(
     community_labels: &HashMap<usize, String>,
     title: &str,
 ) -> String {
+    let export_edges = collapsed_undirected_edges(graph);
     let node_community: HashMap<&str, usize> = communities
         .iter()
         .flat_map(|(&cid, nodes)| nodes.iter().map(move |n| (n.as_str(), cid)))
         .collect();
-    let degree = compute_degrees(graph);
+    let degree = compute_degrees_from_edges(&export_edges);
     let max_degree = degree.values().copied().max().unwrap_or(1).max(1) as f64;
 
     let vis_nodes: Vec<serde_json::Value> = graph
@@ -2363,7 +2686,7 @@ pub fn export_html(
         .iter()
         .map(|node| {
             let cid = node_community.get(node.id.as_str()).copied().unwrap_or(0);
-            let deg = degree.get(node.id.as_str()).copied().unwrap_or(1);
+            let deg = degree.get(node.id.as_str()).copied().unwrap_or(0);
             let color = COMMUNITY_COLORS[cid % COMMUNITY_COLORS.len()];
             serde_json::json!({
                 "id": node.id,
@@ -2388,8 +2711,7 @@ pub fn export_html(
         })
         .collect();
 
-    let vis_edges: Vec<serde_json::Value> = graph
-        .edges
+    let vis_edges: Vec<serde_json::Value> = export_edges
         .iter()
         .map(|edge| {
             let confidence = edge.confidence.as_str();
@@ -2401,6 +2723,7 @@ pub fn export_html(
                 "dashes": confidence != "EXTRACTED",
                 "width": if confidence == "EXTRACTED" { 2 } else { 1 },
                 "color": {"opacity": if confidence == "EXTRACTED" { 0.7 } else { 0.35 }},
+                "confidence": confidence,
             })
         })
         .collect();
@@ -2423,7 +2746,7 @@ pub fn export_html(
     let stats = format!(
         "{} nodes &middot; {} edges &middot; {} communities",
         graph.nodes.len(),
-        graph.edges.len(),
+        export_edges.len(),
         communities.len()
     );
     let nodes_json = js_safe_json(&vis_nodes);
@@ -2668,6 +2991,364 @@ pub fn export_html_to_path(
         fs::create_dir_all(parent)?;
     }
     let html = export_html(
+        graph,
+        communities,
+        community_labels,
+        &output_path.to_string_lossy(),
+    );
+    fs::write(output_path, html)
+}
+
+pub fn export_html_3d(
+    graph: &Graph,
+    communities: &HashMap<usize, Vec<String>>,
+    community_labels: &HashMap<usize, String>,
+    title: &str,
+) -> String {
+    let export_edges = collapsed_undirected_edges(graph);
+    let node_community: HashMap<&str, usize> = communities
+        .iter()
+        .flat_map(|(&cid, nodes)| nodes.iter().map(move |n| (n.as_str(), cid)))
+        .collect();
+    let degree = compute_degrees_from_edges(&export_edges);
+    let max_degree = degree.values().copied().max().unwrap_or(1).max(1) as f64;
+
+    let vis_nodes: Vec<serde_json::Value> = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let cid = node_community.get(node.id.as_str()).copied().unwrap_or(0);
+            let deg = degree.get(node.id.as_str()).copied().unwrap_or(0);
+            serde_json::json!({
+                "id": node.id,
+                "label": node.label,
+                "color": COMMUNITY_COLORS[cid % COMMUNITY_COLORS.len()],
+                "size": ((10.0 + 30.0 * (deg as f64 / max_degree)) * 10.0).round() / 10.0,
+                "community": cid,
+                "community_name": community_labels
+                    .get(&cid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Community {}", cid)),
+                "source_file": node.source_file,
+                "file_type": node.file_type,
+                "degree": deg,
+            })
+        })
+        .collect();
+
+    let vis_edges: Vec<serde_json::Value> = export_edges
+        .iter()
+        .map(|edge| {
+            let confidence = edge.confidence.as_str();
+            let cid = node_community
+                .get(edge.source.as_str())
+                .copied()
+                .unwrap_or(0);
+            serde_json::json!({
+                "source": edge.source,
+                "target": edge.target,
+                "label": edge.relation,
+                "confidence": confidence,
+                "width": if confidence == "EXTRACTED" { 2 } else { 1 },
+                "color": COMMUNITY_COLORS[cid % COMMUNITY_COLORS.len()],
+            })
+        })
+        .collect();
+
+    let mut community_ids: Vec<usize> = communities.keys().copied().collect();
+    community_ids.sort_unstable();
+    let legend: Vec<serde_json::Value> = community_ids
+        .into_iter()
+        .map(|cid| {
+            serde_json::json!({
+                "cid": cid,
+                "color": COMMUNITY_COLORS[cid % COMMUNITY_COLORS.len()],
+                "label": community_labels
+                    .get(&cid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Community {}", cid)),
+                "count": communities.get(&cid).map(|nodes| nodes.len()).unwrap_or(0),
+            })
+        })
+        .collect();
+
+    let title = html_escape(title);
+    let stats = format!(
+        "{} nodes &middot; {} edges &middot; {} communities",
+        graph.nodes.len(),
+        export_edges.len(),
+        communities.len()
+    );
+    let nodes_json = js_safe_json(&vis_nodes);
+    let edges_json = js_safe_json(&vis_edges);
+    let legend_json = js_safe_json(&legend);
+
+    format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>graphify 3D - {title}</title>
+<style>
+html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background: #0f0f1a; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+body {{ display: flex; overflow: hidden; }}
+#graph {{ flex: 1; position: relative; min-width: 0; }}
+#sidebar {{ width: 340px; background: rgba(19, 22, 32, 0.94); backdrop-filter: blur(12px); border-left: 1px solid rgba(255,255,255,0.08); box-sizing: border-box; padding: 18px; overflow-y: auto; }}
+#search-wrap {{ position: sticky; top: 0; background: linear-gradient(180deg, rgba(19,22,32,0.98) 0%, rgba(19,22,32,0.88) 100%); padding-bottom: 12px; z-index: 2; }}
+#search {{ width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.14); border-radius: 10px; background: rgba(255,255,255,0.06); color: #fff; outline: none; }}
+#search:focus {{ border-color: rgba(102, 178, 255, 0.9); box-shadow: 0 0 0 3px rgba(102,178,255,0.18); }}
+#search-results {{ margin-top: 10px; display: none; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; background: rgba(7, 10, 18, 0.95); max-height: 240px; overflow: auto; }}
+.search-item {{ padding: 10px 12px; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.06); }}
+.search-item:last-child {{ border-bottom: 0; }}
+.search-item:hover {{ background: rgba(255,255,255,0.08); }}
+h3 {{ margin: 18px 0 10px; font-size: 15px; color: #dce7ff; }}
+#info-content, #legend {{ font-size: 13px; line-height: 1.5; color: #d4d9e4; }}
+.info-row {{ margin: 6px 0; }}
+.info-label {{ color: #9fb0c9; margin-right: 6px; }}
+.neighbor-list {{ margin: 10px 0 0; padding-left: 18px; }}
+.neighbor-link {{ color: #8fc5ff; cursor: pointer; text-decoration: none; }}
+.neighbor-link:hover {{ text-decoration: underline; }}
+.legend-item {{ display: flex; align-items: center; gap: 10px; margin: 8px 0; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.04); cursor: pointer; user-select: none; }}
+.legend-item.hidden {{ opacity: 0.4; }}
+.legend-swatch {{ width: 14px; height: 14px; border-radius: 50%; flex: none; }}
+.legend-text {{ flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+#stats {{ margin-top: 18px; font-size: 12px; color: #95a3bb; }}
+.empty {{ color: #95a3bb; }}
+</style>
+</head>
+<body>
+<div id="graph"></div>
+<div id="sidebar">
+  <div id="search-wrap">
+    <input id="search" type="text" placeholder="Search nodes..." autocomplete="off">
+    <div id="search-results"></div>
+  </div>
+  <div id="info-panel">
+    <h3>Node Info</h3>
+    <div id="info-content"><span class="empty">Click a node to inspect it</span></div>
+  </div>
+  <div id="legend-wrap">
+    <h3>Communities</h3>
+    <div id="legend"></div>
+  </div>
+  <div id="stats">{stats}</div>
+</div>
+<script src="https://unpkg.com/3d-force-graph"></script>
+<script>
+const BASE_NODES = {nodes_json};
+const BASE_LINKS = {edges_json};
+const LEGEND = {legend_json};
+
+const graphEl = document.getElementById('graph');
+const searchEl = document.getElementById('search');
+const searchResultsEl = document.getElementById('search-results');
+const infoContentEl = document.getElementById('info-content');
+const legendEl = document.getElementById('legend');
+
+const nodeById = new Map(BASE_NODES.map(node => [node.id, node]));
+let hiddenCommunities = new Set();
+let currentData = {{ nodes: [], links: [] }};
+
+function esc(value) {{
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}}
+
+function buildVisibleData() {{
+  const nodes = BASE_NODES
+    .filter(node => !hiddenCommunities.has(node.community))
+    .map(node => ({{ ...node }}));
+  const visible = new Set(nodes.map(node => node.id));
+  const links = BASE_LINKS
+    .filter(link => visible.has(link.source) && visible.has(link.target))
+    .map(link => ({{ ...link }}));
+  return {{ nodes, links }};
+}}
+
+const Graph = ForceGraph3D()(graphEl)
+  .backgroundColor('#0f0f1a')
+  .showNavInfo(false)
+  .nodeRelSize(4)
+  .nodeOpacity(0.95)
+  .nodeColor(node => node.color)
+  .nodeVal(node => Math.max(2.5, Number(node.size || 8) / 5))
+  .nodeLabel(node => `
+    <div style="padding:8px 10px;max-width:320px">
+      <div style="font-weight:600;margin-bottom:4px">${{esc(node.label)}}</div>
+      <div>Community: ${{esc(node.community_name)}}</div>
+      <div>Type: ${{esc(node.file_type || 'unknown')}}</div>
+      <div>Degree: ${{esc(node.degree)}}</div>
+      <div>File: ${{esc(node.source_file || '')}}</div>
+    </div>
+  `)
+  .linkColor(link => link.color)
+  .linkWidth(link => link.width || 1)
+  .linkOpacity(0.28)
+  .linkDirectionalArrowLength(3)
+  .linkDirectionalArrowRelPos(1)
+  .onNodeClick(node => focusNode(node.id));
+
+const charge = Graph.d3Force('charge');
+if (charge) charge.strength(-140);
+const linkForce = Graph.d3Force('link');
+if (linkForce) linkForce.distance(link => link.width > 1 ? 80 : 110);
+Graph.d3VelocityDecay(0.22);
+
+function renderLegend() {{
+  legendEl.innerHTML = '';
+  for (const item of LEGEND) {{
+    const entry = document.createElement('div');
+    entry.className = 'legend-item' + (hiddenCommunities.has(item.cid) ? ' hidden' : '');
+    entry.innerHTML = `
+      <span class="legend-swatch" style="background:${{item.color}}"></span>
+      <span class="legend-text">${{item.label}}</span>
+      <span>${{item.count}}</span>
+    `;
+    entry.addEventListener('click', () => {{
+      if (hiddenCommunities.has(item.cid)) hiddenCommunities.delete(item.cid);
+      else hiddenCommunities.add(item.cid);
+      refreshGraph();
+    }});
+    legendEl.appendChild(entry);
+  }}
+}}
+
+function neighborIds(nodeId) {{
+  const ids = new Set();
+  for (const link of currentData.links) {{
+    const source = typeof link.source === 'object' ? link.source.id : link.source;
+    const target = typeof link.target === 'object' ? link.target.id : link.target;
+    if (source === nodeId) ids.add(target);
+    if (target === nodeId) ids.add(source);
+  }}
+  return [...ids];
+}}
+
+function showInfo(nodeId) {{
+  const node = nodeById.get(nodeId);
+  if (!node) return;
+  const neighbors = neighborIds(nodeId)
+    .map(id => nodeById.get(id))
+    .filter(Boolean)
+    .sort((a, b) => String(a.label).localeCompare(String(b.label)));
+  let html = `
+    <div class="info-row"><span class="info-label">Label:</span>${{esc(node.label)}}</div>
+    <div class="info-row"><span class="info-label">Community:</span>${{esc(node.community_name)}}</div>
+    <div class="info-row"><span class="info-label">Type:</span>${{esc(node.file_type || 'unknown')}}</div>
+    <div class="info-row"><span class="info-label">Degree:</span>${{esc(node.degree)}}</div>
+    <div class="info-row"><span class="info-label">File:</span>${{esc(node.source_file || '')}}</div>
+  `;
+  if (neighbors.length) {{
+    html += '<div class="info-row"><span class="info-label">Neighbors:</span></div><ul class="neighbor-list">';
+    for (const neighbor of neighbors.slice(0, 24)) {{
+      html += `<li><a class="neighbor-link" data-node-id="${{esc(neighbor.id)}}">${{esc(neighbor.label)}}</a></li>`;
+    }}
+    html += '</ul>';
+  }}
+  infoContentEl.innerHTML = html;
+  for (const link of infoContentEl.querySelectorAll('.neighbor-link')) {{
+    link.addEventListener('click', event => {{
+      event.preventDefault();
+      focusNode(link.dataset.nodeId);
+    }});
+  }}
+}}
+
+function focusNode(nodeId) {{
+  let node = currentData.nodes.find(item => item.id === nodeId);
+  if (!node) {{
+    const baseNode = nodeById.get(nodeId);
+    if (!baseNode) return;
+    hiddenCommunities.delete(baseNode.community);
+    refreshGraph();
+    node = currentData.nodes.find(item => item.id === nodeId);
+    if (!node) return;
+  }}
+  showInfo(nodeId);
+  const x = Number(node.x) || 0;
+  const y = Number(node.y) || 0;
+  const z = Number(node.z) || 0;
+  const distance = 160;
+  const norm = Math.hypot(x, y, z) || 1;
+  Graph.cameraPosition(
+    {{ x: x + (x / norm) * distance, y: y + (y / norm) * distance, z: z + (z / norm) * distance }},
+    {{ x, y, z }},
+    1200,
+  );
+}}
+
+function refreshGraph() {{
+  currentData = buildVisibleData();
+  Graph.graphData(currentData);
+  renderLegend();
+}}
+
+function renderSearchResults(results) {{
+  if (!results.length) {{
+    searchResultsEl.style.display = 'none';
+    searchResultsEl.innerHTML = '';
+    return;
+  }}
+  searchResultsEl.style.display = 'block';
+  searchResultsEl.innerHTML = '';
+  for (const node of results) {{
+    const item = document.createElement('div');
+    item.className = 'search-item';
+    item.innerHTML = `<strong>${{esc(node.label)}}</strong><br><span style="color:#9fb0c9">${{esc(node.source_file || node.community_name)}}</span>`;
+    item.addEventListener('click', () => {{
+      searchEl.value = '';
+      renderSearchResults([]);
+      focusNode(node.id);
+    }});
+    searchResultsEl.appendChild(item);
+  }}
+}}
+
+searchEl.addEventListener('input', () => {{
+  const query = searchEl.value.trim().toLowerCase();
+  if (!query) {{
+    renderSearchResults([]);
+    return;
+  }}
+  const results = BASE_NODES
+    .filter(node =>
+      String(node.label).toLowerCase().includes(query) ||
+      String(node.source_file || '').toLowerCase().includes(query))
+    .slice(0, 12);
+  renderSearchResults(results);
+}});
+
+document.addEventListener('click', event => {{
+  if (!searchResultsEl.contains(event.target) && event.target !== searchEl) {{
+    renderSearchResults([]);
+  }}
+}});
+
+refreshGraph();
+</script>
+</body>
+</html>"#,
+        title = title,
+        stats = stats,
+        nodes_json = nodes_json,
+        edges_json = edges_json,
+        legend_json = legend_json,
+    )
+}
+
+pub fn export_html_3d_to_path(
+    graph: &Graph,
+    communities: &HashMap<usize, Vec<String>>,
+    community_labels: &HashMap<usize, String>,
+    output_path: &Path,
+) -> std::io::Result<()> {
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let html = export_html_3d(
         graph,
         communities,
         community_labels,
@@ -3688,7 +4369,10 @@ fn wiki_index_markdown(
         lines.push("(most connected concepts — the load-bearing abstractions)".to_string());
         lines.push(String::new());
         for node in god_nodes {
-            lines.push(format!("- [[{}]] — {} connections", node.label, node.edges));
+            lines.push(format!(
+                "- [[{}]] — {} connections",
+                node.label, node.degree
+            ));
         }
         lines.push(String::new());
     }
@@ -3955,8 +4639,9 @@ pub fn score_all(graph: &Graph, communities: &HashMap<usize, Vec<String>>) -> Ha
 #[cfg(test)]
 mod tests {
     use super::{
-        PyRandom, cluster, export_canvas_data, export_html, export_json_data, export_svg,
-        merge_extractions, suggest_questions, surprising_connections,
+        cluster, coerce_graph, export_canvas_data, export_html, export_html_3d, export_json_data,
+        export_svg, god_nodes, merge_extractions, refine_boundary_nodes, suggest_questions,
+        surprising_connections,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -4003,6 +4688,104 @@ mod tests {
         assert_eq!(result.edges[0].source, "n1");
         assert_eq!(result.edges[0].target, "n2");
         assert_eq!(result.edges[0].weight, 1.0);
+    }
+
+    #[test]
+    fn coerce_graph_merges_extraction_objects_before_filtering() {
+        let result = coerce_graph(&json!({
+            "nodes": [
+                {"id": "n1", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "n2", "label": "B", "file_type": "code", "source_file": "b.py"}
+            ],
+            "edges": [
+                {"source": "n1", "target": "n2", "relation": "uses", "confidence": "INFERRED", "source_file": "a.py"},
+                {"source": "n1", "target": "missing", "relation": "uses", "confidence": "INFERRED", "source_file": "a.py"}
+            ],
+            "input_tokens": 0,
+            "output_tokens": 0
+        }))
+        .unwrap();
+
+        assert_eq!(result.nodes.len(), 2);
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].source, "n1");
+        assert_eq!(result.edges[0].target, "n2");
+    }
+
+    #[test]
+    fn coerce_graph_preserves_built_graph_payloads() {
+        let result = coerce_graph(&json!({
+            "nodes": [
+                {"id": "n1", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "n2", "label": "B", "file_type": "code", "source_file": "b.py"}
+            ],
+            "edges": [
+                {"source": "n1", "target": "n2", "relation": "uses", "confidence": "INFERRED", "source_file": "a.py"}
+            ],
+            "hyperedges": [],
+            "neighbor_order": {"n1": ["n2"]},
+            "input_tokens": 1,
+            "output_tokens": 2
+        }))
+        .unwrap();
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(
+            result.neighbor_order.get("n1").unwrap(),
+            &vec!["n2".to_string()]
+        );
+        assert_eq!(result.input_tokens, 1);
+        assert_eq!(result.output_tokens, 2);
+    }
+
+    #[test]
+    fn merge_collapses_undirected_duplicate_edges_in_core_graph() {
+        let result = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "n1", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "n2", "label": "B", "file_type": "code", "source_file": "b.py"}
+            ],
+            "edges": [
+                {"source": "n1", "target": "n2", "relation": "contains", "confidence": "EXTRACTED", "source_file": "a.py"},
+                {"source": "n2", "target": "n1", "relation": "uses", "confidence": "INFERRED", "source_file": "b.py", "confidence_score": 0.5}
+            ]
+        })]);
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].source, "n1");
+        assert_eq!(result.edges[0].target, "n2");
+        assert_eq!(result.edges[0].relation, "uses");
+        assert_eq!(result.edges[0].confidence, "INFERRED");
+        assert_eq!(result.edges[0].original_source.as_deref(), Some("n2"));
+        assert_eq!(result.edges[0].original_target.as_deref(), Some("n1"));
+    }
+
+    #[test]
+    fn coerce_graph_normalizes_built_graph_payload_edges() {
+        let result = coerce_graph(&json!({
+            "nodes": [
+                {"id": "n1", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "n2", "label": "B", "file_type": "code", "source_file": "b.py"}
+            ],
+            "edges": [
+                {"source": "n2", "target": "n1", "relation": "uses", "confidence": "INFERRED", "source_file": "b.py"},
+                {"source": "n1", "target": "n2", "relation": "contains", "confidence": "EXTRACTED", "source_file": "a.py"}
+            ],
+            "hyperedges": [],
+            "neighbor_order": {"n1": ["n2"]},
+            "input_tokens": 1,
+            "output_tokens": 2
+        }))
+        .unwrap();
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].source, "n1");
+        assert_eq!(result.edges[0].target, "n2");
+        assert_eq!(result.edges[0].relation, "contains");
+        assert_eq!(
+            result.neighbor_order.get("n1").unwrap(),
+            &vec!["n2".to_string()]
+        );
     }
 
     #[test]
@@ -4089,6 +4872,59 @@ mod tests {
     }
 
     #[test]
+    fn surprising_connections_skip_large_graphs_without_communities() {
+        let nodes: Vec<_> = (0..5001)
+            .map(|idx| {
+                json!({
+                    "id": format!("n{idx}"),
+                    "label": format!("Node{idx}"),
+                    "file_type": "code",
+                    "source_file": "large.py"
+                })
+            })
+            .collect();
+        let edges: Vec<_> = (0..5000)
+            .map(|idx| {
+                json!({
+                    "source": format!("n{idx}"),
+                    "target": format!("n{}", idx + 1),
+                    "relation": "calls",
+                    "confidence": "EXTRACTED",
+                    "source_file": "large.py"
+                })
+            })
+            .collect();
+        let graph = merge_extractions(&[json!({ "nodes": nodes, "edges": edges })]);
+
+        let surprises = surprising_connections(&graph, &HashMap::new(), 5);
+
+        assert!(surprises.is_empty());
+    }
+
+    #[test]
+    fn god_nodes_expose_degree_field() {
+        let graph = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "a", "label": "Alpha", "file_type": "code", "source_file": "single.py"},
+                {"id": "b", "label": "Beta", "file_type": "code", "source_file": "single.py"},
+                {"id": "c", "label": "Gamma", "file_type": "code", "source_file": "single.py"}
+            ],
+            "edges": [
+                {"source": "a", "target": "b", "relation": "calls", "confidence": "EXTRACTED", "source_file": "single.py"},
+                {"source": "b", "target": "c", "relation": "calls", "confidence": "EXTRACTED", "source_file": "single.py"}
+            ]
+        })]);
+
+        let result = god_nodes(&graph, 2);
+
+        assert_eq!(result[0].label, "Beta");
+        assert_eq!(result[0].degree, 2);
+        let json = serde_json::to_value(&result[0]).unwrap();
+        assert_eq!(json["degree"], 2);
+        assert!(json.get("edges").is_none());
+    }
+
+    #[test]
     fn suggest_questions_includes_bridge_node_questions() {
         let graph = merge_extractions(&[json!({
             "nodes": [
@@ -4139,6 +4975,54 @@ mod tests {
         let norm_label = exported["nodes"][0]["norm_label"].as_str().unwrap_or("");
 
         assert_eq!(norm_label, "creme brulee strasse");
+    }
+
+    #[test]
+    fn export_json_collapses_undirected_duplicates_with_latest_attrs() {
+        let graph = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "a", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "b", "label": "B", "file_type": "code", "source_file": "b.py"}
+            ],
+            "edges": [
+                {"source": "a", "target": "b", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py"},
+                {"source": "b", "target": "a", "relation": "uses", "confidence": "INFERRED", "source_file": "b.py", "confidence_score": 0.5}
+            ]
+        })]);
+
+        let exported = export_json_data(&graph, &HashMap::new());
+        let links = exported["links"].as_array().unwrap();
+
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0]["source"], "a");
+        assert_eq!(links[0]["target"], "b");
+        assert_eq!(links[0]["relation"], "uses");
+        assert_eq!(links[0]["confidence"], "INFERRED");
+        assert_eq!(links[0]["_src"], "b");
+        assert_eq!(links[0]["_tgt"], "a");
+    }
+
+    #[test]
+    fn html_exports_use_collapsed_undirected_edge_counts() {
+        let graph = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "a", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "b", "label": "B", "file_type": "code", "source_file": "b.py"}
+            ],
+            "edges": [
+                {"source": "a", "target": "b", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py"},
+                {"source": "b", "target": "a", "relation": "uses", "confidence": "INFERRED", "source_file": "b.py"}
+            ]
+        })]);
+        let communities = HashMap::from([(0usize, vec!["a".to_string(), "b".to_string()])]);
+
+        let html_2d = export_html(&graph, &communities, &HashMap::new(), "graph.html");
+        let html_3d = export_html_3d(&graph, &communities, &HashMap::new(), "graph-3d.html");
+
+        assert!(html_2d.contains("2 nodes &middot; 1 edges &middot; 1 communities"));
+        assert_eq!(html_2d.matches("\"from\":").count(), 1);
+        assert!(html_3d.contains("2 nodes &middot; 1 edges &middot; 1 communities"));
+        assert_eq!(html_3d.matches("\"source\":").count(), 1);
     }
 
     #[test]
@@ -4212,26 +5096,88 @@ mod tests {
     }
 
     #[test]
-    fn py_random_matches_python_random_42_getrandbits32() {
-        let mut rng = PyRandom::new(42);
-        let actual: Vec<u32> = (0..10).map(|_| rng.getrandbits(32)).collect();
-        assert_eq!(
-            actual,
-            vec![
-                2746317213, 478163327, 107420369, 3184935163, 1181241943, 1051802512,
-                958682846, 599310825, 3163119785, 440213415,
+    fn cluster_orders_equal_sized_communities_lexicographically() {
+        let graph = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "z1", "label": "Z1", "file_type": "code", "source_file": "z.py"},
+                {"id": "z2", "label": "Z2", "file_type": "code", "source_file": "z.py"},
+                {"id": "a1", "label": "A1", "file_type": "code", "source_file": "a.py"},
+                {"id": "a2", "label": "A2", "file_type": "code", "source_file": "a.py"}
+            ],
+            "edges": [
+                {"source": "z1", "target": "z2", "relation": "calls", "confidence": "EXTRACTED", "source_file": "z.py"},
+                {"source": "a1", "target": "a2", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py"}
             ]
+        })]);
+
+        let communities = cluster(&graph);
+        assert_eq!(
+            communities.get(&0),
+            Some(&vec!["a1".to_string(), "a2".to_string()])
+        );
+        assert_eq!(
+            communities.get(&1),
+            Some(&vec!["z1".to_string(), "z2".to_string()])
         );
     }
 
     #[test]
-    fn py_random_matches_python_random_42_shuffle() {
-        let mut rng = PyRandom::new(42);
-        let mut values: Vec<usize> = (0..20).collect();
-        rng.shuffle(&mut values);
+    fn refine_boundary_nodes_prefers_same_file_anchor_on_tie() {
+        let graph = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "helper", "label": "helper()", "file_type": "code", "source_file": "a.py", "node_type": "function"},
+                {"id": "file_a", "label": "a.py", "file_type": "code", "source_file": "a.py", "node_type": "file"},
+                {"id": "peer_a", "label": "peer_a()", "file_type": "code", "source_file": "a.py", "node_type": "function"},
+                {"id": "external", "label": "external()", "file_type": "code", "source_file": "b.py", "node_type": "function"}
+            ],
+            "edges": [
+                {"source": "helper", "target": "file_a", "relation": "contains", "confidence": "EXTRACTED", "source_file": "a.py"},
+                {"source": "helper", "target": "external", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py"}
+            ]
+        })]);
+
+        let mut communities = vec![vec![0usize, 3usize], vec![1usize, 2usize]];
+        refine_boundary_nodes(&graph, &mut communities);
+        communities
+            .iter_mut()
+            .for_each(|members| members.sort_unstable());
+
+        assert!(communities.contains(&vec![0usize, 1usize, 2usize]));
+        assert!(communities.contains(&vec![3usize]));
+    }
+
+    #[test]
+    fn cluster_separates_two_dense_groups_with_single_bridge() {
+        let graph = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "a", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "b", "label": "B", "file_type": "code", "source_file": "a.py"},
+                {"id": "c", "label": "C", "file_type": "code", "source_file": "a.py"},
+                {"id": "d", "label": "D", "file_type": "code", "source_file": "b.py"},
+                {"id": "e", "label": "E", "file_type": "code", "source_file": "b.py"},
+                {"id": "f", "label": "F", "file_type": "code", "source_file": "b.py"}
+            ],
+            "edges": [
+                {"source": "a", "target": "b", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py"},
+                {"source": "a", "target": "c", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py"},
+                {"source": "b", "target": "c", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py"},
+                {"source": "d", "target": "e", "relation": "calls", "confidence": "EXTRACTED", "source_file": "b.py"},
+                {"source": "d", "target": "f", "relation": "calls", "confidence": "EXTRACTED", "source_file": "b.py"},
+                {"source": "e", "target": "f", "relation": "calls", "confidence": "EXTRACTED", "source_file": "b.py"},
+                {"source": "c", "target": "d", "relation": "calls", "confidence": "EXTRACTED", "source_file": "bridge.py"}
+            ]
+        })]);
+
+        let mut groups: Vec<Vec<String>> = cluster(&graph).into_values().collect();
+        groups.iter_mut().for_each(|group| group.sort());
+        groups.sort();
+
         assert_eq!(
-            values,
-            vec![19, 5, 14, 4, 9, 13, 15, 18, 6, 12, 17, 10, 1, 11, 2, 16, 7, 8, 0, 3]
+            groups,
+            vec![
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                vec!["d".to_string(), "e".to_string(), "f".to_string()]
+            ]
         );
     }
 
@@ -4303,5 +5249,26 @@ mod tests {
         assert!(html.contains("afterDrawing"));
         assert!(html.contains("Auth Flow"));
         assert!(html.contains("hoverNode"));
+    }
+
+    #[test]
+    fn export_html_3d_contains_force_graph_and_legend() {
+        let graph = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "n1", "label": "Parser", "file_type": "code", "source_file": "parser.py"},
+                {"id": "n2", "label": "Renderer", "file_type": "code", "source_file": "renderer.py"}
+            ],
+            "edges": [
+                {"source": "n1", "target": "n2", "relation": "uses", "confidence": "INFERRED", "source_file": "parser.py"}
+            ]
+        })]);
+        let communities = HashMap::from([(0usize, vec!["n1".to_string(), "n2".to_string()])]);
+
+        let html = export_html_3d(&graph, &communities, &HashMap::new(), "graph-3d.html");
+
+        assert!(html.contains("3d-force-graph"));
+        assert!(html.contains("Community 0"));
+        assert!(html.contains("BASE_NODES"));
+        assert!(html.contains("BASE_LINKS"));
     }
 }

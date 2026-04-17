@@ -7,11 +7,7 @@ use std::path::{Path, PathBuf};
 
 macro_rules! skill_asset {
     ($name:literal) => {
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../graphify/assets/skills/",
-            $name
-        ))
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/skills/", $name))
     };
 }
 

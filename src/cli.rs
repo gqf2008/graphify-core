@@ -1540,19 +1540,7 @@ fn resolve_home_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 fn default_version_stamp() -> String {
-    python_package_version().to_string()
-}
-
-fn python_package_version() -> &'static str {
-    static PYPROJECT: &str =
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../pyproject.toml"));
-    PYPROJECT
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("version = \"")
-                .and_then(|rest| rest.strip_suffix('"'))
-        })
-        .unwrap_or(env!("CARGO_PKG_VERSION"))
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 fn print_benchmark(result: &Value) {

@@ -18,6 +18,8 @@ This directory is kept self-contained so it can be split into a standalone repos
 cargo test --quiet
 cargo run --quiet --bin graphify -- --help
 cargo run --quiet --bin graphify-core -- --help
+cargo run --quiet --bin graphify -- update . --wiki
+cargo run --quiet --bin graphify -- cluster-only . --wiki
 ```
 
 ## Split readiness

@@ -631,11 +631,11 @@ fn main() -> Result<()> {
             follow_symlinks,
             today,
         } => {
-            let result = pipeline::rebuild_code(&root, follow_symlinks, today.as_deref())?;
+            let result = pipeline::rebuild_code(&root, follow_symlinks, today.as_deref(), false)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::ClusterOnly { root, today } => {
-            let result = pipeline::cluster_only(&root, today.as_deref())?;
+            let result = pipeline::cluster_only(&root, today.as_deref(), false)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::Watch {

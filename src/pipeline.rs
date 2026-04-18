@@ -22,6 +22,8 @@ pub struct RebuildCodeResult {
     pub graph_path: String,
     pub html_path: String,
     pub report_path: String,
+    pub wiki_path: Option<String>,
+    pub wiki_articles: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -34,6 +36,8 @@ pub struct ClusterOnlyResult {
     pub graph_path: String,
     pub html_path: String,
     pub report_path: String,
+    pub wiki_path: Option<String>,
+    pub wiki_articles: usize,
 }
 
 #[derive(Debug, Default)]
@@ -50,6 +54,8 @@ struct GraphOutputSummary {
     graph_path: PathBuf,
     html_path: PathBuf,
     report_path: PathBuf,
+    wiki_path: Option<PathBuf>,
+    wiki_articles: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +69,7 @@ pub fn rebuild_code(
     root: &Path,
     follow_symlinks: bool,
     today: Option<&str>,
+    write_wiki: bool,
 ) -> Result<RebuildCodeResult> {
     let detection = detect::detect(root, follow_symlinks)?;
     let code_files = detection.files.get("code").cloned().unwrap_or_default();
@@ -83,6 +90,8 @@ pub fn rebuild_code(
             graph_path: graph_path.to_string_lossy().to_string(),
             html_path: out_dir.join("graph-3d.html").to_string_lossy().to_string(),
             report_path: report_path.to_string_lossy().to_string(),
+            wiki_path: None,
+            wiki_articles: 0,
         });
     }
 
@@ -90,7 +99,7 @@ pub fn rebuild_code(
     let preserved = load_preserved_semantic_graph(root);
     let graph = build_graph_with_preserved_semantics(extraction, &preserved);
     let detection_value = serde_json::to_value(&detection)?;
-    let output = write_graph_outputs(root, &graph, detection_value, today)?;
+    let output = write_graph_outputs(root, &graph, detection_value, today, write_wiki)?;
 
     Ok(RebuildCodeResult {
         ok: true,
@@ -104,10 +113,19 @@ pub fn rebuild_code(
         graph_path: output.graph_path.to_string_lossy().to_string(),
         html_path: output.html_path.to_string_lossy().to_string(),
         report_path: output.report_path.to_string_lossy().to_string(),
+        wiki_path: output
+            .wiki_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+        wiki_articles: output.wiki_articles,
     })
 }
 
-pub fn cluster_only(root: &Path, today: Option<&str>) -> Result<ClusterOnlyResult> {
+pub fn cluster_only(
+    root: &Path,
+    today: Option<&str>,
+    write_wiki: bool,
+) -> Result<ClusterOnlyResult> {
     let graph_path = root.join("graphify-out").join("graph.json");
     let graph_json = fs::read_to_string(&graph_path).with_context(|| {
         format!(
@@ -118,7 +136,7 @@ pub fn cluster_only(root: &Path, today: Option<&str>) -> Result<ClusterOnlyResul
     let graph_value: Value = serde_json::from_str(&graph_json)
         .with_context(|| format!("invalid graph JSON: {}", graph_path.display()))?;
     let graph = build::merge_extractions(std::slice::from_ref(&graph_value));
-    let output = write_graph_outputs(root, &graph, json!({}), today)?;
+    let output = write_graph_outputs(root, &graph, json!({}), today, write_wiki)?;
 
     Ok(ClusterOnlyResult {
         ok: true,
@@ -129,6 +147,11 @@ pub fn cluster_only(root: &Path, today: Option<&str>) -> Result<ClusterOnlyResul
         graph_path: output.graph_path.to_string_lossy().to_string(),
         html_path: output.html_path.to_string_lossy().to_string(),
         report_path: output.report_path.to_string_lossy().to_string(),
+        wiki_path: output
+            .wiki_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+        wiki_articles: output.wiki_articles,
     })
 }
 
@@ -194,7 +217,7 @@ pub fn watch(
                 );
                 println!("[graphify watch] Flag written to {}", flag.display());
             } else {
-                let result = rebuild_code(&root, follow_symlinks, today)?;
+                let result = rebuild_code(&root, follow_symlinks, today, false)?;
                 if !result.ok {
                     println!("[graphify watch] {}", result.message);
                 } else {
@@ -425,6 +448,7 @@ fn write_graph_outputs(
     graph: &build::Graph,
     detection_result: Value,
     today: Option<&str>,
+    write_wiki: bool,
 ) -> Result<GraphOutputSummary> {
     let communities = build::cluster(graph);
     let cohesion_scores = build::score_all(graph, &communities);
@@ -472,17 +496,24 @@ fn write_graph_outputs(
             .with_context(|| format!("cannot remove {}", legacy_html_path.display()))?;
     }
 
-    if let Some(wiki_dir) = existing_wiki_dir(&out_dir) {
+    let wiki_path = if write_wiki {
+        Some(out_dir.join("wiki"))
+    } else {
+        existing_wiki_dir(&out_dir)
+    };
+    let wiki_articles = if let Some(wiki_dir) = wiki_path.as_ref() {
         build::export_wiki(
             graph,
             &communities,
-            &wiki_dir,
+            wiki_dir,
             &community_labels,
             &cohesion_scores,
             &god_nodes,
         )
-        .with_context(|| format!("cannot refresh wiki at {}", wiki_dir.display()))?;
-    }
+        .with_context(|| format!("cannot refresh wiki at {}", wiki_dir.display()))?
+    } else {
+        0
+    };
 
     let needs_update = out_dir.join("needs_update");
     if needs_update.exists() {
@@ -495,6 +526,8 @@ fn write_graph_outputs(
         graph_path,
         html_path,
         report_path,
+        wiki_path,
+        wiki_articles,
     })
 }
 
@@ -530,7 +563,7 @@ mod tests {
         let dir = tempdir()?;
         fs::write(dir.path().join("notes.md"), "# Notes\n")?;
 
-        let result = rebuild_code(dir.path(), false, Some("2026-04-16"))?;
+        let result = rebuild_code(dir.path(), false, Some("2026-04-16"), false)?;
 
         assert!(!result.ok);
         assert_eq!(result.message, "No code files found - nothing to rebuild.");
@@ -562,7 +595,7 @@ mod tests {
         )?;
         fs::write(out_dir.join("needs_update"), "1")?;
 
-        let result = rebuild_code(dir.path(), false, Some("2026-04-16"))?;
+        let result = rebuild_code(dir.path(), false, Some("2026-04-16"), false)?;
         let graph: Value = serde_json::from_str(&fs::read_to_string(out_dir.join("graph.json"))?)?;
 
         assert!(result.ok);
@@ -602,7 +635,7 @@ mod tests {
             }))?,
         )?;
 
-        let result = cluster_only(dir.path(), Some("2026-04-16"))?;
+        let result = cluster_only(dir.path(), Some("2026-04-16"), false)?;
         let graph: Value = serde_json::from_str(&fs::read_to_string(out_dir.join("graph.json"))?)?;
         let report = fs::read_to_string(out_dir.join("GRAPH_REPORT.md"))?;
         let html = fs::read_to_string(out_dir.join("graph-3d.html"))?;
@@ -631,7 +664,7 @@ mod tests {
         fs::create_dir_all(&wiki_dir)?;
         fs::write(wiki_dir.join("index.md"), "# stale wiki\n")?;
 
-        let result = rebuild_code(dir.path(), false, Some("2026-04-16"))?;
+        let result = rebuild_code(dir.path(), false, Some("2026-04-16"), false)?;
         let index = fs::read_to_string(wiki_dir.join("index.md"))?;
 
         assert!(result.ok);
@@ -662,7 +695,7 @@ mod tests {
             }))?,
         )?;
 
-        let result = cluster_only(dir.path(), Some("2026-04-16"))?;
+        let result = cluster_only(dir.path(), Some("2026-04-16"), false)?;
         let index = fs::read_to_string(out_dir.join("wiki").join("index.md"))?;
 
         assert!(result.ok);
@@ -677,6 +710,66 @@ mod tests {
                         && entry.file_name() != "index.md"
                 )
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rebuild_code_creates_wiki_when_requested() -> Result<()> {
+        let dir = tempdir()?;
+        fs::write(
+            dir.path().join("service.py"),
+            "class Service:\n    def run(self):\n        return 1\n",
+        )?;
+
+        let result = rebuild_code(dir.path(), false, Some("2026-04-16"), true)?;
+        let wiki_dir = dir.path().join("graphify-out").join("wiki");
+
+        assert!(result.ok);
+        assert_eq!(
+            result.wiki_path.as_deref(),
+            Some(wiki_dir.to_string_lossy().as_ref())
+        );
+        assert!(result.wiki_articles >= 1);
+        assert!(wiki_dir.join("index.md").exists());
+        assert!(wiki_dir.read_dir()?.filter_map(Result::ok).any(|entry| {
+            entry.path().extension().and_then(|ext| ext.to_str()) == Some("md")
+                && entry.file_name() != "index.md"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn cluster_only_creates_wiki_when_requested() -> Result<()> {
+        let dir = tempdir()?;
+        let out_dir = dir.path().join("graphify-out");
+        fs::create_dir_all(&out_dir)?;
+        fs::write(
+            out_dir.join("graph.json"),
+            serde_json::to_string_pretty(&json!({
+                "nodes": [
+                    {"id": "n1", "label": "Parser", "file_type": "code", "source_file": "parser.py"},
+                    {"id": "n2", "label": "Renderer", "file_type": "code", "source_file": "renderer.py"}
+                ],
+                "links": [
+                    {"source": "n1", "target": "n2", "relation": "uses", "confidence": "INFERRED", "source_file": "parser.py"}
+                ]
+            }))?,
+        )?;
+
+        let result = cluster_only(dir.path(), Some("2026-04-16"), true)?;
+        let wiki_dir = out_dir.join("wiki");
+
+        assert!(result.ok);
+        assert_eq!(
+            result.wiki_path.as_deref(),
+            Some(wiki_dir.to_string_lossy().as_ref())
+        );
+        assert!(result.wiki_articles >= 1);
+        assert!(wiki_dir.join("index.md").exists());
+        assert!(wiki_dir.read_dir()?.filter_map(Result::ok).any(|entry| {
+            entry.path().extension().and_then(|ext| ext.to_str()) == Some("md")
+                && entry.file_name() != "index.md"
+        }));
         Ok(())
     }
 

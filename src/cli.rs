@@ -327,6 +327,10 @@ enum Commands {
         /// Report date override (YYYY-MM-DD)
         #[arg(long)]
         today: Option<String>,
+
+        /// Also write graphify-out/wiki markdown articles
+        #[arg(long, default_value_t = false)]
+        wiki: bool,
     },
 
     /// Rerun clustering on an existing graph.json and regenerate report
@@ -339,6 +343,10 @@ enum Commands {
         /// Report date override (YYYY-MM-DD)
         #[arg(long)]
         today: Option<String>,
+
+        /// Also write graphify-out/wiki markdown articles
+        #[arg(long, default_value_t = false)]
+        wiki: bool,
     },
 
     /// Measure token reduction versus naive full-corpus reads
@@ -497,6 +505,9 @@ enum Commands {
 
         #[arg(long)]
         today: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        wiki: bool,
     },
 
     #[command(hide = true, name = "benchmark-json")]
@@ -988,6 +999,7 @@ fn main() -> Result<()> {
             path,
             follow_symlinks,
             today,
+            wiki,
         } => {
             require_path_exists(&path)?;
             println!(
@@ -995,18 +1007,25 @@ fn main() -> Result<()> {
                 path.display()
             );
             let today = today.unwrap_or_else(today_utc);
-            let result = pipeline::rebuild_code(&path, follow_symlinks, Some(today.as_str()))?;
+            let result =
+                pipeline::rebuild_code(&path, follow_symlinks, Some(today.as_str()), wiki)?;
             if result.ok {
-                println!(
-                    "Code graph updated. graph.json, graph-3d.html and GRAPH_REPORT.md refreshed. For doc/paper/image changes run /graphify --update in your AI assistant."
-                );
+                if result.wiki_path.is_some() {
+                    println!(
+                        "Code graph updated. graph.json, graph-3d.html, GRAPH_REPORT.md and graphify-out/wiki refreshed. For doc/paper/image changes run /graphify --update in your AI assistant."
+                    );
+                } else {
+                    println!(
+                        "Code graph updated. graph.json, graph-3d.html and GRAPH_REPORT.md refreshed. For doc/paper/image changes run /graphify --update in your AI assistant."
+                    );
+                }
             } else {
                 println!("{}", result.message);
                 eprintln!("Nothing to update or rebuild failed — check output above.");
                 exit_code = 1;
             }
         }
-        Commands::ClusterOnly { path, today } => {
+        Commands::ClusterOnly { path, today, wiki } => {
             let graph_json = path.join("graphify-out").join("graph.json");
             if !graph_json.exists() {
                 bail!(
@@ -1015,11 +1034,18 @@ fn main() -> Result<()> {
                 );
             }
             let today = today.unwrap_or_else(today_utc);
-            let result = pipeline::cluster_only(&path, Some(today.as_str()))?;
-            println!(
-                "Done — {} communities. GRAPH_REPORT.md, graph.json and graph-3d.html updated.",
-                result.communities
-            );
+            let result = pipeline::cluster_only(&path, Some(today.as_str()), wiki)?;
+            if result.wiki_path.is_some() {
+                println!(
+                    "Done — {} communities. GRAPH_REPORT.md, graph.json, graph-3d.html and graphify-out/wiki updated.",
+                    result.communities
+                );
+            } else {
+                println!(
+                    "Done — {} communities. GRAPH_REPORT.md, graph.json and graph-3d.html updated.",
+                    result.communities
+                );
+            }
         }
         Commands::Benchmark {
             graph,
@@ -1342,8 +1368,9 @@ fn main() -> Result<()> {
             root,
             follow_symlinks,
             today,
+            wiki,
         } => {
-            let result = pipeline::rebuild_code(&root, follow_symlinks, today.as_deref())?;
+            let result = pipeline::rebuild_code(&root, follow_symlinks, today.as_deref(), wiki)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::BenchmarkJson {

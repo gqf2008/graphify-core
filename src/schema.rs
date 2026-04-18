@@ -8,6 +8,8 @@ pub struct Extraction {
     pub edges: Vec<Edge>,
     #[serde(default, skip_serializing, skip_deserializing)]
     pub raw_calls: Vec<RawCall>,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub function_returns: Vec<FunctionReturn>,
     #[serde(default)]
     pub hyperedges: Vec<serde_json::Value>,
     #[serde(default)]
@@ -22,6 +24,13 @@ pub struct RawCall {
     pub callee: String,
     pub source_file: String,
     pub source_location: Option<String>,
+    pub receiver_call: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FunctionReturn {
+    pub function_name: String,
+    pub return_type_name: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

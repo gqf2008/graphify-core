@@ -9,7 +9,7 @@ use regex::Regex;
 use tree_sitter::{Language, Node as TsNode, Parser};
 
 use crate::detect::{FileType, classify_file};
-use crate::schema::{Edge, Extraction, Node, RawCall};
+use crate::schema::{Edge, Extraction, FunctionReturn, Node, RawCall};
 
 const PYTHON_RATIONALE_PREFIXES: [&str; 7] = [
     "# NOTE:",
@@ -31,6 +31,7 @@ struct LanguageConfig {
     call_function_field: &'static str,
     call_accessor_field: &'static str,
     call_accessor_node_types: &'static [&'static str],
+    allow_receiver_call_cross_file: bool,
     name_field: &'static str,
     name_fallback_child_types: &'static [&'static str],
     body_field: &'static str,
@@ -49,6 +50,7 @@ fn lang_config(language: Language) -> LanguageConfig {
         call_function_field: "",
         call_accessor_field: "",
         call_accessor_node_types: &[],
+        allow_receiver_call_cross_file: false,
         name_field: "name",
         name_fallback_child_types: &[],
         body_field: "body",
@@ -413,6 +415,7 @@ fn rust_cfg() -> LanguageConfig {
         call_function_field => "function",
         call_accessor_field => "field",
         call_accessor_node_types => &["field_expression"],
+        allow_receiver_call_cross_file => true,
         name_field => "name",
         name_fallback_child_types => &["identifier", "type_identifier"],
         body_field => "body",
@@ -536,6 +539,7 @@ fn append_extraction(dst: &mut Extraction, src: Extraction) {
     dst.nodes.extend(src.nodes);
     dst.edges.extend(src.edges);
     dst.raw_calls.extend(src.raw_calls);
+    dst.function_returns.extend(src.function_returns);
     dst.hyperedges.extend(src.hyperedges);
     dst.input_tokens += src.input_tokens;
     dst.output_tokens += src.output_tokens;
@@ -547,6 +551,8 @@ fn resolve_cross_file_calls(extraction: &mut Extraction) {
     }
 
     let label_to_id = build_label_index(&extraction.nodes);
+    let function_return_index = build_function_return_index(&extraction.function_returns);
+    let method_index = build_method_index(&extraction.nodes, &extraction.edges);
     let mut existing_pairs: HashSet<(String, String)> = extraction
         .edges
         .iter()
@@ -554,7 +560,9 @@ fn resolve_cross_file_calls(extraction: &mut Extraction) {
         .collect();
 
     for raw_call in extraction.raw_calls.drain(..) {
-        let Some(target_id) = lookup_call_target(&label_to_id, &raw_call.callee) else {
+        let Some(target_id) = lookup_call_target(&label_to_id, &raw_call.callee).or_else(|| {
+            lookup_receiver_method_target(&method_index, &function_return_index, &raw_call)
+        }) else {
             continue;
         };
         if target_id == &raw_call.caller_nid {
@@ -724,6 +732,8 @@ fn append_extraction_unique(
             dst.edges.push(edge);
         }
     }
+    dst.raw_calls.extend(src.raw_calls);
+    dst.function_returns.extend(src.function_returns);
     dst.hyperedges.extend(src.hyperedges);
     dst.input_tokens += src.input_tokens;
     dst.output_tokens += src.output_tokens;
@@ -847,6 +857,7 @@ fn extract_generic_from_source(
         &mut extraction.edges,
         &mut seen_ids,
         &mut pending_calls,
+        &mut extraction.function_returns,
     );
 
     // Resolve pending calls
@@ -877,6 +888,7 @@ fn extract_generic_from_source(
                 callee: pending.callee_name,
                 source_file: source_file.clone(),
                 source_location: Some(format!("L{}", pending.line_no)),
+                receiver_call: pending.receiver_call,
             });
         }
     }
@@ -911,6 +923,7 @@ fn walk_tree<'a>(
     edges: &mut Vec<Edge>,
     seen_ids: &mut HashSet<String>,
     pending_calls: &mut Vec<PendingCall>,
+    function_returns: &mut Vec<FunctionReturn>,
 ) {
     let t = node.kind();
 
@@ -934,6 +947,7 @@ fn walk_tree<'a>(
             edges,
             seen_ids,
             pending_calls,
+            function_returns,
         );
         return;
     }
@@ -952,6 +966,7 @@ fn walk_tree<'a>(
             edges,
             seen_ids,
             pending_calls,
+            function_returns,
         );
         return;
     }
@@ -970,6 +985,7 @@ fn walk_tree<'a>(
             edges,
             seen_ids,
             pending_calls,
+            function_returns,
         );
     }
 }
@@ -988,6 +1004,7 @@ fn handle_class<'a>(
     edges: &mut Vec<Edge>,
     seen_ids: &mut HashSet<String>,
     pending_calls: &mut Vec<PendingCall>,
+    function_returns: &mut Vec<FunctionReturn>,
 ) {
     let class_name = if node.kind() == "impl_item" {
         resolve_impl_type(node, source, stem)
@@ -1084,6 +1101,7 @@ fn handle_class<'a>(
                 edges,
                 seen_ids,
                 pending_calls,
+                function_returns,
             );
         }
     }
@@ -1211,6 +1229,7 @@ fn handle_function<'a>(
     edges: &mut Vec<Edge>,
     seen_ids: &mut HashSet<String>,
     pending_calls: &mut Vec<PendingCall>,
+    function_returns: &mut Vec<FunctionReturn>,
 ) {
     let ext = source_extension(source_file);
     let func_name = if matches!(ext, "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx") {
@@ -1307,11 +1326,57 @@ fn handle_function<'a>(
         },
     );
 
+    if ext == "rs" {
+        if let Some(return_type_name) = rust_return_type_name(node, source) {
+            function_returns.push(FunctionReturn {
+                function_name: func_name.clone(),
+                return_type_name,
+            });
+        }
+    }
+
     // Collect calls inside this function body
     let body = find_body(node, cfg);
     if let Some(body_node) = body {
         collect_calls(body_node, &func_id, source, cfg, pending_calls);
     }
+}
+
+fn rust_return_type_name(node: TsNode<'_>, source: &[u8]) -> Option<String> {
+    let return_node = node
+        .child_by_field_name("return_type")
+        .or_else(|| named_children(node).into_iter().find(|child| child.kind() == "return_type"))?;
+    let return_text = node_text(return_node, source)?;
+    normalize_rust_type_name(&return_text)
+}
+
+fn normalize_rust_type_name(value: &str) -> Option<String> {
+    let mut last = None;
+    let mut current = String::new();
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            current.push(ch);
+            continue;
+        }
+        if !current.is_empty() {
+            if !matches!(
+                current.as_str(),
+                "pub" | "mut" | "const" | "dyn" | "impl" | "where" | "fn"
+            ) {
+                last = Some(current.clone());
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty()
+        && !matches!(
+            current.as_str(),
+            "pub" | "mut" | "const" | "dyn" | "impl" | "where" | "fn"
+        )
+    {
+        last = Some(current);
+    }
+    last.filter(|name| name != "Self")
 }
 
 fn is_python_property_function(node: TsNode<'_>, source: &[u8]) -> bool {
@@ -2098,12 +2163,13 @@ fn collect_calls(
     }
 
     if cfg.call_types.iter().any(|ct| *ct == t) {
-        if let Some((callee, allow_cross_file)) = resolve_callee(node, source, cfg) {
+        if let Some(resolved) = resolve_callee(node, source, cfg) {
             pending_calls.push(PendingCall {
                 caller_id: caller_id.to_string(),
-                callee_name: callee,
+                callee_name: resolved.callee_name,
                 line_no: node.start_position().row + 1,
-                allow_cross_file,
+                allow_cross_file: resolved.allow_cross_file,
+                receiver_call: resolved.receiver_call,
             });
         }
     }
@@ -2113,11 +2179,17 @@ fn collect_calls(
     }
 }
 
+struct ResolvedCall {
+    callee_name: String,
+    allow_cross_file: bool,
+    receiver_call: Option<String>,
+}
+
 fn resolve_callee(
     node: TsNode<'_>,
     source: &[u8],
     cfg: &LanguageConfig,
-) -> Option<(String, bool)> {
+) -> Option<ResolvedCall> {
     if node.kind() == "class_constant_access_expression" {
         return None;
     }
@@ -2133,14 +2205,27 @@ fn resolve_callee(
         .iter()
         .any(|at| *at == func_node.kind())
     {
+        let receiver_call = if cfg.allow_receiver_call_cross_file {
+            accessor_receiver_call_name(func_node, source, cfg)
+        } else {
+            None
+        };
         if !cfg.call_accessor_field.is_empty() {
             if let Some(attr) = func_node.child_by_field_name(cfg.call_accessor_field) {
-                return node_text(attr, source).map(|text| (text, false));
+                return node_text(attr, source).map(|text| ResolvedCall {
+                    callee_name: text,
+                    allow_cross_file: receiver_call.is_some(),
+                    receiver_call,
+                });
             }
         }
         // Last named child as fallback
         if let Some(last) = named_children(func_node).into_iter().last() {
-            return node_text(last, source).map(|text| (text, false));
+            return node_text(last, source).map(|text| ResolvedCall {
+                callee_name: text,
+                allow_cross_file: receiver_call.is_some(),
+                receiver_call,
+            });
         }
     }
 
@@ -2149,14 +2234,40 @@ fn resolve_callee(
             .child_by_field_name("name")
             .and_then(|node| node_text(node, source))
         {
-            return Some((name, true));
+            return Some(ResolvedCall {
+                callee_name: name,
+                allow_cross_file: true,
+                receiver_call: None,
+            });
         }
         if let Some(last) = named_children(func_node).into_iter().last() {
-            return node_text(last, source).map(|text| (text, true));
+            return node_text(last, source).map(|text| ResolvedCall {
+                callee_name: text,
+                allow_cross_file: true,
+                receiver_call: None,
+            });
         }
     }
 
-    node_text(func_node, source).map(|text| (text, true))
+    node_text(func_node, source).map(|text| ResolvedCall {
+        callee_name: text,
+        allow_cross_file: true,
+        receiver_call: None,
+    })
+}
+
+fn accessor_receiver_call_name(
+    func_node: TsNode<'_>,
+    source: &[u8],
+    cfg: &LanguageConfig,
+) -> Option<String> {
+    let receiver = func_node
+        .child_by_field_name("value")
+        .or_else(|| named_children(func_node).into_iter().next())?;
+    if receiver.kind() != "call_expression" {
+        return None;
+    }
+    resolve_callee(receiver, source, cfg).map(|resolved| resolved.callee_name)
 }
 
 fn resolve_c_like_function_name(node: TsNode<'_>, source: &[u8], is_cpp: bool) -> Option<String> {
@@ -2494,6 +2605,7 @@ struct PendingCall {
     callee_name: String,
     line_no: usize,
     allow_cross_file: bool,
+    receiver_call: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2552,6 +2664,86 @@ fn build_label_index(nodes: &[Node]) -> HashMap<String, String> {
         label_to_id.insert(normalized, node.id.clone());
     }
     label_to_id
+}
+
+fn build_function_return_index(function_returns: &[FunctionReturn]) -> HashMap<String, String> {
+    let mut index = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for function_return in function_returns {
+        let function_name = normalize_lookup_name(&function_return.function_name);
+        let return_type_name = normalize_lookup_name(&function_return.return_type_name);
+        if function_name.is_empty() || return_type_name.is_empty() {
+            continue;
+        }
+        insert_unique_lookup(&mut index, &mut ambiguous, function_name, return_type_name);
+    }
+    index
+}
+
+fn build_method_index(nodes: &[Node], edges: &[Edge]) -> HashMap<String, String> {
+    let nodes_by_id: HashMap<&str, &Node> = nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let mut index = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for edge in edges {
+        if edge.relation != "method" {
+            continue;
+        }
+        let Some(owner) = nodes_by_id.get(edge.source.as_str()) else {
+            continue;
+        };
+        let Some(method) = nodes_by_id.get(edge.target.as_str()) else {
+            continue;
+        };
+        let owner_name = normalize_lookup_name(&owner.label);
+        let method_name = normalize_lookup_name(&method.label);
+        if owner_name.is_empty() || method_name.is_empty() {
+            continue;
+        }
+        insert_unique_lookup(
+            &mut index,
+            &mut ambiguous,
+            method_lookup_key(&owner_name, &method_name),
+            method.id.clone(),
+        );
+    }
+    index
+}
+
+fn lookup_receiver_method_target<'a>(
+    method_index: &'a HashMap<String, String>,
+    function_return_index: &HashMap<String, String>,
+    raw_call: &RawCall,
+) -> Option<&'a String> {
+    let receiver_call = raw_call.receiver_call.as_ref()?;
+    let receiver_name = normalize_lookup_name(receiver_call);
+    let method_name = normalize_lookup_name(&raw_call.callee);
+    let return_type = function_return_index.get(&receiver_name)?;
+    method_index.get(&method_lookup_key(return_type, &method_name))
+}
+
+fn method_lookup_key(owner_name: &str, method_name: &str) -> String {
+    format!("{owner_name}::{method_name}")
+}
+
+fn insert_unique_lookup(
+    index: &mut HashMap<String, String>,
+    ambiguous: &mut HashSet<String>,
+    key: String,
+    value: String,
+) {
+    if ambiguous.contains(&key) {
+        return;
+    }
+    match index.get(&key) {
+        None => {
+            index.insert(key, value);
+        }
+        Some(existing) if existing == &value => {}
+        Some(_) => {
+            index.remove(&key);
+            ambiguous.insert(key);
+        }
+    }
 }
 
 fn normalize_lookup_name(value: &str) -> String {
@@ -6136,6 +6328,67 @@ pub fn normalize() {}
         assert!(result.edges.iter().any(|edge| {
             edge.source == start_id
                 && edge.target == normalize_id
+                && edge.relation == "calls"
+                && edge.confidence == "INFERRED"
+                && edge.confidence_score == Some(0.8)
+        }));
+        assert!(result.raw_calls.is_empty());
+    }
+
+    #[test]
+    fn infers_cross_file_calls_for_rust_methods_on_function_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeutil_path = dir.path().join("timeutil.rs");
+        let ingest_path = dir.path().join("ingest.rs");
+        fs::write(
+            &timeutil_path,
+            r#"
+pub struct UtcDateTime;
+
+impl UtcDateTime {
+    pub fn iso_string(&self) -> String {
+        String::new()
+    }
+}
+
+pub fn current_utc_datetime() -> UtcDateTime {
+    UtcDateTime
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &ingest_path,
+            r#"
+fn fetch() {
+    let _ = current_utc_datetime().iso_string();
+}
+"#,
+        )
+        .unwrap();
+
+        let result = extract_paths(&[
+            timeutil_path.to_string_lossy().to_string(),
+            ingest_path.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+
+        let fetch_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "fetch()")
+            .map(|node| node.id.clone())
+            .unwrap();
+        let iso_string_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == ".iso_string()")
+            .map(|node| node.id.clone())
+            .unwrap();
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.source == fetch_id
+                && edge.target == iso_string_id
                 && edge.relation == "calls"
                 && edge.confidence == "INFERRED"
                 && edge.confidence_score == Some(0.8)

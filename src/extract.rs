@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use rayon::prelude::*;
 use regex::Regex;
 use tree_sitter::{Language, Node as TsNode, Parser};
 
@@ -485,6 +486,49 @@ fn config_for_path(path: &Path) -> Option<LanguageConfig> {
 
 // ── Main entry point ──────────────────────────────────────────────────────────
 
+#[derive(Debug)]
+struct ExtractPathResult {
+    path: PathBuf,
+    extraction: Extraction,
+    is_python: bool,
+}
+
+fn extract_path(path_str: &str) -> Result<Option<ExtractPathResult>> {
+    let path = Path::new(path_str);
+    match classify_file(path) {
+        Some(FileType::Document) | Some(FileType::Paper) => Ok(Some(ExtractPathResult {
+            path: path.to_path_buf(),
+            extraction: extract_text_document(path)?,
+            is_python: false,
+        })),
+        Some(FileType::Code) => {
+            if is_embedded_script_path(path) {
+                return Ok(Some(ExtractPathResult {
+                    path: path.to_path_buf(),
+                    extraction: extract_embedded_script_file(path)?,
+                    is_python: false,
+                }));
+            }
+            if let Some(result) = extract_special_case_code(path)? {
+                return Ok(Some(ExtractPathResult {
+                    path: path.to_path_buf(),
+                    extraction: result,
+                    is_python: false,
+                }));
+            }
+            let Some(cfg) = config_for_path(path) else {
+                return Ok(None);
+            };
+            Ok(Some(ExtractPathResult {
+                path: path.to_path_buf(),
+                extraction: extract_generic(path, &cfg)?,
+                is_python: path.extension().and_then(|ext| ext.to_str()) == Some("py"),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub fn extract_paths(paths: &[String]) -> Result<Extraction> {
     if paths.is_empty() {
         return Ok(Extraction::default());
@@ -493,35 +537,21 @@ pub fn extract_paths(paths: &[String]) -> Result<Extraction> {
     let mut combined = Extraction::default();
     let mut python_results: Vec<(PathBuf, Extraction)> = Vec::new();
 
-    for path_str in paths {
-        let path = Path::new(path_str);
-        match classify_file(path) {
-            Some(FileType::Document) | Some(FileType::Paper) => {
-                append_extraction(&mut combined, extract_text_document(path)?);
-            }
-            Some(FileType::Code) => {
-                if is_embedded_script_path(path) {
-                    append_extraction(&mut combined, extract_embedded_script_file(path)?);
-                    continue;
-                }
-                if let Some(result) = extract_special_case_code(path)? {
-                    append_extraction(&mut combined, result);
-                    continue;
-                }
-                let cfg = match config_for_path(path) {
-                    Some(c) => c,
-                    None => {
-                        continue;
-                    }
-                };
-                let result = extract_generic(path, &cfg)?;
-                if path.extension().and_then(|ext| ext.to_str()) == Some("py") {
-                    python_results.push((path.to_path_buf(), result.clone()));
-                }
-                append_extraction(&mut combined, result);
-            }
-            _ => continue,
+    let mut extracted: Vec<(usize, Result<Option<ExtractPathResult>>)> = paths
+        .par_iter()
+        .enumerate()
+        .map(|(index, path_str)| (index, extract_path(path_str)))
+        .collect();
+    extracted.sort_by_key(|(index, _)| *index);
+
+    for (_, result) in extracted {
+        let Some(result) = result? else {
+            continue;
+        };
+        if result.is_python {
+            python_results.push((result.path.clone(), result.extraction.clone()));
         }
+        append_extraction(&mut combined, result.extraction);
     }
 
     if !python_results.is_empty() {
@@ -1343,9 +1373,11 @@ fn handle_function<'a>(
 }
 
 fn rust_return_type_name(node: TsNode<'_>, source: &[u8]) -> Option<String> {
-    let return_node = node
-        .child_by_field_name("return_type")
-        .or_else(|| named_children(node).into_iter().find(|child| child.kind() == "return_type"))?;
+    let return_node = node.child_by_field_name("return_type").or_else(|| {
+        named_children(node)
+            .into_iter()
+            .find(|child| child.kind() == "return_type")
+    })?;
     let return_text = node_text(return_node, source)?;
     normalize_rust_type_name(&return_text)
 }
@@ -1871,7 +1903,10 @@ fn normalize_lexical_path(path: PathBuf) -> PathBuf {
             std::path::Component::RootDir => has_root = true,
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if parts.last().is_some_and(|part: &std::ffi::OsString| part != "..") {
+                if parts
+                    .last()
+                    .is_some_and(|part: &std::ffi::OsString| part != "..")
+                {
                     parts.pop();
                 } else if !has_root {
                     parts.push("..".into());
@@ -2185,11 +2220,7 @@ struct ResolvedCall {
     receiver_call: Option<String>,
 }
 
-fn resolve_callee(
-    node: TsNode<'_>,
-    source: &[u8],
-    cfg: &LanguageConfig,
-) -> Option<ResolvedCall> {
+fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Option<ResolvedCall> {
     if node.kind() == "class_constant_access_expression" {
         return None;
     }
@@ -2681,7 +2712,8 @@ fn build_function_return_index(function_returns: &[FunctionReturn]) -> HashMap<S
 }
 
 fn build_method_index(nodes: &[Node], edges: &[Edge]) -> HashMap<String, String> {
-    let nodes_by_id: HashMap<&str, &Node> = nodes.iter().map(|node| (node.id.as_str(), node)).collect();
+    let nodes_by_id: HashMap<&str, &Node> =
+        nodes.iter().map(|node| (node.id.as_str(), node)).collect();
     let mut index = HashMap::new();
     let mut ambiguous = HashSet::new();
     for edge in edges {
@@ -6433,7 +6465,11 @@ function main() {
         let app_path = nested_dir.join("app.js");
         let util_path = dir.path().join("src").join("shared").join("util.ts");
         fs::create_dir_all(util_path.parent().unwrap()).unwrap();
-        fs::write(&app_path, "import helper from '../shared/../shared/util.js';\n").unwrap();
+        fs::write(
+            &app_path,
+            "import helper from '../shared/../shared/util.js';\n",
+        )
+        .unwrap();
         fs::write(&util_path, "export function helper() {}\n").unwrap();
 
         let result = extract_paths(&[
@@ -6443,10 +6479,12 @@ function main() {
         .unwrap();
         let expected_target = make_id(&util_path.to_string_lossy());
 
-        assert!(result
-            .edges
-            .iter()
-            .any(|edge| edge.relation == "imports_from" && edge.target == expected_target));
+        assert!(
+            result
+                .edges
+                .iter()
+                .any(|edge| edge.relation == "imports_from" && edge.target == expected_target)
+        );
     }
 
     #[test]

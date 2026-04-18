@@ -1,3 +1,4 @@
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
@@ -627,20 +628,31 @@ fn modularity(graph: &WeightedGraphLevel, communities: &[HashSet<usize>]) -> f64
         return 0.0;
     }
 
+    let mut node_to_community = vec![usize::MAX; graph.members.len()];
+    let mut total_degree = vec![0.0; communities.len()];
+    for (community_idx, community) in communities.iter().enumerate() {
+        for &node in community {
+            node_to_community[node] = community_idx;
+            total_degree[community_idx] += graph.degrees[node];
+        }
+    }
+
+    let mut intra_weight = vec![0.0; communities.len()];
+    for (&(u, v), &weight) in &graph.pair_weights {
+        let community_u = node_to_community[u];
+        if community_u != usize::MAX && community_u == node_to_community[v] {
+            intra_weight[community_u] += weight;
+        }
+    }
+
     let mut score = 0.0;
-    for community in communities {
-        if community.is_empty() {
+    for community_idx in 0..communities.len() {
+        if total_degree[community_idx] == 0.0 {
             continue;
         }
-        let total_degree: f64 = community.iter().map(|&node| graph.degrees[node]).sum();
-        let mut intra_weight = 0.0;
-        for (&(u, v), &weight) in &graph.pair_weights {
-            if community.contains(&u) && community.contains(&v) {
-                intra_weight += weight;
-            }
-        }
-        score += intra_weight / graph.total_weight
-            - LOUVAIN_RESOLUTION * (total_degree / (2.0 * graph.total_weight)).powi(2);
+        score += intra_weight[community_idx] / graph.total_weight
+            - LOUVAIN_RESOLUTION
+                * (total_degree[community_idx] / (2.0 * graph.total_weight)).powi(2);
     }
     score
 }
@@ -826,6 +838,11 @@ fn split_community(
     if groups.len() <= 1 {
         return vec![nodes.to_vec()];
     }
+    let id_by_global: HashMap<usize, &String> = local_global
+        .iter()
+        .enumerate()
+        .map(|(local_idx, &global_idx)| (global_idx, &nodes[local_idx]))
+        .collect();
     groups
         .into_iter()
         .map(|members| {
@@ -838,13 +855,7 @@ fn split_community(
                         .copied()
                         .unwrap_or(global_i)
                 })
-                .map(|global_i| {
-                    nodes[local_global
-                        .iter()
-                        .position(|&idx| idx == global_i)
-                        .unwrap()]
-                    .clone()
-                })
+                .filter_map(|global_i| id_by_global.get(&global_i).cloned().cloned())
                 .collect();
             community.sort();
             community
@@ -3041,6 +3052,9 @@ pub fn export_html_3d(
     community_labels: &HashMap<usize, String>,
     title: &str,
 ) -> String {
+    const LARGE_GRAPH_MODE_NODE_THRESHOLD: usize = 300;
+    const LARGE_GRAPH_MODE_EDGE_THRESHOLD: usize = 900;
+
     let export_edges = collapsed_undirected_edges(graph);
     let node_community: HashMap<&str, usize> = communities
         .iter()
@@ -3048,6 +3062,8 @@ pub fn export_html_3d(
         .collect();
     let degree = compute_degrees_from_edges(&export_edges);
     let max_degree = degree.values().copied().max().unwrap_or(1).max(1) as f64;
+    let large_graph_mode = graph.nodes.len() > LARGE_GRAPH_MODE_NODE_THRESHOLD
+        || export_edges.len() > LARGE_GRAPH_MODE_EDGE_THRESHOLD;
 
     let vis_nodes: Vec<serde_json::Value> = graph
         .nodes
@@ -3107,6 +3123,103 @@ pub fn export_html_3d(
             })
         })
         .collect();
+    let node_by_id: HashMap<&str, &Node> = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node))
+        .collect();
+    let community_members: BTreeMap<usize, Vec<String>> = communities
+        .iter()
+        .map(|(&cid, nodes)| (cid, nodes.clone()))
+        .collect();
+    let max_members = community_members
+        .values()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    let mut internal_edges: HashMap<usize, usize> = HashMap::new();
+    let mut cross_edges: BTreeMap<(usize, usize), usize> = BTreeMap::new();
+    for edge in &export_edges {
+        let Some(&source_cid) = node_community.get(edge.source.as_str()) else {
+            continue;
+        };
+        let Some(&target_cid) = node_community.get(edge.target.as_str()) else {
+            continue;
+        };
+        if source_cid == target_cid {
+            *internal_edges.entry(source_cid).or_default() += 1;
+        } else {
+            let pair = if source_cid < target_cid {
+                (source_cid, target_cid)
+            } else {
+                (target_cid, source_cid)
+            };
+            *cross_edges.entry(pair).or_default() += 1;
+        }
+    }
+    let max_cross_edges = cross_edges.values().copied().max().unwrap_or(1).max(1) as f64;
+    let community_overview_nodes: Vec<serde_json::Value> = community_members
+        .iter()
+        .map(|(&cid, members)| {
+            let label = community_labels
+                .get(&cid)
+                .cloned()
+                .unwrap_or_else(|| format!("Community {}", cid));
+            let mut preview_nodes: Vec<&Node> = members
+                .iter()
+                .filter_map(|node_id| node_by_id.get(node_id.as_str()).copied())
+                .collect();
+            preview_nodes.sort_by(|left, right| {
+                degree
+                    .get(right.id.as_str())
+                    .copied()
+                    .unwrap_or(0)
+                    .cmp(&degree.get(left.id.as_str()).copied().unwrap_or(0))
+                    .then_with(|| left.label.cmp(&right.label))
+            });
+            let preview = preview_nodes
+                .iter()
+                .take(3)
+                .map(|node| node.label.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let size = 22.0 + 38.0 * ((members.len() as f64).sqrt() / max_members.sqrt());
+            serde_json::json!({
+                "id": format!("community:{cid}"),
+                "label": label,
+                "color": COMMUNITY_COLORS[cid % COMMUNITY_COLORS.len()],
+                "size": (size * 10.0).round() / 10.0,
+                "community": cid,
+                "community_name": community_labels
+                    .get(&cid)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Community {}", cid)),
+                "source_file": "",
+                "file_type": "community",
+                "degree": members.len(),
+                "node_count": members.len(),
+                "edge_count": internal_edges.get(&cid).copied().unwrap_or(0),
+                "preview": preview,
+                "kind": "community",
+            })
+        })
+        .collect();
+    let community_overview_links: Vec<serde_json::Value> = cross_edges
+        .iter()
+        .map(|(&(source_cid, target_cid), &count)| {
+            let width = 1.0 + 5.0 * (count as f64 / max_cross_edges);
+            serde_json::json!({
+                "source": format!("community:{source_cid}"),
+                "target": format!("community:{target_cid}"),
+                "label": format!("{count} cross-community edges"),
+                "confidence": "AGGREGATED",
+                "width": (width * 10.0).round() / 10.0,
+                "color": COMMUNITY_COLORS[source_cid % COMMUNITY_COLORS.len()],
+                "kind": "community",
+            })
+        })
+        .collect();
 
     let title = html_escape(title);
     let stats = format!(
@@ -3118,7 +3231,10 @@ pub fn export_html_3d(
     let nodes_json = js_safe_json(&vis_nodes);
     let edges_json = js_safe_json(&vis_edges);
     let legend_json = js_safe_json(&legend);
-
+    let community_overview_json = js_safe_json(&serde_json::json!({
+        "nodes": community_overview_nodes,
+        "links": community_overview_links,
+    }));
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -3134,6 +3250,11 @@ body {{ display: flex; overflow: hidden; }}
 #search {{ width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.14); border-radius: 10px; background: rgba(255,255,255,0.06); color: #fff; outline: none; }}
 #search:focus {{ border-color: rgba(102, 178, 255, 0.9); box-shadow: 0 0 0 3px rgba(102,178,255,0.18); }}
 #search-results {{ margin-top: 10px; display: none; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; background: rgba(7, 10, 18, 0.95); max-height: 240px; overflow: auto; }}
+#view-controls {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
+.control-btn {{ border: 1px solid rgba(255,255,255,0.14); border-radius: 999px; background: rgba(255,255,255,0.04); color: #dce7ff; padding: 6px 10px; font-size: 12px; cursor: pointer; }}
+.control-btn.active {{ background: rgba(95, 158, 255, 0.18); border-color: rgba(95, 158, 255, 0.55); }}
+.control-row {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }}
+.mode-hint {{ margin-top: 10px; font-size: 12px; color: #9fb0c9; line-height: 1.5; }}
 .search-item {{ padding: 10px 12px; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.06); }}
 .search-item:last-child {{ border-bottom: 0; }}
 .search-item:hover {{ background: rgba(255,255,255,0.08); }}
@@ -3158,6 +3279,7 @@ h3 {{ margin: 18px 0 10px; font-size: 15px; color: #dce7ff; }}
   <div id="search-wrap">
     <input id="search" type="text" placeholder="Search nodes..." autocomplete="off">
     <div id="search-results"></div>
+    <div id="view-controls"></div>
   </div>
   <div id="info-panel">
     <h3>Node Info</h3>
@@ -3174,15 +3296,37 @@ h3 {{ margin: 18px 0 10px; font-size: 15px; color: #dce7ff; }}
 const BASE_NODES = {nodes_json};
 const BASE_LINKS = {edges_json};
 const LEGEND = {legend_json};
+const LARGE_GRAPH_MODE = {large_graph_mode};
+const COMMUNITY_OVERVIEW = {community_overview_json};
 
 const graphEl = document.getElementById('graph');
 const searchEl = document.getElementById('search');
 const searchResultsEl = document.getElementById('search-results');
 const infoContentEl = document.getElementById('info-content');
 const legendEl = document.getElementById('legend');
+const viewControlsEl = document.getElementById('view-controls');
+const MAX_NEIGHBORHOOD_NEIGHBORS = LARGE_GRAPH_MODE ? 80 : 120;
 
 const nodeById = new Map(BASE_NODES.map(node => [node.id, node]));
+const communityOverviewNodeById = new Map(COMMUNITY_OVERVIEW.nodes.map(node => [node.id, node]));
+const legendById = new Map(LEGEND.map(item => [item.cid, item]));
+const EDGE_RECORDS = BASE_LINKS.map((link, index) => ({{ ...link, _index: index }}));
+const neighborIndex = new Map(BASE_NODES.map(node => [node.id, new Set()]));
+const incidentLinkIndexes = new Map(BASE_NODES.map(node => [node.id, []]));
+const FULL_GRAPH_LINK_BATCH = LARGE_GRAPH_MODE ? 450 : 1000;
+for (const link of EDGE_RECORDS) {{
+  if (neighborIndex.has(link.source)) neighborIndex.get(link.source).add(link.target);
+  if (neighborIndex.has(link.target)) neighborIndex.get(link.target).add(link.source);
+  if (incidentLinkIndexes.has(link.source)) incidentLinkIndexes.get(link.source).push(link._index);
+  if (incidentLinkIndexes.has(link.target)) incidentLinkIndexes.get(link.target).push(link._index);
+}}
 let hiddenCommunities = new Set();
+let viewMode = LARGE_GRAPH_MODE ? 'overview' : 'full';
+let activeCommunity = null;
+let activeNodeId = null;
+let pendingRefreshFrame = null;
+let progressiveLoadFrame = null;
+let pendingZoomToFit = true;
 let currentData = {{ nodes: [], links: [] }};
 
 function esc(value) {{
@@ -3193,7 +3337,93 @@ function esc(value) {{
     .replace(/"/g, '&quot;');
 }}
 
+function graphNodeId(value) {{
+  return typeof value === 'object' ? value.id : value;
+}}
+
+function communityLabel(communityId) {{
+  return legendById.get(communityId)?.label || `Community ${{communityId}}`;
+}}
+
+function applyViewTuning() {{
+  const overview = viewMode === 'overview';
+  const neighborhood = viewMode === 'neighborhood';
+  Graph.linkOpacity(overview ? 0.45 : (LARGE_GRAPH_MODE ? 0.14 : 0.28));
+  Graph.linkDirectionalArrowLength(overview || LARGE_GRAPH_MODE ? 0 : 3);
+  Graph.nodeVal(node => {{
+    if (node.kind === 'community') return Math.max(8, Number(node.size || 20) / 2.8);
+    return Math.max(2.5, Number(node.size || 8) / 5);
+  }});
+  Graph.cooldownTicks(overview ? 45 : (neighborhood ? 30 : (LARGE_GRAPH_MODE ? 60 : 120)));
+  const chargeForce = Graph.d3Force('charge');
+  if (chargeForce) chargeForce.strength(overview ? -260 : (neighborhood ? -180 : (LARGE_GRAPH_MODE ? -95 : -140)));
+  const linkForce = Graph.d3Force('link');
+  if (linkForce) {{
+    linkForce.distance(link => {{
+      if (link.kind === 'community') return 180;
+      return neighborhood
+        ? (link.width > 1 ? 90 : 115)
+        : LARGE_GRAPH_MODE
+          ? (link.width > 1 ? 65 : 85)
+          : (link.width > 1 ? 80 : 110);
+    }});
+  }}
+}}
+
+function showOverviewHint() {{
+  infoContentEl.innerHTML = '<span class="empty">Click a community to inspect it, then open its subgraph only if you need more detail.</span>';
+}}
+
+function buildNeighborhoodData(nodeId) {{
+  const center = nodeById.get(nodeId);
+  if (!center) return {{ nodes: [], links: [] }};
+  const neighbors = [...(neighborIndex.get(nodeId) || [])]
+    .map(id => nodeById.get(id))
+    .filter(Boolean)
+    .sort((left, right) => Number(right.degree || 0) - Number(left.degree || 0) || String(left.label).localeCompare(String(right.label)))
+    .slice(0, MAX_NEIGHBORHOOD_NEIGHBORS);
+  const visibleIds = new Set([nodeId, ...neighbors.map(node => node.id)]);
+  const linkIndexes = new Set();
+  for (const visibleId of visibleIds) {{
+    for (const linkIndex of incidentLinkIndexes.get(visibleId) || []) {{
+      linkIndexes.add(linkIndex);
+    }}
+  }}
+  const nodes = [...visibleIds]
+    .map(id => nodeById.get(id))
+    .filter(Boolean)
+    .map(node => ({{ ...node }}));
+  const links = [...linkIndexes]
+    .map(index => EDGE_RECORDS[index])
+    .filter(link => visibleIds.has(link.source) && visibleIds.has(link.target))
+    .map(link => ({{ ...link }}));
+  return {{ nodes, links }};
+}}
+
 function buildVisibleData() {{
+  if (viewMode === 'overview') {{
+    const nodes = COMMUNITY_OVERVIEW.nodes
+      .filter(node => !hiddenCommunities.has(node.community))
+      .map(node => ({{ ...node }}));
+    const visible = new Set(nodes.map(node => node.id));
+    const links = COMMUNITY_OVERVIEW.links
+      .filter(link => visible.has(link.source) && visible.has(link.target))
+      .map(link => ({{ ...link }}));
+    return {{ nodes, links }};
+  }}
+  if (viewMode === 'neighborhood' && activeNodeId) {{
+    return buildNeighborhoodData(activeNodeId);
+  }}
+  if (viewMode === 'community' && activeCommunity !== null) {{
+    const nodes = BASE_NODES
+      .filter(node => node.community === activeCommunity && !hiddenCommunities.has(node.community))
+      .map(node => ({{ ...node }}));
+    const visible = new Set(nodes.map(node => node.id));
+    const links = BASE_LINKS
+      .filter(link => visible.has(link.source) && visible.has(link.target))
+      .map(link => ({{ ...link }}));
+    return {{ nodes, links }};
+  }}
   const nodes = BASE_NODES
     .filter(node => !hiddenCommunities.has(node.community))
     .map(node => ({{ ...node }}));
@@ -3217,7 +3447,7 @@ const Graph = ForceGraph3D()(graphEl)
       <div>Community: ${{esc(node.community_name)}}</div>
       <div>Type: ${{esc(node.file_type || 'unknown')}}</div>
       <div>Degree: ${{esc(node.degree)}}</div>
-      <div>File: ${{esc(node.source_file || '')}}</div>
+      <div>${{node.kind === 'community' ? 'Nodes' : 'File'}}: ${{esc(node.kind === 'community' ? node.node_count : (node.source_file || ''))}}</div>
     </div>
   `)
   .linkColor(link => link.color)
@@ -3225,13 +3455,142 @@ const Graph = ForceGraph3D()(graphEl)
   .linkOpacity(0.28)
   .linkDirectionalArrowLength(3)
   .linkDirectionalArrowRelPos(1)
-  .onNodeClick(node => focusNode(node.id));
+  .onNodeClick(node => {{
+    if (node.kind === 'community') {{
+      openCommunity(node.community);
+      return;
+    }}
+    focusNode(node.id);
+  }});
 
 const charge = Graph.d3Force('charge');
-if (charge) charge.strength(-140);
+if (charge) charge.strength(LARGE_GRAPH_MODE ? -95 : -140);
 const linkForce = Graph.d3Force('link');
 if (linkForce) linkForce.distance(link => link.width > 1 ? 80 : 110);
-Graph.d3VelocityDecay(0.22);
+Graph.d3VelocityDecay(LARGE_GRAPH_MODE ? 0.34 : 0.22);
+const controls = typeof Graph.controls === 'function' ? Graph.controls() : null;
+if (controls) {{
+  controls.enableZoom = true;
+  controls.enablePan = true;
+  controls.enableRotate = true;
+  controls.zoomSpeed = 1.1;
+}}
+
+function zoomCamera(scale) {{
+  if (!controls || !controls.object) return;
+  const camera = controls.object;
+  const target = controls.target || {{ x: 0, y: 0, z: 0 }};
+  const nextX = target.x + (camera.position.x - target.x) * scale;
+  const nextY = target.y + (camera.position.y - target.y) * scale;
+  const nextZ = target.z + (camera.position.z - target.z) * scale;
+  Graph.cameraPosition(
+    {{ x: nextX, y: nextY, z: nextZ }},
+    {{ x: target.x, y: target.y, z: target.z }},
+    220,
+  );
+}}
+
+function fitCurrentGraph() {{
+  pendingZoomToFit = false;
+  if (typeof Graph.zoomToFit === 'function') {{
+    Graph.zoomToFit(
+      viewMode === 'community' ? 900 : 700,
+      viewMode === 'community' ? 70 : 90,
+    );
+  }}
+}}
+
+function renderControls() {{
+  viewControlsEl.innerHTML = '';
+  const buttons = document.createElement('div');
+  buttons.className = 'control-row';
+  buttons.style.display = 'flex';
+  buttons.style.gap = '8px';
+  buttons.style.flexWrap = 'wrap';
+
+  if (LARGE_GRAPH_MODE) {{
+    const overviewBtn = document.createElement('button');
+    overviewBtn.type = 'button';
+    overviewBtn.className = 'control-btn' + (viewMode === 'overview' ? ' active' : '');
+    overviewBtn.textContent = 'Community overview';
+    overviewBtn.addEventListener('click', () => {{
+      viewMode = 'overview';
+      activeCommunity = null;
+      activeNodeId = null;
+      pendingZoomToFit = true;
+      refreshGraph();
+      showOverviewHint();
+    }});
+    buttons.appendChild(overviewBtn);
+
+    const fullBtn = document.createElement('button');
+    fullBtn.type = 'button';
+    fullBtn.className = 'control-btn' + (viewMode === 'full' ? ' active' : '');
+    fullBtn.textContent = 'Load full graph';
+    fullBtn.addEventListener('click', () => {{
+      viewMode = 'full';
+      activeCommunity = null;
+      activeNodeId = null;
+      pendingZoomToFit = false;
+      refreshGraph();
+    }});
+    buttons.appendChild(fullBtn);
+
+    if ((viewMode === 'community' || viewMode === 'neighborhood') && activeCommunity !== null) {{
+      const communityBtn = document.createElement('button');
+      communityBtn.type = 'button';
+      communityBtn.className = 'control-btn' + (viewMode === 'community' ? ' active' : '');
+      communityBtn.textContent = communityLabel(activeCommunity);
+      communityBtn.addEventListener('click', () => openCommunity(activeCommunity));
+      buttons.appendChild(communityBtn);
+    }}
+
+    if (viewMode === 'neighborhood' && activeNodeId) {{
+      const nodeBtn = document.createElement('button');
+      nodeBtn.type = 'button';
+      nodeBtn.className = 'control-btn active';
+      nodeBtn.textContent = 'Node neighborhood';
+      nodeBtn.addEventListener('click', () => openNodeNeighborhood(activeNodeId));
+      buttons.appendChild(nodeBtn);
+    }}
+  }}
+
+  const zoomInBtn = document.createElement('button');
+  zoomInBtn.type = 'button';
+  zoomInBtn.className = 'control-btn';
+  zoomInBtn.textContent = 'Zoom in';
+  zoomInBtn.addEventListener('click', () => zoomCamera(0.8));
+  buttons.appendChild(zoomInBtn);
+
+  const zoomOutBtn = document.createElement('button');
+  zoomOutBtn.type = 'button';
+  zoomOutBtn.className = 'control-btn';
+  zoomOutBtn.textContent = 'Zoom out';
+  zoomOutBtn.addEventListener('click', () => zoomCamera(1.25));
+  buttons.appendChild(zoomOutBtn);
+
+  const fitBtn = document.createElement('button');
+  fitBtn.type = 'button';
+  fitBtn.className = 'control-btn';
+  fitBtn.textContent = 'Fit view';
+  fitBtn.addEventListener('click', () => fitCurrentGraph());
+  buttons.appendChild(fitBtn);
+
+  const hint = document.createElement('div');
+  hint.className = 'mode-hint';
+  hint.textContent = LARGE_GRAPH_MODE
+    ? viewMode === 'overview'
+      ? 'Large graph mode is active: start from communities, then drill into a community or switch to the full graph if needed.'
+      : viewMode === 'neighborhood' && activeNodeId
+        ? 'Showing only the clicked node and its local neighborhood for faster interaction.'
+        : viewMode === 'community' && activeCommunity !== null
+          ? `Showing ${{communityLabel(activeCommunity)}} only for smoother interaction.`
+          : 'Showing the full graph. If wheel zoom is flaky, use the zoom buttons above.'
+    : 'Use the zoom controls above if browser gestures are unreliable.';
+
+  viewControlsEl.appendChild(buttons);
+  viewControlsEl.appendChild(hint);
+}}
 
 function renderLegend() {{
   legendEl.innerHTML = '';
@@ -3253,30 +3612,76 @@ function renderLegend() {{
 }}
 
 function neighborIds(nodeId) {{
-  const ids = new Set();
-  for (const link of currentData.links) {{
-    const source = typeof link.source === 'object' ? link.source.id : link.source;
-    const target = typeof link.target === 'object' ? link.target.id : link.target;
-    if (source === nodeId) ids.add(target);
-    if (target === nodeId) ids.add(source);
+  return [...(neighborIndex.get(nodeId) || [])];
+}}
+
+function showCommunityInfo(communityId) {{
+  const communityNode = communityOverviewNodeById.get(`community:${{communityId}}`);
+  if (!communityNode) return;
+  const preview = communityNode.preview ? `<div class="info-row"><span class="info-label">Top concepts:</span>${{esc(communityNode.preview)}}</div>` : '';
+  infoContentEl.innerHTML = `
+    <div class="info-row"><span class="info-label">Community:</span>${{esc(communityNode.community_name)}}</div>
+    <div class="info-row"><span class="info-label">Nodes:</span>${{esc(communityNode.node_count)}}</div>
+    <div class="info-row"><span class="info-label">Internal edges:</span>${{esc(communityNode.edge_count)}}</div>
+    ${{preview}}
+    <div class="info-row"><a class="neighbor-link" data-open-community="${{communityId}}">Open community subgraph</a></div>
+  `;
+  const openLink = infoContentEl.querySelector('[data-open-community]');
+  if (openLink) {{
+    openLink.addEventListener('click', event => {{
+      event.preventDefault();
+      openCommunity(communityId);
+    }});
   }}
-  return [...ids];
+}}
+
+function showCommunitySubgraphInfo(communityId) {{
+  const communityNode = communityOverviewNodeById.get(`community:${{communityId}}`);
+  if (!communityNode) return;
+  const preview = communityNode.preview ? `<div class="info-row"><span class="info-label">Top concepts:</span>${{esc(communityNode.preview)}}</div>` : '';
+  infoContentEl.innerHTML = `
+    <div class="info-row"><span class="info-label">Community subgraph:</span>${{esc(communityNode.community_name)}}</div>
+    <div class="info-row"><span class="info-label">Nodes:</span>${{esc(communityNode.node_count)}}</div>
+    <div class="info-row"><span class="info-label">Internal edges:</span>${{esc(communityNode.edge_count)}}</div>
+    ${{preview}}
+    <div class="info-row"><a class="neighbor-link" data-show-overview="true">Back to graph overview</a></div>
+  `;
+  const backLink = infoContentEl.querySelector('[data-show-overview]');
+  if (backLink) {{
+    backLink.addEventListener('click', event => {{
+      event.preventDefault();
+      viewMode = 'overview';
+      activeCommunity = null;
+      activeNodeId = null;
+      pendingZoomToFit = true;
+      refreshGraph();
+      showOverviewHint();
+    }});
+  }}
 }}
 
 function showInfo(nodeId) {{
   const node = nodeById.get(nodeId);
   if (!node) return;
+  const totalNeighborCount = neighborIds(nodeId).length;
   const neighbors = neighborIds(nodeId)
     .map(id => nodeById.get(id))
     .filter(Boolean)
     .sort((a, b) => String(a.label).localeCompare(String(b.label)));
+  const neighborSummary = viewMode === 'neighborhood' && activeNodeId === nodeId && totalNeighborCount > MAX_NEIGHBORHOOD_NEIGHBORS
+    ? `<div class="info-row"><span class="info-label">Rendered:</span>${{esc(MAX_NEIGHBORHOOD_NEIGHBORS)}} of ${{esc(totalNeighborCount)}} neighbors</div>`
+    : '';
   let html = `
     <div class="info-row"><span class="info-label">Label:</span>${{esc(node.label)}}</div>
     <div class="info-row"><span class="info-label">Community:</span>${{esc(node.community_name)}}</div>
     <div class="info-row"><span class="info-label">Type:</span>${{esc(node.file_type || 'unknown')}}</div>
     <div class="info-row"><span class="info-label">Degree:</span>${{esc(node.degree)}}</div>
     <div class="info-row"><span class="info-label">File:</span>${{esc(node.source_file || '')}}</div>
+    ${{neighborSummary}}
   `;
+  if (LARGE_GRAPH_MODE) {{
+    html += `<div class="info-row"><a class="neighbor-link" data-open-community="${{esc(node.community)}}">Open community view</a></div>`;
+  }}
   if (neighbors.length) {{
     html += '<div class="info-row"><span class="info-label">Neighbors:</span></div><ul class="neighbor-list">';
     for (const neighbor of neighbors.slice(0, 24)) {{
@@ -3291,17 +3696,33 @@ function showInfo(nodeId) {{
       focusNode(link.dataset.nodeId);
     }});
   }}
+  const openCommunityLink = infoContentEl.querySelector('[data-open-community]');
+  if (openCommunityLink) {{
+    openCommunityLink.addEventListener('click', event => {{
+      event.preventDefault();
+      openCommunity(Number(openCommunityLink.dataset.openCommunity));
+    }});
+  }}
 }}
 
-function focusNode(nodeId) {{
+function openCommunity(communityId, focusNodeId = null) {{
+  hiddenCommunities.delete(communityId);
+  viewMode = 'community';
+  activeCommunity = communityId;
+  activeNodeId = null;
+  pendingZoomToFit = true;
+  refreshGraph();
+  if (focusNodeId) {{
+    requestAnimationFrame(() => focusNode(focusNodeId));
+  }} else {{
+    showCommunitySubgraphInfo(communityId);
+  }}
+}}
+
+function focusRenderedNode(nodeId) {{
   let node = currentData.nodes.find(item => item.id === nodeId);
   if (!node) {{
-    const baseNode = nodeById.get(nodeId);
-    if (!baseNode) return;
-    hiddenCommunities.delete(baseNode.community);
-    refreshGraph();
-    node = currentData.nodes.find(item => item.id === nodeId);
-    if (!node) return;
+    return false;
   }}
   showInfo(nodeId);
   const x = Number(node.x) || 0;
@@ -3314,12 +3735,132 @@ function focusNode(nodeId) {{
     {{ x, y, z }},
     1200,
   );
+  return true;
+}}
+
+function commitGraphData(nextData) {{
+  const previousSize = currentData.nodes.length + currentData.links.length;
+  const nextSize = nextData.nodes.length + nextData.links.length;
+  const stagedReload = LARGE_GRAPH_MODE
+    && (viewMode === 'overview' || previousSize > 260 || nextSize > 260);
+  const progressiveFullGraph = LARGE_GRAPH_MODE
+    && viewMode === 'full'
+    && nextData.links.length > FULL_GRAPH_LINK_BATCH;
+
+  if (pendingRefreshFrame !== null) {{
+    cancelAnimationFrame(pendingRefreshFrame);
+    pendingRefreshFrame = null;
+  }}
+  if (progressiveLoadFrame !== null) {{
+    cancelAnimationFrame(progressiveLoadFrame);
+    progressiveLoadFrame = null;
+  }}
+
+  currentData = nextData;
+  renderLegend();
+  renderControls();
+
+  const finalizeZoom = () => {{
+    if (pendingZoomToFit) {{
+      pendingZoomToFit = false;
+      requestAnimationFrame(() => {{
+        if (typeof Graph.zoomToFit === 'function') {{
+          Graph.zoomToFit(viewMode === 'community' ? 900 : 700, viewMode === 'community' ? 70 : 90);
+        }}
+      }});
+    }}
+  }};
+
+  const startProgressiveFullGraphLoad = () => {{
+    pendingRefreshFrame = null;
+    applyViewTuning();
+    const nodes = currentData.nodes;
+    const links = currentData.links;
+    let loaded = 0;
+
+    const loadChunk = () => {{
+      progressiveLoadFrame = null;
+      loaded = Math.min(links.length, loaded + FULL_GRAPH_LINK_BATCH);
+      Graph.graphData({{ nodes, links: links.slice(0, loaded) }});
+      if (loaded < links.length && viewMode === 'full') {{
+        progressiveLoadFrame = requestAnimationFrame(loadChunk);
+      }}
+    }};
+
+    Graph.graphData({{ nodes, links: [] }});
+    finalizeZoom();
+    progressiveLoadFrame = requestAnimationFrame(loadChunk);
+  }};
+
+  const applyData = () => {{
+    pendingRefreshFrame = null;
+    if (progressiveFullGraph) {{
+      startProgressiveFullGraphLoad();
+      return;
+    }}
+    applyViewTuning();
+    Graph.graphData(currentData);
+    finalizeZoom();
+  }};
+
+  if (stagedReload) {{
+    Graph.graphData({{ nodes: [], links: [] }});
+    pendingRefreshFrame = requestAnimationFrame(applyData);
+  }} else {{
+    applyData();
+  }}
+}}
+
+function openNodeNeighborhood(nodeId) {{
+  const baseNode = nodeById.get(nodeId);
+  if (!baseNode) return;
+  hiddenCommunities.delete(baseNode.community);
+  viewMode = 'neighborhood';
+  activeCommunity = baseNode.community;
+  activeNodeId = nodeId;
+  pendingZoomToFit = false;
+  refreshGraph();
+  requestAnimationFrame(() => focusRenderedNode(nodeId));
+}}
+
+function focusNode(nodeId) {{
+  const baseNode = nodeById.get(nodeId);
+  if (!baseNode) return;
+  if (LARGE_GRAPH_MODE) {{
+    if (viewMode === 'neighborhood' && activeNodeId === nodeId && focusRenderedNode(nodeId)) {{
+      return;
+    }}
+    openNodeNeighborhood(nodeId);
+    return;
+  }}
+  if (viewMode === 'overview') {{
+    openCommunity(baseNode.community, nodeId);
+    return;
+  }}
+  let node = currentData.nodes.find(item => item.id === nodeId);
+  if (!node) {{
+    if (viewMode === 'community' && activeCommunity !== baseNode.community) {{
+      openCommunity(baseNode.community, nodeId);
+      return;
+    }}
+    hiddenCommunities.delete(baseNode.community);
+    if (viewMode === 'community') activeCommunity = baseNode.community;
+    refreshGraph();
+    node = currentData.nodes.find(item => item.id === nodeId);
+    if (!node) return;
+  }}
+  focusRenderedNode(nodeId);
 }}
 
 function refreshGraph() {{
-  currentData = buildVisibleData();
-  Graph.graphData(currentData);
-  renderLegend();
+  if ((viewMode === 'community' || viewMode === 'neighborhood')
+      && activeCommunity !== null
+      && hiddenCommunities.has(activeCommunity)) {{
+    viewMode = LARGE_GRAPH_MODE ? 'overview' : 'full';
+    activeCommunity = null;
+    activeNodeId = null;
+  }}
+  commitGraphData(buildVisibleData());
 }}
 
 function renderSearchResults(results) {{
@@ -3364,6 +3905,9 @@ document.addEventListener('click', event => {{
 }});
 
 refreshGraph();
+if (LARGE_GRAPH_MODE) {{
+  showOverviewHint();
+}}
 </script>
 </body>
 </html>"#,
@@ -3372,6 +3916,8 @@ refreshGraph();
         nodes_json = nodes_json,
         edges_json = edges_json,
         legend_json = legend_json,
+        large_graph_mode = large_graph_mode,
+        community_overview_json = community_overview_json,
     )
 }
 
@@ -4135,21 +4681,21 @@ pub fn export_svg_to_path(
 
 fn community_wiki_article(
     graph: &Graph,
+    ctx: &WikiExportContext,
     community_id: usize,
     nodes: &[String],
     label: &str,
     labels: &HashMap<usize, String>,
     cohesion: Option<f64>,
-    node_community: &HashMap<&str, usize>,
+    node_community: &HashMap<String, usize>,
 ) -> String {
-    let degree = compute_degrees(graph);
     let mut top_nodes = nodes.to_vec();
     top_nodes.sort_by(|left, right| {
-        degree
+        ctx.degree
             .get(right)
             .copied()
             .unwrap_or(0)
-            .cmp(&degree.get(left).copied().unwrap_or(0))
+            .cmp(&ctx.degree.get(left).copied().unwrap_or(0))
     });
     top_nodes.truncate(25);
 
@@ -4159,12 +4705,16 @@ fn community_wiki_article(
     let mut conf_counts: HashMap<String, usize> = HashMap::new();
     let mut sources: HashSet<String> = HashSet::new();
     for node_id in nodes {
-        if let Some(node) = graph.nodes.iter().find(|node| node.id == *node_id) {
+        if let Some(&node_idx) = ctx.node_by_id.get(node_id) {
+            let node = &graph.nodes[node_idx];
             if !node.source_file.is_empty() {
                 sources.insert(node.source_file.clone());
             }
         }
-        for neighbor in unique_wiki_neighbors(graph, node_id) {
+        let Some(neighbors) = ctx.neighbors_by_id.get(node_id) else {
+            continue;
+        };
+        for neighbor in neighbors {
             let confidence = if neighbor.confidence.is_empty() {
                 "EXTRACTED".to_string()
             } else {
@@ -4214,7 +4764,8 @@ fn community_wiki_article(
     lines.push("## Key Concepts".to_string());
     lines.push(String::new());
     for node_id in &top_nodes {
-        if let Some(node) = graph.nodes.iter().find(|node| node.id == *node_id) {
+        if let Some(&node_idx) = ctx.node_by_id.get(node_id) {
+            let node = &graph.nodes[node_idx];
             let source = if node.source_file.is_empty() {
                 String::new()
             } else {
@@ -4223,7 +4774,7 @@ fn community_wiki_article(
             lines.push(format!(
                 "- **{}** ({} connections){}",
                 node.label,
-                degree.get(node_id).copied().unwrap_or(0),
+                ctx.degree.get(node_id).copied().unwrap_or(0),
                 source
             ));
         }
@@ -4282,55 +4833,98 @@ struct WikiNeighbor {
     order: usize,
 }
 
-fn unique_wiki_neighbors(graph: &Graph, node_id: &str) -> Vec<WikiNeighbor> {
-    let mut neighbors: HashMap<String, WikiNeighbor> = HashMap::new();
-    let mut first_seen: HashMap<String, usize> = HashMap::new();
+#[derive(Debug, Clone)]
+struct WikiExportContext {
+    degree: HashMap<String, usize>,
+    node_by_id: HashMap<String, usize>,
+    neighbors_by_id: HashMap<String, Vec<WikiNeighbor>>,
+}
 
-    for (idx, edge) in graph.edges.iter().enumerate() {
-        let other = if edge.source == node_id {
-            Some(edge.target.as_str())
-        } else if edge.target == node_id {
-            Some(edge.source.as_str())
-        } else {
-            None
-        };
-        let Some(other_id) = other else {
-            continue;
-        };
-
-        let order = *first_seen.entry(other_id.to_string()).or_insert(idx);
-        neighbors.insert(
-            other_id.to_string(),
-            WikiNeighbor {
-                id: other_id.to_string(),
-                relation: if edge.relation.is_empty() {
-                    "related".to_string()
-                } else {
-                    edge.relation.clone()
-                },
-                confidence: edge.confidence.clone(),
-                order,
+fn add_wiki_neighbor(
+    neighbors_by_id: &mut HashMap<String, HashMap<String, WikiNeighbor>>,
+    node_id: &str,
+    other_id: &str,
+    relation: &str,
+    confidence: &str,
+    order: usize,
+) {
+    let neighbors = neighbors_by_id.entry(node_id.to_string()).or_default();
+    let order = neighbors
+        .get(other_id)
+        .map(|neighbor| neighbor.order)
+        .unwrap_or(order);
+    neighbors.insert(
+        other_id.to_string(),
+        WikiNeighbor {
+            id: other_id.to_string(),
+            relation: if relation.is_empty() {
+                "related".to_string()
+            } else {
+                relation.to_string()
             },
+            confidence: confidence.to_string(),
+            order,
+        },
+    );
+}
+
+fn build_wiki_export_context(graph: &Graph) -> WikiExportContext {
+    let degree = compute_degrees(graph);
+    let node_by_id = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| (node.id.clone(), idx))
+        .collect();
+
+    let mut neighbors_by_id: HashMap<String, HashMap<String, WikiNeighbor>> = HashMap::new();
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        add_wiki_neighbor(
+            &mut neighbors_by_id,
+            &edge.source,
+            &edge.target,
+            &edge.relation,
+            &edge.confidence,
+            idx,
+        );
+        add_wiki_neighbor(
+            &mut neighbors_by_id,
+            &edge.target,
+            &edge.source,
+            &edge.relation,
+            &edge.confidence,
+            idx,
         );
     }
 
-    let mut values: Vec<WikiNeighbor> = neighbors.into_values().collect();
-    values.sort_by_key(|neighbor| neighbor.order);
-    values
+    let neighbors_by_id = neighbors_by_id
+        .into_iter()
+        .map(|(node_id, neighbors)| {
+            let mut neighbors: Vec<WikiNeighbor> = neighbors.into_values().collect();
+            neighbors.sort_by_key(|neighbor| neighbor.order);
+            (node_id, neighbors)
+        })
+        .collect();
+
+    WikiExportContext {
+        degree,
+        node_by_id,
+        neighbors_by_id,
+    }
 }
 
 fn god_node_wiki_article(
     graph: &Graph,
+    ctx: &WikiExportContext,
     node_id: &str,
     labels: &HashMap<usize, String>,
-    node_community: &HashMap<&str, usize>,
+    node_community: &HashMap<String, usize>,
 ) -> Option<String> {
-    let degree = compute_degrees(graph);
-    let node = graph.nodes.iter().find(|node| node.id == node_id)?;
+    let node = graph.nodes.get(*ctx.node_by_id.get(node_id)?)?;
     let mut lines = vec![format!("# {}", node.label), String::new()];
     lines.push(format!(
         "> God node · {} connections · `{}`",
-        degree.get(node_id).copied().unwrap_or(0),
+        ctx.degree.get(node_id).copied().unwrap_or(0),
         node.source_file
     ));
     lines.push(String::new());
@@ -4345,19 +4939,24 @@ fn god_node_wiki_article(
     }
 
     let mut by_relation: HashMap<String, Vec<String>> = HashMap::new();
-    let mut neighbors = unique_wiki_neighbors(graph, node_id);
+    let mut neighbors = ctx
+        .neighbors_by_id
+        .get(node_id)
+        .cloned()
+        .unwrap_or_default();
     neighbors.sort_by(|left, right| {
-        degree
+        ctx.degree
             .get(&right.id)
             .copied()
             .unwrap_or(0)
-            .cmp(&degree.get(&left.id).copied().unwrap_or(0))
+            .cmp(&ctx.degree.get(&left.id).copied().unwrap_or(0))
     });
 
     for neighbor_entry in neighbors {
-        let Some(neighbor) = graph.nodes.iter().find(|node| node.id == neighbor_entry.id) else {
+        let Some(&neighbor_idx) = ctx.node_by_id.get(&neighbor_entry.id) else {
             continue;
         };
+        let neighbor = &graph.nodes[neighbor_idx];
         let conf = if neighbor_entry.confidence.is_empty() {
             String::new()
         } else {
@@ -4462,28 +5061,36 @@ pub fn export_wiki(
     } else {
         community_labels.clone()
     };
-    let node_community: HashMap<&str, usize> = communities
+    let node_community: HashMap<String, usize> = communities
         .iter()
-        .flat_map(|(&cid, nodes)| nodes.iter().map(move |node_id| (node_id.as_str(), cid)))
+        .flat_map(|(&cid, nodes)| nodes.iter().map(move |node_id| (node_id.clone(), cid)))
         .collect();
+    let ctx = build_wiki_export_context(graph);
 
     let mut count = 0usize;
     let mut sorted_communities: Vec<_> = communities.iter().collect();
     sorted_communities.sort_by_key(|(cid, _)| *cid);
-    for (&cid, nodes) in sorted_communities {
-        let label = labels
-            .get(&cid)
-            .cloned()
-            .unwrap_or_else(|| format!("Community {}", cid));
-        let article = community_wiki_article(
-            graph,
-            cid,
-            nodes,
-            &label,
-            &labels,
-            cohesion.get(&cid).copied(),
-            &node_community,
-        );
+    let community_articles: Vec<(String, String)> = sorted_communities
+        .into_par_iter()
+        .map(|(&cid, nodes)| {
+            let label = labels
+                .get(&cid)
+                .cloned()
+                .unwrap_or_else(|| format!("Community {}", cid));
+            let article = community_wiki_article(
+                graph,
+                &ctx,
+                cid,
+                nodes,
+                &label,
+                &labels,
+                cohesion.get(&cid).copied(),
+                &node_community,
+            );
+            (label, article)
+        })
+        .collect();
+    for (label, article) in community_articles {
         fs::write(
             output_dir.join(format!("{}.md", safe_wiki_filename(&label))),
             article,
@@ -4491,15 +5098,19 @@ pub fn export_wiki(
         count += 1;
     }
 
-    for god_node in god_nodes {
-        if let Some(article) = god_node_wiki_article(graph, &god_node.id, &labels, &node_community)
-        {
-            fs::write(
-                output_dir.join(format!("{}.md", safe_wiki_filename(&god_node.label))),
-                article,
-            )?;
-            count += 1;
-        }
+    let god_node_articles: Vec<(String, String)> = god_nodes
+        .par_iter()
+        .filter_map(|god_node| {
+            god_node_wiki_article(graph, &ctx, &god_node.id, &labels, &node_community)
+                .map(|article| (god_node.label.clone(), article))
+        })
+        .collect();
+    for (label, article) in god_node_articles {
+        fs::write(
+            output_dir.join(format!("{}.md", safe_wiki_filename(&label))),
+            article,
+        )?;
+        count += 1;
     }
 
     fs::write(
@@ -4700,9 +5311,10 @@ pub fn score_all(graph: &Graph, communities: &HashMap<usize, Vec<String>>) -> Ha
 #[cfg(test)]
 mod tests {
     use super::{
-        Graph, cluster, coerce_graph, community_wiki_article, export_canvas_data, export_html,
-        export_html_3d, export_json_data, export_svg, god_node_wiki_article, god_nodes,
-        merge_extractions, refine_boundary_nodes, suggest_questions, surprising_connections,
+        Graph, build_wiki_export_context, cluster, coerce_graph, community_wiki_article,
+        export_canvas_data, export_html, export_html_3d, export_json_data, export_svg,
+        god_node_wiki_article, god_nodes, merge_extractions, refine_boundary_nodes,
+        suggest_questions, surprising_connections,
     };
     use crate::schema::{Edge, Node};
     use serde_json::json;
@@ -4890,10 +5502,12 @@ mod tests {
             (0usize, "Community 0".to_string()),
             (1usize, "Community 1".to_string()),
         ]);
-        let node_community = HashMap::from([("a", 0usize), ("b", 1usize)]);
+        let node_community = HashMap::from([("a".to_string(), 0usize), ("b".to_string(), 1usize)]);
+        let ctx = build_wiki_export_context(&graph);
 
         let article = community_wiki_article(
             &graph,
+            &ctx,
             0,
             &[String::from("a")],
             "Community 0",
@@ -4947,9 +5561,11 @@ mod tests {
             ..Default::default()
         };
         let labels = HashMap::from([(0usize, "Community 0".to_string())]);
-        let node_community = HashMap::from([("hub", 0usize), ("leaf", 0usize)]);
+        let node_community =
+            HashMap::from([("hub".to_string(), 0usize), ("leaf".to_string(), 0usize)]);
+        let ctx = build_wiki_export_context(&graph);
 
-        let article = god_node_wiki_article(&graph, "hub", &labels, &node_community).unwrap();
+        let article = god_node_wiki_article(&graph, &ctx, "hub", &labels, &node_community).unwrap();
 
         assert!(article.contains("### calls"));
         assert!(article.contains("- [[Leaf]] `INFERRED`"));
@@ -5488,5 +6104,46 @@ mod tests {
         assert!(html.contains("Community 0"));
         assert!(html.contains("BASE_NODES"));
         assert!(html.contains("BASE_LINKS"));
+    }
+
+    #[test]
+    fn export_html_3d_enables_large_graph_mode_for_large_graphs() {
+        let nodes: Vec<serde_json::Value> = (0..301)
+            .map(|idx| {
+                json!({
+                    "id": format!("n{idx}"),
+                    "label": format!("Node {idx}"),
+                    "file_type": "code",
+                    "source_file": format!("file_{idx}.py")
+                })
+            })
+            .collect();
+        let graph = merge_extractions(&[json!({
+            "nodes": nodes,
+            "edges": []
+        })]);
+        let communities = HashMap::from([(
+            0usize,
+            graph.nodes.iter().map(|node| node.id.clone()).collect(),
+        )]);
+
+        let html = export_html_3d(&graph, &communities, &HashMap::new(), "graph-3d.html");
+
+        assert!(html.contains("const LARGE_GRAPH_MODE = true;"));
+        assert!(html.contains("Community overview"));
+        assert!(html.contains("COMMUNITY_OVERVIEW"));
+        assert!(html.contains("openNodeNeighborhood"));
+        assert!(html.contains("Node neighborhood"));
+        assert!(html.contains("openCommunity(node.community);"));
+        assert!(html.contains("showCommunitySubgraphInfo"));
+        assert!(html.contains("Back to graph overview"));
+        assert!(html.contains("FULL_GRAPH_LINK_BATCH"));
+        assert!(html.contains("controls.enableZoom = true;"));
+        assert!(html.contains("startProgressiveFullGraphLoad"));
+        assert!(html.contains("function zoomCamera(scale)"));
+        assert!(html.contains("Zoom in"));
+        assert!(html.contains("Zoom out"));
+        assert!(html.contains("Fit view"));
+        assert!(html.contains("Graph.zoomToFit"));
     }
 }

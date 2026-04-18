@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use rayon::join;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -458,22 +459,6 @@ fn write_graph_outputs(
     let suggested_questions = build::suggest_questions(graph, &communities, &community_labels, 7);
     let token_cost = json!({"input": 0, "output": 0});
 
-    let report = build::generate_report(
-        graph,
-        &communities,
-        &cohesion_scores,
-        &community_labels,
-        &god_nodes,
-        &surprising_connections,
-        &detection_result,
-        &token_cost,
-        &root.to_string_lossy(),
-        &suggested_questions,
-        today,
-    );
-    let graph_json = build::export_json_data(graph, &communities);
-    let graph_html = build::export_html_3d(graph, &communities, &community_labels, "graph-3d.html");
-
     let out_dir = root.join("graphify-out");
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create output directory: {}", out_dir.display()))?;
@@ -481,12 +466,62 @@ fn write_graph_outputs(
     let html_path = out_dir.join("graph-3d.html");
     let report_path = out_dir.join("GRAPH_REPORT.md");
     let legacy_html_path = out_dir.join("graph.html");
+    let wiki_path = if write_wiki {
+        Some(out_dir.join("wiki"))
+    } else {
+        existing_wiki_dir(&out_dir)
+    };
 
-    fs::write(
-        &graph_path,
-        serde_json::to_string_pretty(&graph_json).context("cannot serialize graph.json")?,
-    )
-    .with_context(|| format!("cannot write {}", graph_path.display()))?;
+    let ((report, graph_json), (graph_html, wiki_articles)) = join(
+        || {
+            join(
+                || {
+                    build::generate_report(
+                        graph,
+                        &communities,
+                        &cohesion_scores,
+                        &community_labels,
+                        &god_nodes,
+                        &surprising_connections,
+                        &detection_result,
+                        &token_cost,
+                        &root.to_string_lossy(),
+                        &suggested_questions,
+                        today,
+                    )
+                },
+                || {
+                    serde_json::to_string_pretty(&build::export_json_data(graph, &communities))
+                        .context("cannot serialize graph.json")
+                },
+            )
+        },
+        || {
+            join(
+                || build::export_html_3d(graph, &communities, &community_labels, "graph-3d.html"),
+                || {
+                    if let Some(wiki_dir) = wiki_path.as_ref() {
+                        build::export_wiki(
+                            graph,
+                            &communities,
+                            wiki_dir,
+                            &community_labels,
+                            &cohesion_scores,
+                            &god_nodes,
+                        )
+                        .with_context(|| format!("cannot refresh wiki at {}", wiki_dir.display()))
+                    } else {
+                        Ok(0)
+                    }
+                },
+            )
+        },
+    );
+    let graph_json = graph_json?;
+    let wiki_articles = wiki_articles?;
+
+    fs::write(&graph_path, graph_json)
+        .with_context(|| format!("cannot write {}", graph_path.display()))?;
     fs::write(&html_path, graph_html)
         .with_context(|| format!("cannot write {}", html_path.display()))?;
     fs::write(&report_path, report)
@@ -495,25 +530,6 @@ fn write_graph_outputs(
         fs::remove_file(&legacy_html_path)
             .with_context(|| format!("cannot remove {}", legacy_html_path.display()))?;
     }
-
-    let wiki_path = if write_wiki {
-        Some(out_dir.join("wiki"))
-    } else {
-        existing_wiki_dir(&out_dir)
-    };
-    let wiki_articles = if let Some(wiki_dir) = wiki_path.as_ref() {
-        build::export_wiki(
-            graph,
-            &communities,
-            wiki_dir,
-            &community_labels,
-            &cohesion_scores,
-            &god_nodes,
-        )
-        .with_context(|| format!("cannot refresh wiki at {}", wiki_dir.display()))?
-    } else {
-        0
-    };
 
     let needs_update = out_dir.join("needs_update");
     if needs_update.exists() {

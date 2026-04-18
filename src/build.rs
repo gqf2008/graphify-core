@@ -41,10 +41,12 @@ fn normalize_graph(mut graph: Graph) -> Graph {
     let mut normalized_edges: Vec<Edge> = Vec::new();
 
     for mut edge in graph.edges.drain(..) {
-        let Some(src) = resolve_node_index(&node_index, &normalized_node_index, &edge.source) else {
+        let Some(src) = resolve_node_index(&node_index, &normalized_node_index, &edge.source)
+        else {
             continue;
         };
-        let Some(tgt) = resolve_node_index(&node_index, &normalized_node_index, &edge.target) else {
+        let Some(tgt) = resolve_node_index(&node_index, &normalized_node_index, &edge.target)
+        else {
             continue;
         };
         let pair = if src <= tgt { (src, tgt) } else { (tgt, src) };
@@ -4148,11 +4150,11 @@ fn community_wiki_article(
             .copied()
             .unwrap_or(0)
             .cmp(&degree.get(left).copied().unwrap_or(0))
-            .then(left.cmp(right))
     });
     top_nodes.truncate(25);
 
     let mut cross_counts: HashMap<String, usize> = HashMap::new();
+    let mut cross_order: HashMap<String, usize> = HashMap::new();
     let node_set: HashSet<&str> = nodes.iter().map(String::as_str).collect();
     let mut conf_counts: HashMap<String, usize> = HashMap::new();
     let mut sources: HashSet<String> = HashSet::new();
@@ -4162,18 +4164,14 @@ fn community_wiki_article(
                 sources.insert(node.source_file.clone());
             }
         }
-        for edge in &graph.edges {
-            let other = if edge.source == *node_id {
-                Some(edge.target.as_str())
-            } else if edge.target == *node_id {
-                Some(edge.source.as_str())
+        for neighbor in unique_wiki_neighbors(graph, node_id) {
+            let confidence = if neighbor.confidence.is_empty() {
+                "EXTRACTED".to_string()
             } else {
-                None
+                neighbor.confidence.clone()
             };
-            let Some(other_id) = other else {
-                continue;
-            };
-            *conf_counts.entry(edge.confidence.clone()).or_default() += 1;
+            *conf_counts.entry(confidence).or_default() += 1;
+            let other_id = neighbor.id.as_str();
             if node_set.contains(other_id) {
                 continue;
             }
@@ -4183,6 +4181,8 @@ fn community_wiki_article(
                         .get(&other_cid)
                         .cloned()
                         .unwrap_or_else(|| format!("Community {}", other_cid));
+                    let next_idx = cross_order.len();
+                    cross_order.entry(other_label.clone()).or_insert(next_idx);
                     *cross_counts.entry(other_label).or_default() += 1;
                 }
             }
@@ -4190,7 +4190,15 @@ fn community_wiki_article(
     }
     let total_edges = conf_counts.values().sum::<usize>().max(1);
     let mut cross: Vec<(String, usize)> = cross_counts.into_iter().collect();
-    cross.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+    cross.sort_by(|left, right| {
+        right.1.cmp(&left.1).then(
+            cross_order
+                .get(&left.0)
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(&cross_order.get(&right.0).copied().unwrap_or(usize::MAX)),
+        )
+    });
 
     let mut sorted_sources: Vec<String> = sources.into_iter().collect();
     sorted_sources.sort();
@@ -4266,6 +4274,51 @@ fn community_wiki_article(
     lines.join("\n")
 }
 
+#[derive(Debug, Clone)]
+struct WikiNeighbor {
+    id: String,
+    relation: String,
+    confidence: String,
+    order: usize,
+}
+
+fn unique_wiki_neighbors(graph: &Graph, node_id: &str) -> Vec<WikiNeighbor> {
+    let mut neighbors: HashMap<String, WikiNeighbor> = HashMap::new();
+    let mut first_seen: HashMap<String, usize> = HashMap::new();
+
+    for (idx, edge) in graph.edges.iter().enumerate() {
+        let other = if edge.source == node_id {
+            Some(edge.target.as_str())
+        } else if edge.target == node_id {
+            Some(edge.source.as_str())
+        } else {
+            None
+        };
+        let Some(other_id) = other else {
+            continue;
+        };
+
+        let order = *first_seen.entry(other_id.to_string()).or_insert(idx);
+        neighbors.insert(
+            other_id.to_string(),
+            WikiNeighbor {
+                id: other_id.to_string(),
+                relation: if edge.relation.is_empty() {
+                    "related".to_string()
+                } else {
+                    edge.relation.clone()
+                },
+                confidence: edge.confidence.clone(),
+                order,
+            },
+        );
+    }
+
+    let mut values: Vec<WikiNeighbor> = neighbors.into_values().collect();
+    values.sort_by_key(|neighbor| neighbor.order);
+    values
+}
+
 fn god_node_wiki_article(
     graph: &Graph,
     node_id: &str,
@@ -4292,52 +4345,26 @@ fn god_node_wiki_article(
     }
 
     let mut by_relation: HashMap<String, Vec<String>> = HashMap::new();
-    let mut neighbors: Vec<String> = graph
-        .edges
-        .iter()
-        .filter_map(|edge| {
-            if edge.source == node_id {
-                Some(edge.target.clone())
-            } else if edge.target == node_id {
-                Some(edge.source.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let mut neighbors = unique_wiki_neighbors(graph, node_id);
     neighbors.sort_by(|left, right| {
         degree
-            .get(right)
+            .get(&right.id)
             .copied()
             .unwrap_or(0)
-            .cmp(&degree.get(left).copied().unwrap_or(0))
-            .then(left.cmp(right))
+            .cmp(&degree.get(&left.id).copied().unwrap_or(0))
     });
 
-    for neighbor_id in neighbors {
-        let Some(neighbor) = graph.nodes.iter().find(|node| node.id == neighbor_id) else {
+    for neighbor_entry in neighbors {
+        let Some(neighbor) = graph.nodes.iter().find(|node| node.id == neighbor_entry.id) else {
             continue;
         };
-        let edge = graph
-            .edges
-            .iter()
-            .find(|edge| {
-                (edge.source == node_id && edge.target == neighbor.id)
-                    || (edge.target == node_id && edge.source == neighbor.id)
-            })
-            .cloned()
-            .unwrap_or_default();
-        let conf = if edge.confidence.is_empty() {
+        let conf = if neighbor_entry.confidence.is_empty() {
             String::new()
         } else {
-            format!(" `{}`", edge.confidence)
+            format!(" `{}`", neighbor_entry.confidence)
         };
         by_relation
-            .entry(if edge.relation.is_empty() {
-                "related".to_string()
-            } else {
-                edge.relation
-            })
+            .entry(neighbor_entry.relation)
             .or_default()
             .push(format!("[[{}]]{}", neighbor.label, conf));
     }
@@ -4673,10 +4700,11 @@ pub fn score_all(graph: &Graph, communities: &HashMap<usize, Vec<String>>) -> Ha
 #[cfg(test)]
 mod tests {
     use super::{
-        cluster, coerce_graph, export_canvas_data, export_html, export_html_3d, export_json_data,
-        export_svg, god_nodes, merge_extractions, refine_boundary_nodes, suggest_questions,
-        surprising_connections,
+        Graph, cluster, coerce_graph, community_wiki_article, export_canvas_data, export_html,
+        export_html_3d, export_json_data, export_svg, god_node_wiki_article, god_nodes,
+        merge_extractions, refine_boundary_nodes, suggest_questions, surprising_connections,
     };
+    use crate::schema::{Edge, Node};
     use serde_json::json;
     use std::collections::HashMap;
 
@@ -4743,7 +4771,10 @@ mod tests {
             result.edges[0].original_source.as_deref(),
             Some("session_validatetoken")
         );
-        assert_eq!(result.edges[0].original_target.as_deref(), Some("api_client"));
+        assert_eq!(
+            result.edges[0].original_target.as_deref(),
+            Some("api_client")
+        );
     }
 
     #[test]
@@ -4814,6 +4845,115 @@ mod tests {
         );
         assert_eq!(result.input_tokens, 1);
         assert_eq!(result.output_tokens, 2);
+    }
+
+    #[test]
+    fn community_wiki_article_counts_unique_cross_community_neighbors() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: "a".into(),
+                    label: "A".into(),
+                    file_type: "code".into(),
+                    source_file: "a.py".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: "b".into(),
+                    label: "B".into(),
+                    file_type: "code".into(),
+                    source_file: "b.py".into(),
+                    ..Default::default()
+                },
+            ],
+            edges: vec![
+                Edge {
+                    source: "a".into(),
+                    target: "b".into(),
+                    relation: "uses".into(),
+                    confidence: "EXTRACTED".into(),
+                    source_file: "a.py".into(),
+                    ..Default::default()
+                },
+                Edge {
+                    source: "a".into(),
+                    target: "b".into(),
+                    relation: "calls".into(),
+                    confidence: "INFERRED".into(),
+                    source_file: "a.py".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let labels = HashMap::from([
+            (0usize, "Community 0".to_string()),
+            (1usize, "Community 1".to_string()),
+        ]);
+        let node_community = HashMap::from([("a", 0usize), ("b", 1usize)]);
+
+        let article = community_wiki_article(
+            &graph,
+            0,
+            &[String::from("a")],
+            "Community 0",
+            &labels,
+            Some(0.5),
+            &node_community,
+        );
+
+        assert!(article.contains("- [[Community 1]] (1 shared connections)"));
+        assert!(article.contains("- INFERRED: 1 (100%)"));
+        assert!(!article.contains("(2 shared connections)"));
+    }
+
+    #[test]
+    fn god_node_wiki_article_deduplicates_same_neighbor() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: "hub".into(),
+                    label: "Hub".into(),
+                    file_type: "code".into(),
+                    source_file: "hub.py".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: "leaf".into(),
+                    label: "Leaf".into(),
+                    file_type: "code".into(),
+                    source_file: "leaf.py".into(),
+                    ..Default::default()
+                },
+            ],
+            edges: vec![
+                Edge {
+                    source: "hub".into(),
+                    target: "leaf".into(),
+                    relation: "uses".into(),
+                    confidence: "EXTRACTED".into(),
+                    source_file: "hub.py".into(),
+                    ..Default::default()
+                },
+                Edge {
+                    source: "hub".into(),
+                    target: "leaf".into(),
+                    relation: "calls".into(),
+                    confidence: "INFERRED".into(),
+                    source_file: "hub.py".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let labels = HashMap::from([(0usize, "Community 0".to_string())]);
+        let node_community = HashMap::from([("hub", 0usize), ("leaf", 0usize)]);
+
+        let article = god_node_wiki_article(&graph, "hub", &labels, &node_community).unwrap();
+
+        assert!(article.contains("### calls"));
+        assert!(article.contains("- [[Leaf]] `INFERRED`"));
+        assert_eq!(article.matches("[[Leaf]]").count(), 1);
     }
 
     #[test]

@@ -31,14 +31,20 @@ fn normalize_graph(mut graph: Graph) -> Graph {
         .enumerate()
         .map(|(idx, node)| (node.id.clone(), idx))
         .collect();
+    let normalized_node_index: HashMap<String, usize> = graph
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(idx, node)| (normalize_id(&node.id), idx))
+        .collect();
     let mut pair_to_pos: HashMap<(usize, usize), usize> = HashMap::new();
     let mut normalized_edges: Vec<Edge> = Vec::new();
 
     for mut edge in graph.edges.drain(..) {
-        let Some(&src) = node_index.get(edge.source.as_str()) else {
+        let Some(src) = resolve_node_index(&node_index, &normalized_node_index, &edge.source) else {
             continue;
         };
-        let Some(&tgt) = node_index.get(edge.target.as_str()) else {
+        let Some(tgt) = resolve_node_index(&node_index, &normalized_node_index, &edge.target) else {
             continue;
         };
         let pair = if src <= tgt { (src, tgt) } else { (tgt, src) };
@@ -74,6 +80,34 @@ fn normalize_graph(mut graph: Graph) -> Graph {
 
     graph.edges = normalized_edges;
     graph
+}
+
+fn resolve_node_index(
+    node_index: &HashMap<String, usize>,
+    normalized_node_index: &HashMap<String, usize>,
+    id: &str,
+) -> Option<usize> {
+    node_index
+        .get(id)
+        .copied()
+        .or_else(|| normalized_node_index.get(&normalize_id(id)).copied())
+}
+
+fn normalize_id(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut last_was_separator = false;
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator {
+            normalized.push('_');
+            last_was_separator = true;
+        }
+    }
+
+    normalized.trim_matches('_').to_string()
 }
 
 /// Merge multiple extraction dicts into one, deduplicating nodes by ID and edges by undirected pair.
@@ -4691,6 +4725,28 @@ mod tests {
     }
 
     #[test]
+    fn merge_remaps_edge_endpoints_via_normalized_node_ids() {
+        let result = merge_extractions(&[json!({
+            "nodes": [
+                {"id": "session_validatetoken", "label": "validate_token()", "file_type": "code", "source_file": "auth.py"},
+                {"id": "api_client", "label": "ApiClient", "file_type": "code", "source_file": "api.py"}
+            ],
+            "edges": [
+                {"source": "Session.ValidateToken", "target": "API Client", "relation": "uses", "confidence": "INFERRED", "source_file": "auth.py"}
+            ]
+        })]);
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].source, "session_validatetoken");
+        assert_eq!(result.edges[0].target, "api_client");
+        assert_eq!(
+            result.edges[0].original_source.as_deref(),
+            Some("session_validatetoken")
+        );
+        assert_eq!(result.edges[0].original_target.as_deref(), Some("api_client"));
+    }
+
+    #[test]
     fn coerce_graph_merges_extraction_objects_before_filtering() {
         let result = coerce_graph(&json!({
             "nodes": [
@@ -4710,6 +4766,28 @@ mod tests {
         assert_eq!(result.edges.len(), 1);
         assert_eq!(result.edges[0].source, "n1");
         assert_eq!(result.edges[0].target, "n2");
+    }
+
+    #[test]
+    fn coerce_graph_remaps_drifted_built_graph_edge_endpoints() {
+        let result = coerce_graph(&json!({
+            "nodes": [
+                {"id": "session_validatetoken", "label": "validate_token()", "file_type": "code", "source_file": "auth.py"},
+                {"id": "api_client", "label": "ApiClient", "file_type": "code", "source_file": "api.py"}
+            ],
+            "edges": [
+                {"source": "Session.ValidateToken", "target": "API Client", "relation": "uses", "confidence": "INFERRED", "source_file": "auth.py"}
+            ],
+            "hyperedges": [],
+            "neighbor_order": {"session_validatetoken": ["api_client"]},
+            "input_tokens": 0,
+            "output_tokens": 0
+        }))
+        .unwrap();
+
+        assert_eq!(result.edges.len(), 1);
+        assert_eq!(result.edges[0].source, "session_validatetoken");
+        assert_eq!(result.edges[0].target, "api_client");
     }
 
     #[test]

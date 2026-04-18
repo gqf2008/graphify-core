@@ -20,6 +20,7 @@ pub struct RebuildCodeResult {
     pub preserved_semantic_edges: usize,
     pub out_dir: String,
     pub graph_path: String,
+    pub html_path: String,
     pub report_path: String,
 }
 
@@ -31,6 +32,7 @@ pub struct ClusterOnlyResult {
     pub communities: usize,
     pub out_dir: String,
     pub graph_path: String,
+    pub html_path: String,
     pub report_path: String,
 }
 
@@ -46,6 +48,7 @@ struct GraphOutputSummary {
     communities: usize,
     out_dir: PathBuf,
     graph_path: PathBuf,
+    html_path: PathBuf,
     report_path: PathBuf,
 }
 
@@ -78,6 +81,7 @@ pub fn rebuild_code(
             preserved_semantic_edges: 0,
             out_dir: out_dir.to_string_lossy().to_string(),
             graph_path: graph_path.to_string_lossy().to_string(),
+            html_path: out_dir.join("graph.html").to_string_lossy().to_string(),
             report_path: report_path.to_string_lossy().to_string(),
         });
     }
@@ -98,6 +102,7 @@ pub fn rebuild_code(
         preserved_semantic_edges: preserved.edges.len(),
         out_dir: output.out_dir.to_string_lossy().to_string(),
         graph_path: output.graph_path.to_string_lossy().to_string(),
+        html_path: output.html_path.to_string_lossy().to_string(),
         report_path: output.report_path.to_string_lossy().to_string(),
     })
 }
@@ -122,6 +127,7 @@ pub fn cluster_only(root: &Path, today: Option<&str>) -> Result<ClusterOnlyResul
         communities: output.communities,
         out_dir: output.out_dir.to_string_lossy().to_string(),
         graph_path: output.graph_path.to_string_lossy().to_string(),
+        html_path: output.html_path.to_string_lossy().to_string(),
         report_path: output.report_path.to_string_lossy().to_string(),
     })
 }
@@ -197,7 +203,7 @@ pub fn watch(
                         result.nodes, result.edges, result.communities
                     );
                     println!(
-                        "[graphify watch] graph.json and GRAPH_REPORT.md updated in {}",
+                        "[graphify watch] graph.json, graph.html and GRAPH_REPORT.md updated in {}",
                         result.out_dir
                     );
                 }
@@ -442,11 +448,13 @@ fn write_graph_outputs(
         today,
     );
     let graph_json = build::export_json_data(graph, &communities);
+    let graph_html = build::export_html(graph, &communities, &community_labels, "graph.html");
 
     let out_dir = root.join("graphify-out");
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create output directory: {}", out_dir.display()))?;
     let graph_path = out_dir.join("graph.json");
+    let html_path = out_dir.join("graph.html");
     let report_path = out_dir.join("GRAPH_REPORT.md");
 
     fs::write(
@@ -454,6 +462,8 @@ fn write_graph_outputs(
         serde_json::to_string_pretty(&graph_json).context("cannot serialize graph.json")?,
     )
     .with_context(|| format!("cannot write {}", graph_path.display()))?;
+    fs::write(&html_path, graph_html)
+        .with_context(|| format!("cannot write {}", html_path.display()))?;
     fs::write(&report_path, report)
         .with_context(|| format!("cannot write {}", report_path.display()))?;
 
@@ -478,6 +488,7 @@ fn write_graph_outputs(
         communities: communities.len(),
         out_dir,
         graph_path,
+        html_path,
         report_path,
     })
 }
@@ -562,12 +573,13 @@ mod tests {
                 .iter()
                 .any(|edge| edge.get("relation").and_then(Value::as_str) == Some("references"))
         }));
+        assert!(out_dir.join("graph.html").exists());
         assert!(!out_dir.join("needs_update").exists());
         Ok(())
     }
 
     #[test]
-    fn cluster_only_rewrites_graph_json_and_report() -> Result<()> {
+    fn cluster_only_rewrites_graph_json_report_and_html() -> Result<()> {
         let dir = tempdir()?;
         let out_dir = dir.path().join("graphify-out");
         fs::create_dir_all(&out_dir)?;
@@ -587,6 +599,7 @@ mod tests {
         let result = cluster_only(dir.path(), Some("2026-04-16"))?;
         let graph: Value = serde_json::from_str(&fs::read_to_string(out_dir.join("graph.json"))?)?;
         let report = fs::read_to_string(out_dir.join("GRAPH_REPORT.md"))?;
+        let html = fs::read_to_string(out_dir.join("graph.html"))?;
 
         assert!(result.ok);
         assert!(result.communities >= 1);
@@ -596,6 +609,7 @@ mod tests {
                 .is_some_and(|nodes| nodes.iter().all(|node| node.get("community").is_some()))
         );
         assert!(report.contains("## Communities"));
+        assert!(html.contains("vis-network"));
         Ok(())
     }
 

@@ -554,8 +554,7 @@ fn resolve_cross_file_calls(extraction: &mut Extraction) {
         .collect();
 
     for raw_call in extraction.raw_calls.drain(..) {
-        let key = raw_call.callee.to_lowercase();
-        let Some(target_id) = label_to_id.get(&key) else {
+        let Some(target_id) = lookup_call_target(&label_to_id, &raw_call.callee) else {
             continue;
         };
         if target_id == &raw_call.caller_nid {
@@ -853,10 +852,8 @@ fn extract_generic_from_source(
     // Resolve pending calls
     let label_to_id = build_label_index(&extraction.nodes);
     let mut seen_call_pairs: HashSet<(String, String)> = HashSet::new();
-    let allow_cross_file_calls = source_extension(&source_file) != "rs";
     for pending in pending_calls {
-        let key = pending.callee_name.to_lowercase();
-        if let Some(target_id) = label_to_id.get(&key) {
+        if let Some(target_id) = lookup_call_target(&label_to_id, &pending.callee_name) {
             if target_id == &pending.caller_id {
                 continue;
             }
@@ -874,7 +871,7 @@ fn extract_generic_from_source(
                     line_no: pending.line_no,
                 },
             );
-        } else if allow_cross_file_calls {
+        } else if pending.allow_cross_file {
             extraction.raw_calls.push(RawCall {
                 caller_nid: pending.caller_id,
                 callee: pending.callee_name,
@@ -1775,10 +1772,12 @@ fn extract_js_import_targets(
             continue;
         }
         let target = if raw.starts_with('.') {
-            let mut resolved = Path::new(source_file)
-                .parent()
-                .unwrap_or_else(|| Path::new(""))
-                .join(raw);
+            let mut resolved = normalize_lexical_path(
+                Path::new(source_file)
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(raw),
+            );
             if resolved.extension().and_then(|ext| ext.to_str()) == Some("js") {
                 resolved.set_extension("ts");
             } else if resolved.extension().and_then(|ext| ext.to_str()) == Some("jsx") {
@@ -1795,6 +1794,38 @@ fn extract_js_import_targets(
         return vec![(target, "imports_from".to_string())];
     }
     Vec::new()
+}
+
+fn normalize_lexical_path(path: PathBuf) -> PathBuf {
+    let mut prefix = None;
+    let mut has_root = false;
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(value) => prefix = Some(value.as_os_str().to_owned()),
+            std::path::Component::RootDir => has_root = true,
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if parts.last().is_some_and(|part: &std::ffi::OsString| part != "..") {
+                    parts.pop();
+                } else if !has_root {
+                    parts.push("..".into());
+                }
+            }
+            std::path::Component::Normal(part) => parts.push(part.to_owned()),
+        }
+    }
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if has_root {
+        normalized.push(std::path::MAIN_SEPARATOR.to_string());
+    }
+    for part in parts {
+        normalized.push(part);
+    }
+    normalized
 }
 
 fn collect_java_import_targets(node: TsNode<'_>, source: &[u8]) -> Vec<(String, String)> {
@@ -2067,11 +2098,12 @@ fn collect_calls(
     }
 
     if cfg.call_types.iter().any(|ct| *ct == t) {
-        if let Some(callee) = resolve_callee(node, source, cfg) {
+        if let Some((callee, allow_cross_file)) = resolve_callee(node, source, cfg) {
             pending_calls.push(PendingCall {
                 caller_id: caller_id.to_string(),
                 callee_name: callee,
                 line_no: node.start_position().row + 1,
+                allow_cross_file,
             });
         }
     }
@@ -2081,7 +2113,11 @@ fn collect_calls(
     }
 }
 
-fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Option<String> {
+fn resolve_callee(
+    node: TsNode<'_>,
+    source: &[u8],
+    cfg: &LanguageConfig,
+) -> Option<(String, bool)> {
     if node.kind() == "class_constant_access_expression" {
         return None;
     }
@@ -2099,12 +2135,12 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
     {
         if !cfg.call_accessor_field.is_empty() {
             if let Some(attr) = func_node.child_by_field_name(cfg.call_accessor_field) {
-                return node_text(attr, source);
+                return node_text(attr, source).map(|text| (text, false));
             }
         }
         // Last named child as fallback
         if let Some(last) = named_children(func_node).into_iter().last() {
-            return node_text(last, source);
+            return node_text(last, source).map(|text| (text, false));
         }
     }
 
@@ -2113,14 +2149,14 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
             .child_by_field_name("name")
             .and_then(|node| node_text(node, source))
         {
-            return Some(name);
+            return Some((name, true));
         }
         if let Some(last) = named_children(func_node).into_iter().last() {
-            return node_text(last, source);
+            return node_text(last, source).map(|text| (text, true));
         }
     }
 
-    node_text(func_node, source)
+    node_text(func_node, source).map(|text| (text, true))
 }
 
 fn resolve_c_like_function_name(node: TsNode<'_>, source: &[u8], is_cpp: bool) -> Option<String> {
@@ -2457,6 +2493,7 @@ struct PendingCall {
     caller_id: String,
     callee_name: String,
     line_no: usize,
+    allow_cross_file: bool,
 }
 
 #[derive(Debug)]
@@ -2508,17 +2545,50 @@ fn node_text(node: TsNode<'_>, source: &[u8]) -> Option<String> {
 fn build_label_index(nodes: &[Node]) -> HashMap<String, String> {
     let mut label_to_id = HashMap::new();
     for node in nodes {
-        let normalized = node
-            .label
-            .trim_matches(|ch| ch == '(' || ch == ')')
-            .trim_start_matches('.')
-            .to_lowercase();
+        let normalized = normalize_lookup_name(&node.label);
         if normalized.is_empty() {
             continue;
         }
         label_to_id.insert(normalized, node.id.clone());
     }
     label_to_id
+}
+
+fn normalize_lookup_name(value: &str) -> String {
+    value
+        .trim()
+        .trim_end_matches('!')
+        .trim_matches(|ch| ch == '(' || ch == ')')
+        .trim_start_matches('.')
+        .to_lowercase()
+}
+
+fn call_lookup_keys(callee: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let trimmed = callee.trim();
+    let mut push = |candidate: &str| {
+        let normalized = normalize_lookup_name(candidate);
+        if !normalized.is_empty() && !keys.contains(&normalized) {
+            keys.push(normalized);
+        }
+    };
+
+    push(trimmed);
+    for separator in ["::", "->", ".", "/"] {
+        if let Some((_, tail)) = trimmed.rsplit_once(separator) {
+            push(tail);
+        }
+    }
+    keys
+}
+
+fn lookup_call_target<'a>(
+    label_to_id: &'a HashMap<String, String>,
+    callee: &str,
+) -> Option<&'a String> {
+    call_lookup_keys(callee)
+        .into_iter()
+        .find_map(|key| label_to_id.get(&key))
 }
 
 fn make_id(value: &str) -> String {
@@ -6021,6 +6091,59 @@ function helper() {
     }
 
     #[test]
+    fn infers_cross_file_calls_for_rust_module_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller_path = dir.path().join("caller.rs");
+        let callee_path = dir.path().join("helper.rs");
+        fs::write(
+            &caller_path,
+            r#"
+mod helper;
+
+fn start() {
+    helper::normalize();
+}
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &callee_path,
+            r#"
+pub fn normalize() {}
+"#,
+        )
+        .unwrap();
+
+        let result = extract_paths(&[
+            caller_path.to_string_lossy().to_string(),
+            callee_path.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+
+        let start_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "start()")
+            .map(|node| node.id.clone())
+            .unwrap();
+        let normalize_id = result
+            .nodes
+            .iter()
+            .find(|node| node.label == "normalize()")
+            .map(|node| node.id.clone())
+            .unwrap();
+
+        assert!(result.edges.iter().any(|edge| {
+            edge.source == start_id
+                && edge.target == normalize_id
+                && edge.relation == "calls"
+                && edge.confidence == "INFERRED"
+                && edge.confidence_score == Some(0.8)
+        }));
+        assert!(result.raw_calls.is_empty());
+    }
+
+    #[test]
     fn extracts_js_classes_and_functions() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.js");
@@ -6047,6 +6170,30 @@ function main() {
         assert!(labels.iter().any(|l| *l == "App"));
         assert!(labels.iter().any(|l| *l == "main()"));
         assert!(labels.iter().any(|l| *l == ".init()"));
+    }
+
+    #[test]
+    fn normalizes_js_relative_import_targets_before_id_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested_dir = dir.path().join("src").join("ui");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let app_path = nested_dir.join("app.js");
+        let util_path = dir.path().join("src").join("shared").join("util.ts");
+        fs::create_dir_all(util_path.parent().unwrap()).unwrap();
+        fs::write(&app_path, "import helper from '../shared/../shared/util.js';\n").unwrap();
+        fs::write(&util_path, "export function helper() {}\n").unwrap();
+
+        let result = extract_paths(&[
+            app_path.to_string_lossy().to_string(),
+            util_path.to_string_lossy().to_string(),
+        ])
+        .unwrap();
+        let expected_target = make_id(&util_path.to_string_lossy());
+
+        assert!(result
+            .edges
+            .iter()
+            .any(|edge| edge.relation == "imports_from" && edge.target == expected_target));
     }
 
     #[test]

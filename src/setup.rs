@@ -4,6 +4,7 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 macro_rules! skill_asset {
     ($name:literal) => {
@@ -622,8 +623,7 @@ pub fn antigravity_uninstall(home_dir: &Path, project_dir: &Path) -> Result<Vec<
 pub fn hook_install(path: &Path) -> Result<Vec<String>> {
     let root = git_root(path)
         .ok_or_else(|| anyhow::anyhow!("No git repository found at or above {}", path.display()))?;
-    let hooks_dir = root.join(".git/hooks");
-    fs::create_dir_all(&hooks_dir)?;
+    let hooks_dir = hooks_dir(&root)?;
     let commit_msg = install_hook(&hooks_dir, "post-commit", HOOK_SCRIPT, HOOK_MARKER)?;
     let checkout_msg = install_hook(
         &hooks_dir,
@@ -640,7 +640,7 @@ pub fn hook_install(path: &Path) -> Result<Vec<String>> {
 pub fn hook_uninstall(path: &Path) -> Result<Vec<String>> {
     let root = git_root(path)
         .ok_or_else(|| anyhow::anyhow!("No git repository found at or above {}", path.display()))?;
-    let hooks_dir = root.join(".git/hooks");
+    let hooks_dir = hooks_dir(&root)?;
     let commit_msg = uninstall_hook(&hooks_dir, "post-commit", HOOK_MARKER, HOOK_MARKER_END)?;
     let checkout_msg = uninstall_hook(
         &hooks_dir,
@@ -658,7 +658,7 @@ pub fn hook_status(path: &Path) -> Result<Vec<String>> {
     let Some(root) = git_root(path) else {
         return Ok(vec!["Not in a git repository.".to_string()]);
     };
-    let hooks_dir = root.join(".git/hooks");
+    let hooks_dir = hooks_dir(&root)?;
     Ok(vec![
         format!(
             "post-commit: {}",
@@ -669,6 +669,29 @@ pub fn hook_status(path: &Path) -> Result<Vec<String>> {
             hook_status_one(&hooks_dir, "post-checkout", CHECKOUT_MARKER)?
         ),
     ])
+}
+
+fn hooks_dir(root: &Path) -> Result<PathBuf> {
+    if let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "core.hooksPath"])
+        .output()
+    {
+        if output.status.success() {
+            let custom = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !custom.is_empty() {
+                let path = PathBuf::from(custom);
+                let hooks_dir = if path.is_absolute() { path } else { root.join(path) };
+                fs::create_dir_all(&hooks_dir)?;
+                return Ok(hooks_dir);
+            }
+        }
+    }
+
+    let hooks_dir = root.join(".git/hooks");
+    fs::create_dir_all(&hooks_dir)?;
+    Ok(hooks_dir)
 }
 
 pub fn agents_install(project_dir: &Path, platform: &str) -> Result<Vec<String>> {
@@ -1188,7 +1211,18 @@ mod tests {
     #[test]
     fn hook_round_trip() {
         let dir = tempdir().unwrap();
-        fs::create_dir_all(dir.path().join(".git")).unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["config", "core.hooksPath", ".git/hooks"])
+            .status()
+            .unwrap();
 
         let installed = hook_install(dir.path()).unwrap();
         assert!(installed[0].contains("post-commit:"));
@@ -1204,6 +1238,30 @@ mod tests {
 
         let removed = hook_uninstall(dir.path()).unwrap();
         assert!(removed[0].contains("removed") || removed[0].contains("nothing to remove"));
+        assert!(!dir.path().join(".git/hooks/post-commit").exists());
+    }
+
+    #[test]
+    fn hook_install_respects_core_hooks_path() {
+        let dir = tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir.path())
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["config", "core.hooksPath", ".husky"])
+            .status()
+            .unwrap();
+
+        let installed = hook_install(dir.path()).unwrap();
+
+        assert!(installed[0].contains(".husky/post-commit"));
+        assert!(dir.path().join(".husky/post-commit").exists());
+        assert!(dir.path().join(".husky/post-checkout").exists());
         assert!(!dir.path().join(".git/hooks/post-commit").exists());
     }
 

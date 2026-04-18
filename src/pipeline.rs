@@ -81,7 +81,7 @@ pub fn rebuild_code(
             preserved_semantic_edges: 0,
             out_dir: out_dir.to_string_lossy().to_string(),
             graph_path: graph_path.to_string_lossy().to_string(),
-            html_path: out_dir.join("graph.html").to_string_lossy().to_string(),
+            html_path: out_dir.join("graph-3d.html").to_string_lossy().to_string(),
             report_path: report_path.to_string_lossy().to_string(),
         });
     }
@@ -203,7 +203,7 @@ pub fn watch(
                         result.nodes, result.edges, result.communities
                     );
                     println!(
-                        "[graphify watch] graph.json, graph.html and GRAPH_REPORT.md updated in {}",
+                        "[graphify watch] graph.json, graph-3d.html and GRAPH_REPORT.md updated in {}",
                         result.out_dir
                     );
                 }
@@ -448,14 +448,15 @@ fn write_graph_outputs(
         today,
     );
     let graph_json = build::export_json_data(graph, &communities);
-    let graph_html = build::export_html(graph, &communities, &community_labels, "graph.html");
+    let graph_html = build::export_html_3d(graph, &communities, &community_labels, "graph-3d.html");
 
     let out_dir = root.join("graphify-out");
     fs::create_dir_all(&out_dir)
         .with_context(|| format!("cannot create output directory: {}", out_dir.display()))?;
     let graph_path = out_dir.join("graph.json");
-    let html_path = out_dir.join("graph.html");
+    let html_path = out_dir.join("graph-3d.html");
     let report_path = out_dir.join("GRAPH_REPORT.md");
+    let legacy_html_path = out_dir.join("graph.html");
 
     fs::write(
         &graph_path,
@@ -466,6 +467,10 @@ fn write_graph_outputs(
         .with_context(|| format!("cannot write {}", html_path.display()))?;
     fs::write(&report_path, report)
         .with_context(|| format!("cannot write {}", report_path.display()))?;
+    if legacy_html_path.exists() {
+        fs::remove_file(&legacy_html_path)
+            .with_context(|| format!("cannot remove {}", legacy_html_path.display()))?;
+    }
 
     if let Some(wiki_dir) = existing_wiki_dir(&out_dir) {
         build::export_wiki(
@@ -573,7 +578,8 @@ mod tests {
                 .iter()
                 .any(|edge| edge.get("relation").and_then(Value::as_str) == Some("references"))
         }));
-        assert!(out_dir.join("graph.html").exists());
+        assert!(out_dir.join("graph-3d.html").exists());
+        assert!(!out_dir.join("graph.html").exists());
         assert!(!out_dir.join("needs_update").exists());
         Ok(())
     }
@@ -599,7 +605,7 @@ mod tests {
         let result = cluster_only(dir.path(), Some("2026-04-16"))?;
         let graph: Value = serde_json::from_str(&fs::read_to_string(out_dir.join("graph.json"))?)?;
         let report = fs::read_to_string(out_dir.join("GRAPH_REPORT.md"))?;
-        let html = fs::read_to_string(out_dir.join("graph.html"))?;
+        let html = fs::read_to_string(out_dir.join("graph-3d.html"))?;
 
         assert!(result.ok);
         assert!(result.communities >= 1);
@@ -609,7 +615,7 @@ mod tests {
                 .is_some_and(|nodes| nodes.iter().all(|node| node.get("community").is_some()))
         );
         assert!(report.contains("## Communities"));
-        assert!(html.contains("vis-network"));
+        assert!(html.contains("3d-force-graph"));
         Ok(())
     }
 

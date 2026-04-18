@@ -232,8 +232,8 @@ G = build_from_json(extraction)
 communities = cluster(G)
 
 try:
-    to_html(G, communities, 'graphify-out/graph.html')
-    print('graph.html written')
+    to_html_3d(G, communities, 'graphify-out/graph-3d.html')
+    print('graph-3d.html written')
 except ValueError as e:
     print(f'Visualization skipped: {e}')
 "
@@ -246,7 +246,7 @@ Print this summary:
 ```
 graphify complete
   graph.json      — GraphRAG-ready, queryable by MCP or CLI
-  graph.html      — interactive visualization (open in browser)
+  graph-3d.html      — interactive visualization (open in browser)
   GRAPH_REPORT.md — plain-language architecture summary
 ```
 

@@ -998,7 +998,7 @@ fn main() -> Result<()> {
             let result = pipeline::rebuild_code(&path, follow_symlinks, Some(today.as_str()))?;
             if result.ok {
                 println!(
-                    "Code graph updated. graph.json, graph.html and GRAPH_REPORT.md refreshed. For doc/paper/image changes run /graphify --update in your AI assistant."
+                    "Code graph updated. graph.json, graph-3d.html and GRAPH_REPORT.md refreshed. For doc/paper/image changes run /graphify --update in your AI assistant."
                 );
             } else {
                 println!("{}", result.message);
@@ -1017,7 +1017,7 @@ fn main() -> Result<()> {
             let today = today.unwrap_or_else(today_utc);
             let result = pipeline::cluster_only(&path, Some(today.as_str()))?;
             println!(
-                "Done — {} communities. GRAPH_REPORT.md, graph.json and graph.html updated.",
+                "Done — {} communities. GRAPH_REPORT.md, graph.json and graph-3d.html updated.",
                 result.communities
             );
         }

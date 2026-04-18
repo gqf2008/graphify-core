@@ -536,8 +536,8 @@ labels = {int(k): v for k, v in labels_raw.items()}
 if G.number_of_nodes() > 5000:
     print(f'Graph has {G.number_of_nodes()} nodes - too large for HTML viz. Use Obsidian vault instead.')
 else:
-    to_html(G, communities, 'graphify-out/graph.html', community_labels=labels or None)
-    print('graph.html written - open in any browser, no server needed')
+    to_html_3d(G, communities, 'graphify-out/graph-3d.html', community_labels=labels or None)
+    print('graph-3d.html written - open in any browser, no server needed')
 "
 ```
 
@@ -707,7 +707,7 @@ Tell the user (omit the obsidian line unless --obsidian was given):
 ```
 Graph complete. Outputs in PATH_TO_DIR/graphify-out/
 
-  graph.html            - interactive graph, open in browser
+  graph-3d.html            - interactive graph, open in browser
   GRAPH_REPORT.md       - audit report
   graph.json            - raw graph data
   obsidian/             - Obsidian vault (only if --obsidian was given)

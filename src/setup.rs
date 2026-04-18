@@ -8,7 +8,11 @@ use std::process::Command;
 
 macro_rules! skill_asset {
     ($name:literal) => {
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/skills/", $name))
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/skills/",
+            $name
+        ))
     };
 }
 
@@ -682,7 +686,11 @@ fn hooks_dir(root: &Path) -> Result<PathBuf> {
             let custom = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !custom.is_empty() {
                 let path = PathBuf::from(custom);
-                let hooks_dir = if path.is_absolute() { path } else { root.join(path) };
+                let hooks_dir = if path.is_absolute() {
+                    path
+                } else {
+                    root.join(path)
+                };
                 fs::create_dir_all(&hooks_dir)?;
                 return Ok(hooks_dir);
             }

@@ -324,7 +324,12 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
         .filter(|members| !members.is_empty())
         .map(|members| members.into_iter().map(|idx| graph.nodes[idx].id.clone()).collect())
         .collect();
-    let min_community_size = if n < 50 { 1 } else { (n / 100).max(5) };
+    // Only merge truly tiny communities (singletons / pairs) to avoid
+    // over-aggregation on large graphs.  Previous threshold of n/100 was
+    // far too aggressive — e.g. 5559 nodes → threshold 55, which collapsed
+    // ~1000 communities down to 5.  A fixed floor of 3 keeps the graph
+    // readable without destroying meaningful structure.
+    let min_community_size = if n < 50 { 1 } else { 3 };
     named_communities = merge_small_communities(graph, named_communities, min_community_size);
     named_communities.iter_mut().for_each(|v| v.sort());
     named_communities

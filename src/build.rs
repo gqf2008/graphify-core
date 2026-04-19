@@ -222,7 +222,7 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
     }
 
     let n = graph.nodes.len();
-    let (node_index, _adj, _) = graph_adjacency(graph);
+    let (node_index, adj, _) = graph_adjacency(graph);
 
     if graph.edges.is_empty() {
         let mut node_ids: Vec<String> = graph.nodes.iter().map(|node| node.id.clone()).collect();
@@ -234,28 +234,59 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
             .collect();
     }
 
-    let mut pg_graph = UnGraph::<(), f64>::new_undirected();
-    let pg_nodes: Vec<NodeIndex> = (0..n).map(|_| pg_graph.add_node(())).collect();
-    for edge in &graph.edges {
-        let Some(&src) = node_index.get(edge.source.as_str()) else {
-            continue;
-        };
-        let Some(&tgt) = node_index.get(edge.target.as_str()) else {
-            continue;
-        };
-        if src == tgt {
-            continue;
-        }
-        let weight = normalize_weight(edge.weight);
-        pg_graph.add_edge(pg_nodes[src], pg_nodes[tgt], weight);
-    }
-
-    let communities_map = leiden_communities(&pg_graph, None, None, None);
+    let isolates: Vec<usize> = adj
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, neighbors)| if neighbors.is_empty() { Some(idx) } else { None })
+        .collect();
+    let connected_nodes: Vec<usize> = adj
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, neighbors)| if !neighbors.is_empty() { Some(idx) } else { None })
+        .collect();
 
     let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (node_idx, pg_node) in pg_nodes.iter().enumerate() {
-        let label = communities_map.get(pg_node).copied().unwrap_or(node_idx as u32);
-        groups.entry(label).or_default().push(node_idx);
+    let mut next_label: u32 = 0;
+
+    if !connected_nodes.is_empty() {
+        let mut pg_graph = UnGraph::<(), f64>::new_undirected();
+        let pg_nodes: Vec<NodeIndex> =
+            (0..connected_nodes.len()).map(|_| pg_graph.add_node(())).collect();
+        let global_to_local: HashMap<usize, usize> = connected_nodes
+            .iter()
+            .enumerate()
+            .map(|(local, &global)| (global, local))
+            .collect();
+
+        for edge in &graph.edges {
+            let Some(&src) = node_index.get(edge.source.as_str()) else {
+                continue;
+            };
+            let Some(&tgt) = node_index.get(edge.target.as_str()) else {
+                continue;
+            };
+            if src == tgt {
+                continue;
+            }
+            if let (Some(&local_src), Some(&local_tgt)) =
+                (global_to_local.get(&src), global_to_local.get(&tgt))
+            {
+                let weight = normalize_weight(edge.weight);
+                pg_graph.add_edge(pg_nodes[local_src], pg_nodes[local_tgt], weight);
+            }
+        }
+
+        let communities_map = leiden_communities(&pg_graph, None, None, None);
+        for (local_idx, pg_node) in pg_nodes.iter().enumerate() {
+            let raw_label = communities_map.get(pg_node).copied().unwrap_or(local_idx as u32);
+            groups.entry(raw_label).or_default().push(connected_nodes[local_idx]);
+        }
+        next_label = groups.keys().copied().max().map(|m| m + 1).unwrap_or(0);
+    }
+
+    for isolate_idx in isolates {
+        groups.entry(next_label).or_default().push(isolate_idx);
+        next_label += 1;
     }
 
     let mut final_communities: Vec<Vec<String>> = Vec::new();

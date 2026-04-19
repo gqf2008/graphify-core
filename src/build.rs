@@ -1,4 +1,6 @@
 use rayon::prelude::*;
+use rustworkx_core::community::leiden_communities;
+use rustworkx_core::petgraph::graph::{NodeIndex, UnGraph};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
@@ -208,26 +210,11 @@ fn normalize_edge(edge: &serde_json::Value) -> Option<Edge> {
     serde_json::from_value::<Edge>(value).ok()
 }
 
-// ── Community detection (Louvain, Python-parity) ─────────────────────────────
+// ── Community detection (Leiden via rustworkx-core) ───────────────────────────
 
-const LOUVAIN_RESOLUTION: f64 = 1.0;
-const LOUVAIN_THRESHOLD: f64 = 1e-4;
-const LOUVAIN_MAX_LEVEL: usize = 10;
-const LOUVAIN_SEED: u64 = 42;
 const MAX_COMMUNITY_FRACTION: f64 = 0.25;
 const MIN_SPLIT_SIZE: usize = 10;
 const BOUNDARY_REFINEMENT_MAX_DEGREE: usize = 2;
-
-#[derive(Debug, Clone)]
-struct WeightedGraphLevel {
-    members: Vec<HashSet<usize>>,
-    adjacency: Vec<BTreeMap<usize, f64>>,
-    neighbor_order: Vec<Vec<usize>>,
-    edge_order: Vec<(usize, usize)>,
-    pair_weights: BTreeMap<(usize, usize), f64>,
-    degrees: Vec<f64>,
-    total_weight: f64,
-}
 
 pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
     if graph.nodes.is_empty() {
@@ -235,10 +222,9 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
     }
 
     let n = graph.nodes.len();
-    let (node_index, adj, _) = graph_adjacency(graph);
-    let weighted = weighted_graph_level(graph);
+    let (node_index, _adj, _) = graph_adjacency(graph);
 
-    if weighted.total_weight == 0.0 {
+    if graph.edges.is_empty() {
         let mut node_ids: Vec<String> = graph.nodes.iter().map(|node| node.id.clone()).collect();
         node_ids.sort();
         return node_ids
@@ -248,36 +234,37 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
             .collect();
     }
 
-    let mut communities: Vec<Vec<String>> = Vec::new();
-    let connected_nodes: Vec<usize> = adj
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, neighbors)| (!neighbors.is_empty()).then_some(idx))
-        .collect();
-
-    if !connected_nodes.is_empty() {
-        let connected_graph = induced_weighted_subgraph(&weighted, &connected_nodes);
-        for group in louvain_groups(&connected_graph) {
-            let nodes = group
-                .into_iter()
-                .map(|global_i| graph.nodes[global_i].id.clone())
-                .collect();
-            communities.push(nodes);
+    let mut pg_graph = UnGraph::<(), f64>::new_undirected();
+    let pg_nodes: Vec<NodeIndex> = (0..n).map(|_| pg_graph.add_node(())).collect();
+    for edge in &graph.edges {
+        let Some(&src) = node_index.get(edge.source.as_str()) else {
+            continue;
+        };
+        let Some(&tgt) = node_index.get(edge.target.as_str()) else {
+            continue;
+        };
+        if src == tgt {
+            continue;
         }
+        let weight = normalize_weight(edge.weight);
+        pg_graph.add_edge(pg_nodes[src], pg_nodes[tgt], weight);
     }
 
-    for (global_i, neighbors) in adj.iter().enumerate() {
-        if neighbors.is_empty() {
-            communities.push(vec![graph.nodes[global_i].id.clone()]);
-        }
+    let communities_map = leiden_communities(&pg_graph, None, None, None);
+
+    let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (node_idx, pg_node) in pg_nodes.iter().enumerate() {
+        let label = communities_map.get(pg_node).copied().unwrap_or(node_idx as u32);
+        groups.entry(label).or_default().push(node_idx);
     }
 
-    let max_size = std::cmp::max(MIN_SPLIT_SIZE, (n as f64 * MAX_COMMUNITY_FRACTION) as usize);
     let mut final_communities: Vec<Vec<String>> = Vec::new();
+    let max_size = std::cmp::max(MIN_SPLIT_SIZE, (n as f64 * MAX_COMMUNITY_FRACTION) as usize);
 
-    for nodes in communities {
+    for members in groups.into_values() {
+        let nodes: Vec<String> = members.into_iter().map(|idx| graph.nodes[idx].id.clone()).collect();
         if nodes.len() > max_size {
-            let splits = split_community(&weighted, &nodes, &node_index);
+            let splits = split_community(graph, &nodes, &node_index);
             if splits.len() <= 1 {
                 final_communities.push(nodes);
             } else {
@@ -304,12 +291,7 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
     let mut named_communities: Vec<Vec<String>> = indexed_communities
         .into_iter()
         .filter(|members| !members.is_empty())
-        .map(|members| {
-            members
-                .into_iter()
-                .map(|idx| graph.nodes[idx].id.clone())
-                .collect()
-        })
+        .map(|members| members.into_iter().map(|idx| graph.nodes[idx].id.clone()).collect())
         .collect();
     named_communities.iter_mut().for_each(|v| v.sort());
     named_communities
@@ -317,34 +299,27 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
     named_communities.into_iter().enumerate().collect()
 }
 
-fn weighted_graph_level(graph: &Graph) -> WeightedGraphLevel {
-    let node_index: HashMap<&str, usize> = graph
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(idx, node)| (node.id.as_str(), idx))
-        .collect();
-    let mut pair_weights: BTreeMap<(usize, usize), f64> = BTreeMap::new();
-    let mut neighbor_order = vec![Vec::new(); graph.nodes.len()];
-    let mut seen_pairs = HashSet::new();
-    let mut seen_neighbors = vec![HashSet::new(); graph.nodes.len()];
-
-    if !graph.neighbor_order.is_empty() {
-        for (node_id, neighbors) in &graph.neighbor_order {
-            let Some(&src) = node_index.get(node_id.as_str()) else {
-                continue;
-            };
-            for neighbor_id in neighbors {
-                let Some(&tgt) = node_index.get(neighbor_id.as_str()) else {
-                    continue;
-                };
-                if src == tgt || !seen_neighbors[src].insert(tgt) {
-                    continue;
-                }
-                neighbor_order[src].push(tgt);
-            }
-        }
+fn split_community(
+    graph: &Graph,
+    nodes: &[String],
+    node_index: &HashMap<&str, usize>,
+) -> Vec<Vec<String>> {
+    if nodes.len() <= 1 {
+        return vec![nodes.to_vec()];
     }
+
+    let local_global: Vec<usize> = nodes
+        .iter()
+        .filter_map(|id| node_index.get(id.as_str()).copied())
+        .collect();
+    if local_global.len() <= 1 {
+        return vec![nodes.to_vec()];
+    }
+
+    let mut pg_graph = UnGraph::<(), f64>::new_undirected();
+    let pg_nodes: Vec<NodeIndex> = (0..local_global.len()).map(|_| pg_graph.add_node(())).collect();
+    let global_to_local: HashMap<usize, usize> =
+        local_global.iter().enumerate().map(|(local, &global)| (global, local)).collect();
 
     for edge in &graph.edges {
         let Some(&src) = node_index.get(edge.source.as_str()) else {
@@ -353,510 +328,30 @@ fn weighted_graph_level(graph: &Graph) -> WeightedGraphLevel {
         let Some(&tgt) = node_index.get(edge.target.as_str()) else {
             continue;
         };
-        let pair = if src <= tgt { (src, tgt) } else { (tgt, src) };
-        if seen_pairs.insert(pair) && src != tgt && graph.neighbor_order.is_empty() {
-            neighbor_order[src].push(tgt);
-            neighbor_order[tgt].push(src);
-        }
-        pair_weights.insert(pair, normalize_weight(edge.weight));
-    }
-
-    weighted_level_from_parts(
-        (0..graph.nodes.len())
-            .map(|idx| HashSet::from([idx]))
-            .collect(),
-        pair_weights,
-        neighbor_order,
-    )
-}
-
-fn weighted_level_from_parts(
-    members: Vec<HashSet<usize>>,
-    pair_weights: BTreeMap<(usize, usize), f64>,
-    neighbor_order: Vec<Vec<usize>>,
-) -> WeightedGraphLevel {
-    let mut adjacency: Vec<BTreeMap<usize, f64>> = vec![BTreeMap::new(); members.len()];
-    let mut degrees = vec![0.0; members.len()];
-    let mut total_weight = 0.0;
-
-    for (&(u, v), &weight) in &pair_weights {
-        total_weight += weight;
-        if u == v {
-            adjacency[u].insert(v, weight);
-            degrees[u] += 2.0 * weight;
-        } else {
-            adjacency[u].insert(v, weight);
-            adjacency[v].insert(u, weight);
-            degrees[u] += weight;
-            degrees[v] += weight;
-        }
-    }
-    let edge_order = edge_iteration_order(members.len(), &neighbor_order, &pair_weights);
-
-    WeightedGraphLevel {
-        members,
-        adjacency,
-        neighbor_order,
-        edge_order,
-        pair_weights,
-        degrees,
-        total_weight,
-    }
-}
-
-fn edge_iteration_order(
-    node_count: usize,
-    neighbor_order: &[Vec<usize>],
-    pair_weights: &BTreeMap<(usize, usize), f64>,
-) -> Vec<(usize, usize)> {
-    let mut order = Vec::new();
-    let mut seen = HashSet::new();
-    for u in 0..node_count {
-        if pair_weights.contains_key(&(u, u)) && seen.insert((u, u)) {
-            order.push((u, u));
-        }
-        for &v in &neighbor_order[u] {
-            let pair = if u <= v { (u, v) } else { (v, u) };
-            if seen.insert(pair) {
-                order.push(pair);
-            }
-        }
-    }
-    order
-}
-
-fn induced_weighted_subgraph(level: &WeightedGraphLevel, nodes: &[usize]) -> WeightedGraphLevel {
-    let global_local: HashMap<usize, usize> = nodes
-        .iter()
-        .enumerate()
-        .map(|(local, &global)| (global, local))
-        .collect();
-    let members = nodes
-        .iter()
-        .map(|&global| level.members[global].clone())
-        .collect::<Vec<_>>();
-    let mut pair_weights = BTreeMap::new();
-    let mut neighbor_order = vec![Vec::new(); nodes.len()];
-    let mut seen_pairs = HashSet::new();
-
-    for &(global_u, global_v) in &level.edge_order {
-        let Some(&weight) = level.pair_weights.get(&(global_u, global_v)) else {
-            continue;
-        };
-        let Some(&local_u) = global_local.get(&global_u) else {
-            continue;
-        };
-        let Some(&local_v) = global_local.get(&global_v) else {
-            continue;
-        };
-        let pair = if local_u <= local_v {
-            (local_u, local_v)
-        } else {
-            (local_v, local_u)
-        };
-        pair_weights.insert(pair, normalize_weight(weight));
-        if seen_pairs.insert(pair) && local_u != local_v {
-            neighbor_order[local_u].push(local_v);
-            neighbor_order[local_v].push(local_u);
-        }
-    }
-
-    weighted_level_from_parts(members, pair_weights, neighbor_order)
-}
-
-fn louvain_groups(level: &WeightedGraphLevel) -> Vec<Vec<usize>> {
-    if level.members.is_empty() {
-        return Vec::new();
-    }
-    if level.members.len() == 1 || level.total_weight == 0.0 {
-        return level
-            .members
-            .iter()
-            .map(|members| members.iter().copied().collect())
-            .collect();
-    }
-
-    let mut rng = PyRandom::new(LOUVAIN_SEED);
-    let mut graph = level.clone();
-    let mut modularity_score = modularity(
-        &graph,
-        &(0..graph.members.len())
-            .map(|i| HashSet::from([i]))
-            .collect::<Vec<_>>(),
-    );
-    let (mut partition, mut inner_partition, _) =
-        louvain_one_level(&graph, graph.members.clone(), &mut rng);
-
-    for level_idx in 0..LOUVAIN_MAX_LEVEL {
-        let new_modularity = modularity(&graph, &inner_partition);
-
-        if new_modularity - modularity_score <= LOUVAIN_THRESHOLD
-            || level_idx + 1 >= LOUVAIN_MAX_LEVEL
+        if let (Some(&local_src), Some(&local_tgt)) =
+            (global_to_local.get(&src), global_to_local.get(&tgt))
         {
-            return partition
-                .into_iter()
-                .filter(|members| !members.is_empty())
-                .map(|members| {
-                    let mut values: Vec<_> = members.into_iter().collect();
-                    values.sort_unstable();
-                    values
-                })
-                .collect();
-        }
-
-        modularity_score = new_modularity;
-        graph = coarse_grain_graph(&graph, &inner_partition);
-        let (next_partition, next_inner_partition, improvement) =
-            louvain_one_level(&graph, partition.clone(), &mut rng);
-        if !improvement {
-            return partition
-                .into_iter()
-                .filter(|members| !members.is_empty())
-                .map(|members| {
-                    let mut values: Vec<_> = members.into_iter().collect();
-                    values.sort_unstable();
-                    values
-                })
-                .collect();
-        }
-        partition = next_partition;
-        inner_partition = next_inner_partition;
-    }
-
-    partition
-        .into_iter()
-        .filter(|members| !members.is_empty())
-        .map(|members| {
-            let mut values: Vec<_> = members.into_iter().collect();
-            values.sort_unstable();
-            values
-        })
-        .collect()
-}
-
-fn louvain_one_level(
-    graph: &WeightedGraphLevel,
-    mut partition: Vec<HashSet<usize>>,
-    rng: &mut PyRandom,
-) -> (Vec<HashSet<usize>>, Vec<HashSet<usize>>, bool) {
-    let node_count = graph.members.len();
-    let mut node_to_community: Vec<usize> = (0..node_count).collect();
-    let mut inner_partition: Vec<HashSet<usize>> =
-        (0..node_count).map(|i| HashSet::from([i])).collect();
-    let mut community_degree = graph.degrees.clone();
-    let mut order: Vec<usize> = (0..node_count).collect();
-    rng.shuffle(&mut order);
-
-    let mut moves = 1usize;
-    while moves > 0 {
-        moves = 0;
-        for &node in &order {
-            let current_community = node_to_community[node];
-            let weights_to_community = neighbor_community_weights(node, graph, &node_to_community);
-            let degree = graph.degrees[node];
-            community_degree[current_community] -= degree;
-            let current_weight = weights_to_community
-                .iter()
-                .find_map(|(community, weight)| {
-                    (*community == current_community).then_some(*weight)
-                })
-                .unwrap_or(0.0);
-            let remove_cost = -current_weight / graph.total_weight
-                + LOUVAIN_RESOLUTION * (community_degree[current_community] * degree)
-                    / (2.0 * graph.total_weight * graph.total_weight);
-
-            let mut best_gain = 0.0f64;
-            let mut best_community = current_community;
-            for (candidate_community, weight) in &weights_to_community {
-                let gain = remove_cost + weight / graph.total_weight
-                    - LOUVAIN_RESOLUTION * (community_degree[*candidate_community] * degree)
-                        / (2.0 * graph.total_weight * graph.total_weight);
-                if gain > best_gain {
-                    best_gain = gain;
-                    best_community = *candidate_community;
-                }
-            }
-
-            community_degree[best_community] += degree;
-            if best_community != current_community {
-                for member in &graph.members[node] {
-                    partition[current_community].remove(member);
-                }
-                inner_partition[current_community].remove(&node);
-                partition[best_community].extend(graph.members[node].iter().copied());
-                inner_partition[best_community].insert(node);
-                node_to_community[node] = best_community;
-                moves += 1;
-            }
+            let weight = normalize_weight(edge.weight);
+            pg_graph.add_edge(pg_nodes[local_src], pg_nodes[local_tgt], weight);
         }
     }
 
-    partition.retain(|community| !community.is_empty());
-    inner_partition.retain(|community| !community.is_empty());
-    (
-        partition,
-        inner_partition,
-        node_to_community
-            .iter()
-            .enumerate()
-            .any(|(idx, cid)| *cid != idx),
-    )
-}
-
-fn neighbor_community_weights(
-    node: usize,
-    graph: &WeightedGraphLevel,
-    node_to_community: &[usize],
-) -> Vec<(usize, f64)> {
-    let mut weights: Vec<(usize, f64)> = Vec::new();
-    for &neighbor in &graph.neighbor_order[node] {
-        let Some(&weight) = graph.adjacency[node].get(&neighbor) else {
-            continue;
-        };
-        let community = node_to_community[neighbor];
-        if let Some((_, total)) = weights.iter_mut().find(|(cid, _)| *cid == community) {
-            *total += weight;
-        } else {
-            weights.push((community, weight));
-        }
-    }
-    weights
-}
-
-fn modularity(graph: &WeightedGraphLevel, communities: &[HashSet<usize>]) -> f64 {
-    if graph.total_weight == 0.0 {
-        return 0.0;
+    let communities = leiden_communities(&pg_graph, None, None, None);
+    let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (local_idx, pg_node) in pg_nodes.iter().enumerate() {
+        let label = communities.get(pg_node).copied().unwrap_or(local_idx as u32);
+        groups.entry(label).or_default().push(local_idx);
     }
 
-    let mut node_to_community = vec![usize::MAX; graph.members.len()];
-    let mut total_degree = vec![0.0; communities.len()];
-    for (community_idx, community) in communities.iter().enumerate() {
-        for &node in community {
-            node_to_community[node] = community_idx;
-            total_degree[community_idx] += graph.degrees[node];
-        }
-    }
-
-    let mut intra_weight = vec![0.0; communities.len()];
-    for (&(u, v), &weight) in &graph.pair_weights {
-        let community_u = node_to_community[u];
-        if community_u != usize::MAX && community_u == node_to_community[v] {
-            intra_weight[community_u] += weight;
-        }
-    }
-
-    let mut score = 0.0;
-    for community_idx in 0..communities.len() {
-        if total_degree[community_idx] == 0.0 {
-            continue;
-        }
-        score += intra_weight[community_idx] / graph.total_weight
-            - LOUVAIN_RESOLUTION
-                * (total_degree[community_idx] / (2.0 * graph.total_weight)).powi(2);
-    }
-    score
-}
-
-fn coarse_grain_graph(
-    graph: &WeightedGraphLevel,
-    inner_partition: &[HashSet<usize>],
-) -> WeightedGraphLevel {
-    let mut node_to_community = vec![0usize; graph.members.len()];
-    let mut members = Vec::with_capacity(inner_partition.len());
-
-    for (community_idx, community) in inner_partition.iter().enumerate() {
-        let mut aggregate = HashSet::new();
-        for &node in community {
-            node_to_community[node] = community_idx;
-            aggregate.extend(graph.members[node].iter().copied());
-        }
-        members.push(aggregate);
-    }
-
-    let mut pair_weights = BTreeMap::new();
-    let mut neighbor_order = vec![Vec::new(); inner_partition.len()];
-    let mut seen_pairs = HashSet::new();
-
-    for &(u, v) in &graph.edge_order {
-        let Some(&weight) = graph.pair_weights.get(&(u, v)) else {
-            continue;
-        };
-        let community_u = node_to_community[u];
-        let community_v = node_to_community[v];
-        let pair = if community_u <= community_v {
-            (community_u, community_v)
-        } else {
-            (community_v, community_u)
-        };
-        let entry = pair_weights.entry(pair).or_insert(0.0);
-        *entry = normalize_weight(*entry + weight);
-        if seen_pairs.insert(pair) && community_u != community_v {
-            neighbor_order[community_u].push(community_v);
-            neighbor_order[community_v].push(community_u);
-        }
-    }
-
-    weighted_level_from_parts(members, pair_weights, neighbor_order)
-}
-
-#[derive(Debug, Clone)]
-struct PyRandom {
-    mt: [u32; 624],
-    index: usize,
-}
-
-impl PyRandom {
-    fn new(seed: u64) -> Self {
-        let mut rng = Self {
-            mt: [0; 624],
-            index: 625,
-        };
-        rng.init_by_array(&[seed as u32]);
-        rng
-    }
-
-    fn init_genrand(&mut self, seed: u32) {
-        self.mt[0] = seed;
-        for i in 1..624 {
-            self.mt[i] = 1812433253u32
-                .wrapping_mul(self.mt[i - 1] ^ (self.mt[i - 1] >> 30))
-                .wrapping_add(i as u32);
-        }
-        self.index = 624;
-    }
-
-    fn init_by_array(&mut self, seed_words: &[u32]) {
-        self.init_genrand(19650218);
-        let mut i = 1usize;
-        let mut j = 0usize;
-        let mut k = 624usize.max(seed_words.len());
-
-        while k > 0 {
-            let mixed = (self.mt[i - 1] ^ (self.mt[i - 1] >> 30)).wrapping_mul(1664525);
-            self.mt[i] = (self.mt[i] ^ mixed)
-                .wrapping_add(seed_words[j])
-                .wrapping_add(j as u32);
-            i += 1;
-            j += 1;
-            if i >= 624 {
-                self.mt[0] = self.mt[623];
-                i = 1;
-            }
-            if j >= seed_words.len() {
-                j = 0;
-            }
-            k -= 1;
-        }
-
-        k = 623;
-        while k > 0 {
-            let mixed = (self.mt[i - 1] ^ (self.mt[i - 1] >> 30)).wrapping_mul(1566083941);
-            self.mt[i] = (self.mt[i] ^ mixed).wrapping_sub(i as u32);
-            i += 1;
-            if i >= 624 {
-                self.mt[0] = self.mt[623];
-                i = 1;
-            }
-            k -= 1;
-        }
-
-        self.mt[0] = 0x8000_0000;
-        self.index = 624;
-    }
-
-    fn genrand_uint32(&mut self) -> u32 {
-        const N: usize = 624;
-        const M: usize = 397;
-        const MATRIX_A: u32 = 0x9908_b0df;
-        const UPPER_MASK: u32 = 0x8000_0000;
-        const LOWER_MASK: u32 = 0x7fff_ffff;
-
-        if self.index >= N {
-            for kk in 0..(N - M) {
-                let y = (self.mt[kk] & UPPER_MASK) | (self.mt[kk + 1] & LOWER_MASK);
-                self.mt[kk] = self.mt[kk + M] ^ (y >> 1) ^ if y & 1 == 0 { 0 } else { MATRIX_A };
-            }
-            for kk in (N - M)..(N - 1) {
-                let y = (self.mt[kk] & UPPER_MASK) | (self.mt[kk + 1] & LOWER_MASK);
-                self.mt[kk] =
-                    self.mt[kk + M - N] ^ (y >> 1) ^ if y & 1 == 0 { 0 } else { MATRIX_A };
-            }
-            let y = (self.mt[N - 1] & UPPER_MASK) | (self.mt[0] & LOWER_MASK);
-            self.mt[N - 1] = self.mt[M - 1] ^ (y >> 1) ^ if y & 1 == 0 { 0 } else { MATRIX_A };
-            self.index = 0;
-        }
-
-        let mut y = self.mt[self.index];
-        self.index += 1;
-        y ^= y >> 11;
-        y ^= (y << 7) & 0x9d2c_5680;
-        y ^= (y << 15) & 0xefc6_0000;
-        y ^= y >> 18;
-        y
-    }
-
-    fn getrandbits(&mut self, bits: u32) -> u32 {
-        if bits == 0 {
-            return 0;
-        }
-        let value = self.genrand_uint32();
-        value >> (32 - bits)
-    }
-
-    fn randbelow(&mut self, upper: usize) -> usize {
-        if upper <= 1 {
-            return 0;
-        }
-        let bit_count = usize::BITS - upper.leading_zeros();
-        loop {
-            let value = self.getrandbits(bit_count) as usize;
-            if value < upper {
-                return value;
-            }
-        }
-    }
-
-    fn shuffle<T>(&mut self, values: &mut [T]) {
-        for i in (1..values.len()).rev() {
-            let j = self.randbelow(i + 1);
-            values.swap(i, j);
-        }
-    }
-}
-
-fn split_community(
-    weighted: &WeightedGraphLevel,
-    nodes: &[String],
-    node_to_idx: &HashMap<&str, usize>,
-) -> Vec<Vec<String>> {
-    let local_global: Vec<usize> = nodes
-        .iter()
-        .filter_map(|id| node_to_idx.get(id.as_str()).copied())
-        .collect();
-    let subgraph = induced_weighted_subgraph(weighted, &local_global);
-    let groups = louvain_groups(&subgraph);
     if groups.len() <= 1 {
         return vec![nodes.to_vec()];
     }
-    let id_by_global: HashMap<usize, &String> = local_global
-        .iter()
-        .enumerate()
-        .map(|(local_idx, &global_idx)| (global_idx, &nodes[local_idx]))
-        .collect();
+
     groups
-        .into_iter()
+        .into_values()
         .map(|members| {
-            let mut community: Vec<String> = members
-                .into_iter()
-                .map(|global_i| {
-                    weighted.members[global_i]
-                        .iter()
-                        .next()
-                        .copied()
-                        .unwrap_or(global_i)
-                })
-                .filter_map(|global_i| id_by_global.get(&global_i).cloned().cloned())
-                .collect();
+            let mut community: Vec<String> =
+                members.into_iter().map(|local_idx| nodes[local_idx].clone()).collect();
             community.sort();
             community
         })

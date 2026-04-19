@@ -75,7 +75,7 @@ The crate is intentionally self-contained so it can be split into a standalone r
 - **Language:** Rust (edition 2024)
 - **Build tool:** Cargo
 - **AST parsing:** tree-sitter (20+ language grammars)
-- **Graph algorithms:** petgraph
+- **Graph algorithms:** rustworkx-core
 - **Parallelism:** rayon
 - **CLI framework:** clap (derive macros)
 - **Error handling:** anyhow

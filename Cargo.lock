@@ -1078,7 +1078,7 @@ dependencies = [
 [[package]]
 name = "rustworkx-core"
 version = "0.17.1"
-source = "git+https://github.com/gqf2008/rustworkx?rev=53a22228115c1e6149a94bd2118153d9fc127a7a#53a22228115c1e6149a94bd2118153d9fc127a7a"
+source = "git+https://github.com/gqf2008/rustworkx?rev=d733b4765650303ab50cc24badaf20aaf71d628c#d733b4765650303ab50cc24badaf20aaf71d628c"
 dependencies = [
  "fixedbitset",
  "foldhash",

@@ -276,7 +276,7 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
             }
         }
 
-        let communities_map = leiden_communities(&pg_graph, None, None, None);
+        let communities_map = leiden_communities(&pg_graph, None, None, Some(0.001), None);
         for (local_idx, pg_node) in pg_nodes.iter().enumerate() {
             let raw_label = communities_map.get(pg_node).copied().unwrap_or(local_idx as u32);
             groups.entry(raw_label).or_default().push(connected_nodes[local_idx]);
@@ -448,7 +448,7 @@ fn split_community(
         }
     }
 
-    let communities = leiden_communities(&pg_graph, None, None, None);
+    let communities = leiden_communities(&pg_graph, None, None, Some(0.001), None);
     let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
     for (local_idx, pg_node) in pg_nodes.iter().enumerate() {
         let label = communities.get(pg_node).copied().unwrap_or(local_idx as u32);

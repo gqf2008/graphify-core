@@ -2989,7 +2989,9 @@ function createNodeMesh(nodes) {{
   if (nodeMesh) {{ scene.remove(nodeMesh); nodeMesh.dispose(); }}
   if (!nodes.length) return;
 
-  const geometry = new THREE.SphereGeometry(1, 8, 6);
+  const segs = nodes.length > 2000 ? 5 : (nodes.length > 500 ? 6 : 8);
+  const rings = nodes.length > 2000 ? 3 : (nodes.length > 500 ? 4 : 6);
+  const geometry = new THREE.SphereGeometry(1, segs, rings);
   const material = new THREE.MeshBasicMaterial({{ color: 0xffffff }});
   nodeMesh = new THREE.InstancedMesh(geometry, material, nodes.length);
   nodeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
@@ -3015,6 +3017,7 @@ function createEdgeMesh() {{
     edgeGroup = null;
   }}
   if (!currentLinks.length) return;
+  if (viewMode === 'full' && currentLinks.length > 3000) return;
 
   for (const link of currentLinks) {{
     if (!link._rgb) {{
@@ -3316,6 +3319,41 @@ function tick() {{
   }};
 }}
 
+function generateDeterministicLayout(nodes, links) {{
+  const positions = new Float32Array(nodes.length * 3);
+  const communityNodes = new Map();
+  for (let i = 0; i < nodes.length; i++) {{
+    const cid = nodes[i].community;
+    if (!communityNodes.has(cid)) communityNodes.set(cid, []);
+    communityNodes.get(cid).push(i);
+  }}
+  const communities = Array.from(communityNodes.keys());
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+  const communityPositions = new Map();
+  for (let i = 0; i < communities.length; i++) {{
+    const y = 1 - (i / (communities.length - 1)) * 2;
+    const radius = Math.sqrt(1 - y * y);
+    const theta = goldenAngle * i;
+    const x = Math.cos(theta) * radius;
+    const z = Math.sin(theta) * radius;
+    communityPositions.set(communities[i], {{x: x * 600, y: y * 600, z: z * 600}});
+  }}
+  for (const [cid, nodeIndices] of communityNodes) {{
+    const center = communityPositions.get(cid);
+    const spread = 40 + Math.sqrt(nodeIndices.length) * 10;
+    for (let i = 0; i < nodeIndices.length; i++) {{
+      const idx = nodeIndices[i];
+      const phi = Math.acos(1 - 2 * (i + 0.5) / nodeIndices.length);
+      const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+      const r = spread * Math.cbrt(Math.random() * 0.8 + 0.2);
+      positions[idx * 3] = center.x + r * Math.sin(phi) * Math.cos(theta);
+      positions[idx * 3 + 1] = center.y + r * Math.sin(phi) * Math.sin(theta);
+      positions[idx * 3 + 2] = center.z + r * Math.cos(phi);
+    }}
+  }}
+  return positions;
+}}
+
 function startPhysics(nodes, links) {{
   physicsGen++;
   if (worker) {{
@@ -3326,6 +3364,12 @@ function startPhysics(nodes, links) {{
   nodePositions = new Float32Array(nodes.length * 3);
   currentNodeIndexMap = new Map(nodes.map((n, i) => [n.id, i]));
   if (nodes.length === 0) return currentNodeIndexMap;
+
+  if (nodes.length > 2000) {{
+    nodePositions = generateDeterministicLayout(nodes, links);
+    needsLayoutUpdate = true;
+    return currentNodeIndexMap;
+  }}
 
   const spread = 200 + Math.sqrt(nodes.length) * 15;
   for (let i = 0; i < nodes.length; i++) {{
@@ -3392,6 +3436,7 @@ function refreshGraph() {{
 }}
 
 function onMouseMove(event) {{
+  if (currentNodes.length > 2000) return;
   const rect = container.getBoundingClientRect();
   mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;

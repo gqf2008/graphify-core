@@ -3089,7 +3089,6 @@ function createEdgeMesh() {{
     edgeGroup = null;
   }}
   if (!currentLinks.length) return;
-  if (viewMode === 'full' && currentLinks.length > 3000) return;
 
   for (const link of currentLinks) {{
     if (!link._rgb) {{

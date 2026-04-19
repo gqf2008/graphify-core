@@ -324,10 +324,82 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
         .filter(|members| !members.is_empty())
         .map(|members| members.into_iter().map(|idx| graph.nodes[idx].id.clone()).collect())
         .collect();
+    let min_community_size = if n < 50 { 1 } else { (n / 100).max(5) };
+    named_communities = merge_small_communities(graph, named_communities, min_community_size);
     named_communities.iter_mut().for_each(|v| v.sort());
     named_communities
         .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     named_communities.into_iter().enumerate().collect()
+}
+
+fn merge_small_communities(
+    graph: &Graph,
+    communities: Vec<Vec<String>>,
+    min_size: usize,
+) -> Vec<Vec<String>> {
+    if communities.len() <= 1 {
+        return communities;
+    }
+
+    let mut large: Vec<Vec<String>> = Vec::new();
+    let mut small: Vec<Vec<String>> = Vec::new();
+    for c in communities {
+        if c.len() < min_size {
+            small.push(c);
+        } else {
+            large.push(c);
+        }
+    }
+
+    if small.is_empty() {
+        return large;
+    }
+
+    if large.is_empty() {
+        let mut sorted = small;
+        sorted.sort_by_key(|c| std::cmp::Reverse(c.len()));
+        let mut result: Vec<Vec<String>> = Vec::new();
+        if let Some(first) = sorted.pop() {
+            result.push(first);
+        }
+        for c in sorted {
+            result.last_mut().unwrap().extend(c);
+        }
+        return result;
+    }
+
+    let node_to_community: HashMap<String, usize> = large
+        .iter()
+        .enumerate()
+        .flat_map(|(i, c)| c.iter().map(move |node| (node.clone(), i)))
+        .collect();
+
+    for small_comm in small {
+        let mut neighbor_counts: HashMap<usize, usize> = HashMap::new();
+        for node in &small_comm {
+            for edge in &graph.edges {
+                let other = if edge.source == *node {
+                    edge.target.as_str()
+                } else if edge.target == *node {
+                    edge.source.as_str()
+                } else {
+                    continue;
+                };
+                if let Some(&cid) = node_to_community.get(other) {
+                    *neighbor_counts.entry(cid).or_default() += 1;
+                }
+            }
+        }
+
+        let target = neighbor_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(cid, _)| cid)
+            .unwrap_or(0);
+        large[target].extend(small_comm);
+    }
+
+    large.into_iter().filter(|c| !c.is_empty()).collect()
 }
 
 fn split_community(

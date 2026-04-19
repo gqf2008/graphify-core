@@ -520,6 +520,18 @@ fn write_graph_outputs(
     let graph_json = graph_json?;
     let wiki_articles = wiki_articles?;
 
+    // Merge analysis results into graph.json for parity benchmarking
+    let mut graph_value: Value = serde_json::from_str(&graph_json)
+        .context("cannot parse graph.json for analysis merge")?;
+    if let Some(obj) = graph_value.as_object_mut() {
+        obj.insert("communities".to_string(), serde_json::to_value(&communities)?);
+        obj.insert("god_nodes".to_string(), serde_json::to_value(&god_nodes)?);
+        obj.insert("surprising_connections".to_string(), serde_json::to_value(&surprising_connections)?);
+        obj.insert("suggest_questions".to_string(), serde_json::to_value(&suggested_questions)?);
+    }
+    let graph_json = serde_json::to_string_pretty(&graph_value)
+        .context("cannot re-serialize graph.json after merge")?;
+
     fs::write(&graph_path, graph_json)
         .with_context(|| format!("cannot write {}", graph_path.display()))?;
     fs::write(&html_path, graph_html)

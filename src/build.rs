@@ -317,7 +317,8 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
             members
         })
         .collect();
-    refine_boundary_nodes(graph, &mut indexed_communities);
+    // Disabled to align with Python original (pure Leiden output).
+    // refine_boundary_nodes(graph, &mut indexed_communities);
 
     let mut named_communities: Vec<Vec<String>> = indexed_communities
         .into_iter()

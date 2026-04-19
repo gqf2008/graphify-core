@@ -50,7 +50,7 @@ tree-sitter-objc = "3.0"
 tree-sitter-powershell = "0.26"
 tree-sitter-verilog = "1.0"
 tree-sitter-dart = "0.1.0"
-rustworkx-core = { git = "https://github.com/gqf2008/rustworkx", rev = "d733b4765650303ab50cc24badaf20aaf71d628c" }
+rustworkx-core = { git = "https://github.com/gqf2008/rustworkx", rev = "086a96204c0282f89574686041337dd66e29f0c2" }
 regex = "1.12.3"
 pdf-extract = "0.10.0"
 docx-lite = "0.2.0"

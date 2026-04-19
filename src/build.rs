@@ -308,9 +308,13 @@ fn split_community(
         return vec![nodes.to_vec()];
     }
 
-    let local_global: Vec<usize> = nodes
+    let filtered_nodes: Vec<&String> = nodes
         .iter()
-        .filter_map(|id| node_index.get(id.as_str()).copied())
+        .filter(|id| node_index.contains_key(id.as_str()))
+        .collect();
+    let local_global: Vec<usize> = filtered_nodes
+        .iter()
+        .map(|id| *node_index.get(id.as_str()).unwrap())
         .collect();
     if local_global.len() <= 1 {
         return vec![nodes.to_vec()];
@@ -351,7 +355,7 @@ fn split_community(
         .into_values()
         .map(|members| {
             let mut community: Vec<String> =
-                members.into_iter().map(|local_idx| nodes[local_idx].clone()).collect();
+                members.into_iter().map(|local_idx| filtered_nodes[local_idx].clone()).collect();
             community.sort();
             community
         })

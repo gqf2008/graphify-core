@@ -3235,6 +3235,7 @@ pub fn export_html_3d(
         "nodes": community_overview_nodes,
         "links": community_overview_links,
     }));
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -3246,668 +3247,878 @@ html, body {{ margin: 0; padding: 0; width: 100%; height: 100%; background: #0f0
 body {{ display: flex; overflow: hidden; }}
 #graph {{ flex: 1; position: relative; min-width: 0; }}
 #sidebar {{ width: 340px; background: rgba(19, 22, 32, 0.94); backdrop-filter: blur(12px); border-left: 1px solid rgba(255,255,255,0.08); box-sizing: border-box; padding: 18px; overflow-y: auto; }}
-#search-wrap {{ position: sticky; top: 0; background: linear-gradient(180deg, rgba(19,22,32,0.98) 0%, rgba(19,22,32,0.88) 100%); padding-bottom: 12px; z-index: 2; }}
-#search {{ width: 100%; box-sizing: border-box; padding: 10px 12px; border: 1px solid rgba(255,255,255,0.14); border-radius: 10px; background: rgba(255,255,255,0.06); color: #fff; outline: none; }}
-#search:focus {{ border-color: rgba(102, 178, 255, 0.9); box-shadow: 0 0 0 3px rgba(102,178,255,0.18); }}
-#search-results {{ margin-top: 10px; display: none; border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; background: rgba(7, 10, 18, 0.95); max-height: 240px; overflow: auto; }}
-#view-controls {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }}
-.control-btn {{ border: 1px solid rgba(255,255,255,0.14); border-radius: 999px; background: rgba(255,255,255,0.04); color: #dce7ff; padding: 6px 10px; font-size: 12px; cursor: pointer; }}
-.control-btn.active {{ background: rgba(95, 158, 255, 0.18); border-color: rgba(95, 158, 255, 0.55); }}
-.control-row {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }}
-.mode-hint {{ margin-top: 10px; font-size: 12px; color: #9fb0c9; line-height: 1.5; }}
-.search-item {{ padding: 10px 12px; cursor: pointer; border-bottom: 1px solid rgba(255,255,255,0.06); }}
-.search-item:last-child {{ border-bottom: 0; }}
-.search-item:hover {{ background: rgba(255,255,255,0.08); }}
-h3 {{ margin: 18px 0 10px; font-size: 15px; color: #dce7ff; }}
-#info-content, #legend {{ font-size: 13px; line-height: 1.5; color: #d4d9e4; }}
-.info-row {{ margin: 6px 0; }}
-.info-label {{ color: #9fb0c9; margin-right: 6px; }}
-.neighbor-list {{ margin: 10px 0 0; padding-left: 18px; }}
-.neighbor-link {{ color: #8fc5ff; cursor: pointer; text-decoration: none; }}
-.neighbor-link:hover {{ text-decoration: underline; }}
-.legend-item {{ display: flex; align-items: center; gap: 10px; margin: 8px 0; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.04); cursor: pointer; user-select: none; }}
-.legend-item.hidden {{ opacity: 0.4; }}
-.legend-swatch {{ width: 14px; height: 14px; border-radius: 50%; flex: none; }}
-.legend-text {{ flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-#stats {{ margin-top: 18px; font-size: 12px; color: #95a3bb; }}
-.empty {{ color: #95a3bb; }}
+h1 {{ font-size: 18px; margin: 0 0 10px; color: #c7d3e7; }}
+.stats {{ font-size: 13px; color: #8a9bb8; margin-bottom: 16px; }}
+.section {{ margin-bottom: 18px; }}
+.section-title {{ font-size: 12px; text-transform: uppercase; color: #5c6b82; letter-spacing: 0.5px; margin-bottom: 8px; }}
+.legend-row {{ display: flex; align-items: center; gap: 8px; margin-bottom: 5px; font-size: 13px; cursor: pointer; }}
+.legend-row:hover {{ opacity: 0.8; }}
+.legend-color {{ width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }}
+.search-wrap {{ position: relative; margin-bottom: 10px; }}
+#search {{ width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #fff; font-size: 13px; box-sizing: border-box; }}
+#search:focus {{ outline: none; border-color: rgba(255,255,255,0.25); }}
+#search-results {{ position: absolute; top: 100%; left: 0; right: 0; background: rgba(25,28,40,0.98); border: 1px solid rgba(255,255,255,0.1); border-radius: 6px; margin-top: 4px; max-height: 260px; overflow-y: auto; z-index: 100; display: none; }}
+.search-item {{ padding: 8px 10px; cursor: pointer; font-size: 13px; border-bottom: 1px solid rgba(255,255,255,0.05); }}
+.search-item:hover {{ background: rgba(255,255,255,0.05); }}
+.search-item:last-child {{ border-bottom: none; }}
+.node-details {{ background: rgba(255,255,255,0.04); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.5; }}
+.node-details strong {{ color: #c7d3e7; }}
+.node-details a {{ color: #6ea8fe; text-decoration: none; }}
+.node-details a:hover {{ text-decoration: underline; }}
+.empty-state {{ color: #5c6b82; font-size: 13px; font-style: italic; padding: 8px 0; }}
+.controls {{ display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }}
+.control-btn {{ padding: 6px 12px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.1); background: rgba(255,255,255,0.05); color: #c7d3e7; font-size: 12px; cursor: pointer; }}
+.control-btn:hover {{ background: rgba(255,255,255,0.1); }}
+.control-btn.active {{ background: rgba(110,168,254,0.2); border-color: rgba(110,168,254,0.4); color: #6ea8fe; }}
+.hint {{ font-size: 12px; color: #5c6b82; margin-top: 8px; }}
+.hint kbd {{ background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 3px; font-family: monospace; }}
+#canvas-container {{ width: 100%; height: 100%; cursor: grab; }}
+#canvas-container:active {{ cursor: grabbing; }}
+#canvas-controls {{ position: absolute; bottom: 14px; right: 14px; display: flex; gap: 6px; z-index: 10; }}
+#tooltip {{ position: absolute; background: rgba(19, 22, 32, 0.95); backdrop-filter: blur(8px); border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; padding: 10px 14px; color: #fff; font-size: 13px; pointer-events: none; opacity: 0; transition: opacity 0.15s; max-width: 280px; z-index: 50; }}
+#tooltip.visible {{ opacity: 1; }}
+.community-nodes {{ max-height: 200px; overflow-y: auto; margin-top: 8px; }}
+.community-node {{ padding: 4px 0; font-size: 12px; cursor: pointer; color: #9fb0c9; border-bottom: 1px solid rgba(255,255,255,0.04); }}
+.community-node:hover {{ color: #c7d3e7; }}
 </style>
+<script type="importmap">
+{{ "imports": {{ "three": "https://unpkg.com/three@0.160.0/build/three.module.js", "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/" }} }}
+</script>
 </head>
 <body>
-<div id="graph"></div>
+<div id="graph">
+  <div id="canvas-container">
+    <div id="canvas-controls">
+      <button class="control-btn" title="Zoom out" onclick="event.stopPropagation(); zoomCamera(1.4)">−</button>
+      <button class="control-btn" title="Fit view" onclick="event.stopPropagation(); zoomToFit()">Fit</button>
+      <button class="control-btn" title="Zoom in" onclick="event.stopPropagation(); zoomCamera(0.7)">+</button>
+    </div>
+  </div>
+  <div id="tooltip"></div>
+</div>
 <div id="sidebar">
-  <div id="search-wrap">
-    <input id="search" type="text" placeholder="Search nodes..." autocomplete="off">
-    <div id="search-results"></div>
-    <div id="view-controls"></div>
+  <h1>graphify 3D</h1>
+  <div class="stats">{stats}</div>
+
+  <div class="section">
+    <div class="section-title">Search</div>
+    <div class="search-wrap">
+      <input type="text" id="search" placeholder="Find node..." autocomplete="off">
+      <div id="search-results"></div>
+    </div>
   </div>
-  <div id="info-panel">
-    <h3>Node Info</h3>
-    <div id="info-content"><span class="empty">Click a node to inspect it</span></div>
+
+  <div class="section">
+    <div class="section-title">View</div>
+    <div class="controls">
+      <button class="control-btn" id="btn-full" onclick="setViewMode('full')">Full Graph</button>
+      <button class="control-btn" id="btn-overview" onclick="setViewMode('overview')">Overview</button>
+      <button class="control-btn" id="btn-back" style="display:none;" onclick="setViewMode('overview')">← Back to Overview</button>
+    </div>
+    <div id="community-controls" class="controls" style="display:none;"></div>
   </div>
-  <div id="legend-wrap">
-    <h3>Communities</h3>
+
+  <div class="section">
+    <div class="section-title">Legend</div>
     <div id="legend"></div>
   </div>
-  <div id="stats">{stats}</div>
+
+  <div class="section">
+    <div class="section-title">Node Details</div>
+    <div id="node-details" class="node-details">
+      <div class="empty-state">Click or hover a node to see details.</div>
+    </div>
+  </div>
+
+  <div class="section">
+    <div class="section-title">Navigation</div>
+    <div class="hint">
+      <kbd>Left drag</kbd> rotate &nbsp; <kbd>Right drag</kbd> pan<br>
+      <kbd>Scroll</kbd> zoom &nbsp; <kbd>Click</kbd> select
+    </div>
+  </div>
 </div>
-<script src="https://unpkg.com/3d-force-graph"></script>
-<script>
+
+<script type="module">
+import * as THREE from 'three';
+import {{ OrbitControls }} from 'three/addons/controls/OrbitControls.js';
+
 const BASE_NODES = {nodes_json};
 const BASE_LINKS = {edges_json};
-const LEGEND = {legend_json};
-const LARGE_GRAPH_MODE = {large_graph_mode};
+const LEGEND_DATA = {legend_json};
 const COMMUNITY_OVERVIEW = {community_overview_json};
+const LARGE_GRAPH_MODE = {large_graph_mode};
 
-const graphEl = document.getElementById('graph');
-const searchEl = document.getElementById('search');
-const searchResultsEl = document.getElementById('search-results');
-const infoContentEl = document.getElementById('info-content');
-const legendEl = document.getElementById('legend');
-const viewControlsEl = document.getElementById('view-controls');
-const MAX_NEIGHBORHOOD_NEIGHBORS = LARGE_GRAPH_MODE ? 80 : 120;
+const nodeById = new Map(BASE_NODES.map(n => [n.id, n]));
 
-const nodeById = new Map(BASE_NODES.map(node => [node.id, node]));
-const communityOverviewNodeById = new Map(COMMUNITY_OVERVIEW.nodes.map(node => [node.id, node]));
-const legendById = new Map(LEGEND.map(item => [item.cid, item]));
-const EDGE_RECORDS = BASE_LINKS.map((link, index) => ({{ ...link, _index: index }}));
-const neighborIndex = new Map(BASE_NODES.map(node => [node.id, new Set()]));
-const incidentLinkIndexes = new Map(BASE_NODES.map(node => [node.id, []]));
-const FULL_GRAPH_LINK_BATCH = LARGE_GRAPH_MODE ? 450 : 1000;
-for (const link of EDGE_RECORDS) {{
-  if (neighborIndex.has(link.source)) neighborIndex.get(link.source).add(link.target);
-  if (neighborIndex.has(link.target)) neighborIndex.get(link.target).add(link.source);
-  if (incidentLinkIndexes.has(link.source)) incidentLinkIndexes.get(link.source).push(link._index);
-  if (incidentLinkIndexes.has(link.target)) incidentLinkIndexes.get(link.target).push(link._index);
-}}
-let hiddenCommunities = new Set();
 let viewMode = LARGE_GRAPH_MODE ? 'overview' : 'full';
 let activeCommunity = null;
 let activeNodeId = null;
-let pendingRefreshFrame = null;
-let progressiveLoadFrame = null;
-let pendingZoomToFit = true;
-let currentData = {{ nodes: [], links: [] }};
+let hiddenCommunities = new Set();
+let currentNodes = [];
+let currentLinks = [];
+let hoveredNodeId = null;
+let selectedNodeId = null;
+let selectedNodeIndicator = null;
 
-function esc(value) {{
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
-}}
+const container = document.getElementById('canvas-container');
+const tooltip = document.getElementById('tooltip');
 
-function graphNodeId(value) {{
-  return typeof value === 'object' ? value.id : value;
-}}
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f0f1a);
 
-function communityLabel(communityId) {{
-  return legendById.get(communityId)?.label || `Community ${{communityId}}`;
-}}
+const camera = new THREE.PerspectiveCamera(60, container.clientWidth / container.clientHeight, 0.1, 50000);
+camera.position.set(0, 0, 300);
 
-function applyViewTuning() {{
-  const overview = viewMode === 'overview';
-  const neighborhood = viewMode === 'neighborhood';
-  Graph.linkOpacity(overview ? 0.45 : (LARGE_GRAPH_MODE ? 0.14 : 0.28));
-  Graph.linkDirectionalArrowLength(overview || LARGE_GRAPH_MODE ? 0 : 3);
-  Graph.nodeVal(node => {{
-    if (node.kind === 'community') return Math.max(8, Number(node.size || 20) / 2.8);
-    return Math.max(2.5, Number(node.size || 8) / 5);
-  }});
-  Graph.cooldownTicks(overview ? 45 : (neighborhood ? 30 : (LARGE_GRAPH_MODE ? 60 : 120)));
-  const chargeForce = Graph.d3Force('charge');
-  if (chargeForce) chargeForce.strength(overview ? -260 : (neighborhood ? -180 : (LARGE_GRAPH_MODE ? -95 : -140)));
-  const linkForce = Graph.d3Force('link');
-  if (linkForce) {{
-    linkForce.distance(link => {{
-      if (link.kind === 'community') return 180;
-      return neighborhood
-        ? (link.width > 1 ? 90 : 115)
-        : LARGE_GRAPH_MODE
-          ? (link.width > 1 ? 65 : 85)
-          : (link.width > 1 ? 80 : 110);
-    }});
-  }}
-}}
+const renderer = new THREE.WebGLRenderer({{ antialias: true, powerPreference: 'high-performance' }});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(container.clientWidth, container.clientHeight);
+container.appendChild(renderer.domElement);
 
-function showOverviewHint() {{
-  infoContentEl.innerHTML = '<span class="empty">Click a community to inspect it, then open its subgraph only if you need more detail.</span>';
-}}
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.rotateSpeed = 0.6;
+controls.zoomSpeed = 1.2;
+controls.panSpeed = 0.8;
+controls.minDistance = 10;
+controls.maxDistance = 50000;
 
-function buildNeighborhoodData(nodeId) {{
-  const center = nodeById.get(nodeId);
-  if (!center) return {{ nodes: [], links: [] }};
-  const neighbors = [...(neighborIndex.get(nodeId) || [])]
-    .map(id => nodeById.get(id))
-    .filter(Boolean)
-    .sort((left, right) => Number(right.degree || 0) - Number(left.degree || 0) || String(left.label).localeCompare(String(right.label)))
-    .slice(0, MAX_NEIGHBORHOOD_NEIGHBORS);
-  const visibleIds = new Set([nodeId, ...neighbors.map(node => node.id)]);
-  const linkIndexes = new Set();
-  for (const visibleId of visibleIds) {{
-    for (const linkIndex of incidentLinkIndexes.get(visibleId) || []) {{
-      linkIndexes.add(linkIndex);
-    }}
-  }}
-  const nodes = [...visibleIds]
-    .map(id => nodeById.get(id))
-    .filter(Boolean)
-    .map(node => ({{ ...node }}));
-  const links = [...linkIndexes]
-    .map(index => EDGE_RECORDS[index])
-    .filter(link => visibleIds.has(link.source) && visibleIds.has(link.target))
-    .map(link => ({{ ...link }}));
-  return {{ nodes, links }};
-}}
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+
+// Reusable THREE objects to avoid per-frame allocation
+const _matrix = new THREE.Matrix4();
+const _scale = new THREE.Vector3();
+const _pos = new THREE.Vector3();
+const _quat = new THREE.Quaternion();
+const _box = new THREE.Box3();
+const _center = new THREE.Vector3();
+
+const _sphere = new THREE.Sphere();
+const _offset = new THREE.Vector3();
+const _up = new THREE.Vector3(0, 1, 0);
+const _end = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _edgeColor = new THREE.Color();
+
+let nodeMesh = null;
+let edgeMesh = null;
+let nodePositions = null;
+let worker = null;
+let needsLayoutUpdate = false;
+let currentNodeIndexMap = new Map();
+let physicsGen = 0;
 
 function buildVisibleData() {{
-  if (viewMode === 'overview') {{
-    const nodes = COMMUNITY_OVERVIEW.nodes
-      .filter(node => !hiddenCommunities.has(node.community))
-      .map(node => ({{ ...node }}));
-    const visible = new Set(nodes.map(node => node.id));
-    const links = COMMUNITY_OVERVIEW.links
-      .filter(link => visible.has(link.source) && visible.has(link.target))
-      .map(link => ({{ ...link }}));
-    return {{ nodes, links }};
+  if (viewMode === 'full') {{
+    currentNodes = BASE_NODES.filter(n => !hiddenCommunities.has(n.community));
+    const nodeSet = new Set(currentNodes.map(n => n.id));
+    currentLinks = BASE_LINKS.filter(l => nodeSet.has(l.source) && nodeSet.has(l.target));
+  }} else if (viewMode === 'overview') {{
+    currentNodes = COMMUNITY_OVERVIEW.nodes || [];
+    currentLinks = COMMUNITY_OVERVIEW.links || [];
+  }} else if (viewMode === 'community' && activeCommunity !== null) {{
+    currentNodes = BASE_NODES.filter(n => n.community === activeCommunity && !hiddenCommunities.has(n.community));
+    const nodeSet = new Set(currentNodes.map(n => n.id));
+    currentLinks = BASE_LINKS.filter(l => nodeSet.has(l.source) && nodeSet.has(l.target));
+  }} else if (viewMode === 'neighborhood' && activeNodeId !== null) {{
+    const neighborIds = new Set([activeNodeId]);
+    for (const l of BASE_LINKS) {{
+      if (l.source === activeNodeId) neighborIds.add(l.target);
+      if (l.target === activeNodeId) neighborIds.add(l.source);
+    }}
+    currentNodes = BASE_NODES.filter(n => neighborIds.has(n.id) && !hiddenCommunities.has(n.community));
+    const nodeSet = new Set(currentNodes.map(n => n.id));
+    currentLinks = BASE_LINKS.filter(l => nodeSet.has(l.source) && nodeSet.has(l.target));
+  }} else {{
+    currentNodes = [];
+    currentLinks = [];
   }}
-  if (viewMode === 'neighborhood' && activeNodeId) {{
-    return buildNeighborhoodData(activeNodeId);
-  }}
-  if (viewMode === 'community' && activeCommunity !== null) {{
-    const nodes = BASE_NODES
-      .filter(node => node.community === activeCommunity && !hiddenCommunities.has(node.community))
-      .map(node => ({{ ...node }}));
-    const visible = new Set(nodes.map(node => node.id));
-    const links = BASE_LINKS
-      .filter(link => visible.has(link.source) && visible.has(link.target))
-      .map(link => ({{ ...link }}));
-    return {{ nodes, links }};
-  }}
-  const nodes = BASE_NODES
-    .filter(node => !hiddenCommunities.has(node.community))
-    .map(node => ({{ ...node }}));
-  const visible = new Set(nodes.map(node => node.id));
-  const links = BASE_LINKS
-    .filter(link => visible.has(link.source) && visible.has(link.target))
-    .map(link => ({{ ...link }}));
-  return {{ nodes, links }};
 }}
 
-const Graph = ForceGraph3D()(graphEl)
-  .backgroundColor('#0f0f1a')
-  .showNavInfo(false)
-  .nodeRelSize(4)
-  .nodeOpacity(0.95)
-  .nodeColor(node => node.color)
-  .nodeVal(node => Math.max(2.5, Number(node.size || 8) / 5))
-  .nodeLabel(node => `
-    <div style="padding:8px 10px;max-width:320px">
-      <div style="font-weight:600;margin-bottom:4px">${{esc(node.label)}}</div>
-      <div>Community: ${{esc(node.community_name)}}</div>
-      <div>Type: ${{esc(node.file_type || 'unknown')}}</div>
-      <div>Degree: ${{esc(node.degree)}}</div>
-      <div>${{node.kind === 'community' ? 'Nodes' : 'File'}}: ${{esc(node.kind === 'community' ? node.node_count : (node.source_file || ''))}}</div>
-    </div>
-  `)
-  .linkColor(link => link.color)
-  .linkWidth(link => link.width || 1)
-  .linkOpacity(0.28)
-  .linkDirectionalArrowLength(3)
-  .linkDirectionalArrowRelPos(1)
-  .onNodeClick(node => {{
-    if (node.kind === 'community') {{
-      openCommunity(node.community);
-      return;
+function hexToRgb(hex) {{
+  const r6 = /^#?([a-f0-9]{{2}})([a-f0-9]{{2}})([a-f0-9]{{2}})$/i.exec(hex);
+  if (r6) return {{
+    r: parseInt(r6[1], 16) / 255,
+    g: parseInt(r6[2], 16) / 255,
+    b: parseInt(r6[3], 16) / 255
+  }};
+  const r3 = /^#?([a-f0-9])([a-f0-9])([a-f0-9])$/i.exec(hex);
+  if (r3) return {{
+    r: parseInt(r3[1] + r3[1], 16) / 255,
+    g: parseInt(r3[2] + r3[2], 16) / 255,
+    b: parseInt(r3[3] + r3[3], 16) / 255
+  }};
+  return {{ r: 0.5, g: 0.5, b: 0.5 }};
+}}
+
+function createNodeMesh(nodes) {{
+  if (nodeMesh) {{ scene.remove(nodeMesh); nodeMesh.dispose(); }}
+  if (!nodes.length) return;
+
+  const geometry = new THREE.SphereGeometry(1, 8, 6);
+  const material = new THREE.MeshBasicMaterial({{ color: 0xffffff }});
+  nodeMesh = new THREE.InstancedMesh(geometry, material, nodes.length);
+  nodeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+
+  const color = new THREE.Color();
+  for (let i = 0; i < nodes.length; i++) {{
+    const c = hexToRgb(nodes[i].color || '#888888');
+    color.setRGB(c.r, c.g, c.b);
+    nodeMesh.setColorAt(i, color);
+  }}
+  nodeMesh.instanceColor.needsUpdate = true;
+  scene.add(nodeMesh);
+}}
+
+let edgeColorsNeedUpdate = false;
+function createEdgeMesh() {{
+  if (edgeMesh) {{ scene.remove(edgeMesh); edgeMesh.dispose(); }}
+  if (!currentLinks.length) return;
+
+  // Pre-compute and cache edge colors to avoid repeated hexToRgb
+  // Lighten colors by 25% so they remain visible on the dark background
+  for (const link of currentLinks) {{
+    if (!link._rgb) {{
+      const base = hexToRgb(link.color || '#888888');
+      link._rgb = {{ r: base.r * 0.75 + 0.25, g: base.g * 0.75 + 0.25, b: base.b * 0.75 + 0.25 }};
     }}
-    focusNode(node.id);
+  }}
+
+  const geometry = new THREE.CylinderGeometry(1, 1, 1, 4, 1, true);
+  const material = new THREE.MeshBasicMaterial({{
+    color: 0xffffff,
+    transparent: true,
+    opacity: 0.6,
+    depthWrite: false,
   }});
 
-const charge = Graph.d3Force('charge');
-if (charge) charge.strength(LARGE_GRAPH_MODE ? -95 : -140);
-const linkForce = Graph.d3Force('link');
-if (linkForce) linkForce.distance(link => link.width > 1 ? 80 : 110);
-Graph.d3VelocityDecay(LARGE_GRAPH_MODE ? 0.34 : 0.22);
-const controls = typeof Graph.controls === 'function' ? Graph.controls() : null;
-if (controls) {{
-  controls.enableZoom = true;
-  controls.enablePan = true;
-  controls.enableRotate = true;
-  controls.zoomSpeed = 1.1;
+  edgeMesh = new THREE.InstancedMesh(geometry, material, currentLinks.length);
+  edgeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  edgeMesh.frustumCulled = false;
+  scene.add(edgeMesh);
+  edgeColorsNeedUpdate = true;
+}}
+
+function updateNodeMatrices() {{
+  if (!nodeMesh || !nodePositions) return;
+  const n = currentNodes.length;
+  const sizeScale = n > 2000 ? 0.35 : (n > 500 ? 0.22 : 0.15);
+
+  for (let i = 0; i < n; i++) {{
+    const node = currentNodes[i];
+    const s = (node.size || 10) * sizeScale;
+    _scale.set(s, s, s);
+    _pos.set(nodePositions[i * 3], nodePositions[i * 3 + 1], nodePositions[i * 3 + 2]);
+    _matrix.compose(_pos, _quat, _scale);
+    nodeMesh.setMatrixAt(i, _matrix);
+  }}
+  nodeMesh.instanceMatrix.needsUpdate = true;
+  nodeMesh.count = currentNodes.length;
+}}
+
+function updateEdgePositions() {{
+  if (!edgeMesh || !nodePositions) return;
+  const edgeRadius = 0.06;
+
+  let idx = 0;
+  for (const link of currentLinks) {{
+    const si = currentNodeIndexMap.get(link.source);
+    const ti = currentNodeIndexMap.get(link.target);
+    if (si === undefined || ti === undefined || si === ti) continue;
+
+    const sx = nodePositions[si * 3], sy = nodePositions[si * 3 + 1], sz = nodePositions[si * 3 + 2];
+    const tx = nodePositions[ti * 3], ty = nodePositions[ti * 3 + 1], tz = nodePositions[ti * 3 + 2];
+
+    _pos.set(sx, sy, sz);
+    _end.set(tx, ty, tz);
+    _center.addVectors(_pos, _end).multiplyScalar(0.5);
+    _dir.subVectors(_end, _pos);
+    const len = _dir.length();
+    if (len < 0.001) continue;
+    _dir.normalize();
+    _quat.setFromUnitVectors(_up, _dir);
+    _scale.set(edgeRadius, len, edgeRadius);
+    _matrix.compose(_center, _quat, _scale);
+    edgeMesh.setMatrixAt(idx, _matrix);
+
+    const c = link._rgb || hexToRgb(link.color || '#888888');
+    _edgeColor.setRGB(c.r, c.g, c.b);
+    edgeMesh.setColorAt(idx, _edgeColor);
+    idx++;
+  }}
+
+  edgeMesh.instanceMatrix.needsUpdate = true;
+  if (edgeColorsNeedUpdate) {{
+    edgeMesh.instanceColor.needsUpdate = true;
+    edgeColorsNeedUpdate = false;
+  }}
+  edgeMesh.count = idx;
+}}
+
+let workerUrl = null;
+function initWorker() {{
+  const workerCode = `
+let nodes = [];
+let edges = [];
+let positions = null;
+let velocities = null;
+let running = false;
+let nodeIndexMap = new Map();
+let tickCount = 0;
+let edgeMap = null;
+
+self.onmessage = function(e) {{
+  const msg = e.data;
+  if (msg.type === 'init') {{
+    nodes = msg.nodes;
+    edges = msg.edges;
+    nodeIndexMap = new Map(msg.nodeIndexMap || []);
+    positions = new Float32Array(nodes.length * 3);
+    velocities = new Float32Array(nodes.length * 3);
+    const spread = 200 + Math.sqrt(nodes.length) * 15;
+    for (let i = 0; i < nodes.length; i++) {{
+      positions[i*3] = (Math.random() - 0.5) * spread;
+      positions[i*3+1] = (Math.random() - 0.5) * spread;
+      positions[i*3+2] = (Math.random() - 0.5) * spread;
+    }}
+    edgeMap = null;
+    tickCount = 0;
+    running = false;
+  }} else if (msg.type === 'start') {{
+    running = true;
+    tick();
+  }} else if (msg.type === 'stop') {{
+    running = false;
+  }}
+}};
+
+function tick() {{
+  if (!running) return;
+  const n = nodes.length;
+  if (n === 0) {{ setTimeout(tick, 16); return; }}
+
+  // Physics params tuned to reduce oscillation
+  const repulsion = 2000;
+  const attraction = 0.015;
+  const damping = 0.85;
+  const centerGravity = 0.005;
+  const idealDist = 40 + Math.sqrt(Math.max(n, 50)) * 2;
+
+  if (!edgeMap) {{
+    edgeMap = new Map();
+    for (let i = 0; i < edges.length; i++) {{
+      const e = edges[i];
+      if (!edgeMap.has(e.source)) edgeMap.set(e.source, []);
+      if (!edgeMap.has(e.target)) edgeMap.set(e.target, []);
+      edgeMap.get(e.source).push(e.target);
+      edgeMap.get(e.target).push(e.source);
+    }}
+  }}
+
+  const cellSize = idealDist * 2.5;
+  const grid = new Map();
+  for (let i = 0; i < n; i++) {{
+    const cx = Math.floor(positions[i*3] / cellSize);
+    const cy = Math.floor(positions[i*3+1] / cellSize);
+    const cz = Math.floor(positions[i*3+2] / cellSize);
+    const key = cx + ',' + cy + ',' + cz;
+    if (!grid.has(key)) grid.set(key, []);
+    grid.get(key).push(i);
+  }}
+
+  let totalEnergy = 0;
+
+  for (let i = 0; i < n; i++) {{
+    let fx = 0, fy = 0, fz = 0;
+
+    const ci = Math.floor(positions[i*3] / cellSize);
+    const cj = Math.floor(positions[i*3+1] / cellSize);
+    const ck = Math.floor(positions[i*3+2] / cellSize);
+    for (let dx = -1; dx <= 1; dx++) {{
+      for (let dy = -1; dy <= 1; dy++) {{
+        for (let dz = -1; dz <= 1; dz++) {{
+          const key = (ci+dx) + ',' + (cj+dy) + ',' + (ck+dz);
+          const cell = grid.get(key);
+          if (!cell) continue;
+          for (const j of cell) {{
+            if (j <= i) continue;
+            const dx_ = positions[i*3] - positions[j*3];
+            const dy_ = positions[i*3+1] - positions[j*3+1];
+            const dz_ = positions[i*3+2] - positions[j*3+2];
+            const distSq = dx_*dx_ + dy_*dy_ + dz_*dz_;
+            if (distSq < 0.5) continue;
+            const f = repulsion / (distSq + 100);  // softening
+            const invDist = 1 / Math.sqrt(distSq);
+            const fdx = dx_ * f * invDist;
+            const fdy = dy_ * f * invDist;
+            const fdz = dz_ * f * invDist;
+            fx += fdx; fy += fdy; fz += fdz;
+            velocities[j*3] -= fdx;
+            velocities[j*3+1] -= fdy;
+            velocities[j*3+2] -= fdz;
+          }}
+        }}
+      }}
+    }}
+
+    const neighbors = edgeMap.get(nodes[i].id);
+    if (neighbors) {{
+      for (const nbId of neighbors) {{
+        const j = nodeIndexMap.get(nbId);
+        if (j === undefined || j === i) continue;
+        const dx_ = positions[j*3] - positions[i*3];
+        const dy_ = positions[j*3+1] - positions[i*3+1];
+        const dz_ = positions[j*3+2] - positions[i*3+2];
+        const dist = Math.sqrt(dx_*dx_ + dy_*dy_ + dz_*dz_);
+        if (dist < 0.1) continue;
+        const f = (dist - idealDist) * attraction;
+        fx += dx_ * f / dist;
+        fy += dy_ * f / dist;
+        fz += dz_ * f / dist;
+      }}
+    }}
+
+    fx -= positions[i*3] * centerGravity;
+    fy -= positions[i*3+1] * centerGravity;
+    fz -= positions[i*3+2] * centerGravity;
+
+    velocities[i*3] += fx;
+    velocities[i*3+1] += fy;
+    velocities[i*3+2] += fz;
+  }}
+
+  for (let i = 0; i < n; i++) {{
+    velocities[i*3] *= damping;
+    velocities[i*3+1] *= damping;
+    velocities[i*3+2] *= damping;
+    const vx = velocities[i*3];
+    const vy = velocities[i*3+1];
+    const vz = velocities[i*3+2];
+    totalEnergy += vx*vx + vy*vy + vz*vz;
+    positions[i*3] += vx;
+    positions[i*3+1] += vy;
+    positions[i*3+2] += vz;
+  }}
+
+  tickCount++;
+  const shouldSend = tickCount % 5 === 0;
+
+  // Auto-stop when layout has converged
+  const energyThreshold = n * 0.02;
+  if (totalEnergy < energyThreshold && tickCount > 150) {{
+    self.postMessage({{ type: 'tick', positions: positions.slice() }});
+    self.postMessage({{ type: 'converged' }});
+    running = false;
+    return;
+  }}
+
+  if (shouldSend) {{
+    self.postMessage({{ type: 'tick', positions: positions.slice() }});
+  }}
+
+  const delay = n > 2000 ? 0 : (n > 500 ? 8 : 16);
+  setTimeout(tick, delay);
+}}
+  `;
+  const blob = new Blob([workerCode], {{ type: 'application/javascript' }});
+  if (workerUrl) URL.revokeObjectURL(workerUrl);
+  workerUrl = URL.createObjectURL(blob);
+  worker = new Worker(workerUrl);
+  const expectedGen = physicsGen;
+  worker.onmessage = (e) => {{
+    if (e.data.type === 'tick') {{
+      if (expectedGen !== physicsGen) return;
+      nodePositions = e.data.positions;
+      needsLayoutUpdate = true;
+    }}
+    if (e.data.type === 'converged') {{
+      // Layout has stabilized; no more jitter
+    }}
+  }};
+}}
+
+function startPhysics(nodes, links) {{
+  physicsGen++;
+  if (worker) {{
+    worker.postMessage({{ type: 'stop' }});
+    worker.terminate();
+    worker = null;
+  }}
+  nodePositions = new Float32Array(nodes.length * 3);
+  currentNodeIndexMap = new Map(nodes.map((n, i) => [n.id, i]));
+  if (nodes.length === 0) return currentNodeIndexMap;
+
+  const spread = 200 + Math.sqrt(nodes.length) * 15;
+  for (let i = 0; i < nodes.length; i++) {{
+    nodePositions[i*3] = (Math.random() - 0.5) * spread;
+    nodePositions[i*3+1] = (Math.random() - 0.5) * spread;
+    nodePositions[i*3+2] = (Math.random() - 0.5) * spread;
+  }}
+
+  if (!worker) initWorker();
+  worker.postMessage({{
+    type: 'init',
+    nodes: nodes.map(n => ({{ id: n.id, size: n.size || 10 }})),
+    edges: links.map(l => ({{ source: l.source, target: l.target }})),
+    nodeIndexMap: Array.from(currentNodeIndexMap.entries()),
+  }});
+  worker.postMessage({{ type: 'start' }});
+  return currentNodeIndexMap;
 }}
 
 function zoomCamera(scale) {{
-  if (!controls || !controls.object) return;
-  const camera = controls.object;
-  const target = controls.target || {{ x: 0, y: 0, z: 0 }};
-  const nextX = target.x + (camera.position.x - target.x) * scale;
-  const nextY = target.y + (camera.position.y - target.y) * scale;
-  const nextZ = target.z + (camera.position.z - target.z) * scale;
-  Graph.cameraPosition(
-    {{ x: nextX, y: nextY, z: nextZ }},
-    {{ x: target.x, y: target.y, z: target.z }},
-    220,
-  );
+  _offset.copy(camera.position).sub(controls.target);
+  const currentDist = _offset.length();
+  const newDist = Math.max(controls.minDistance, Math.min(controls.maxDistance, currentDist * scale));
+  _offset.normalize().multiplyScalar(newDist);
+  camera.position.copy(controls.target).add(_offset);
+  controls.update();
 }}
 
-function fitCurrentGraph() {{
-  pendingZoomToFit = false;
-  if (typeof Graph.zoomToFit === 'function') {{
-    Graph.zoomToFit(
-      viewMode === 'community' ? 900 : 700,
-      viewMode === 'community' ? 70 : 90,
-    );
+function zoomToFit() {{
+  if (!nodePositions || !currentNodes.length) return;
+  _box.makeEmpty();
+  for (let i = 0; i < currentNodes.length; i++) {{
+    _pos.set(nodePositions[i*3], nodePositions[i*3+1], nodePositions[i*3+2]);
+    _box.expandByPoint(_pos);
   }}
+  _box.getCenter(_center);
+  _box.getBoundingSphere(_sphere);
+  const dist = _sphere.radius / Math.tan((camera.fov * Math.PI / 180) / 2);
+  _offset.copy(camera.position).sub(controls.target);
+  if (_offset.lengthSq() < 0.001) _offset.set(0, 0, 1);
+  _offset.normalize().multiplyScalar(Math.max(dist * 1.3, 50));
+  camera.position.copy(_center).add(_offset);
+  controls.target.copy(_center);
+  controls.update();
 }}
 
-function renderControls() {{
-  viewControlsEl.innerHTML = '';
-  const buttons = document.createElement('div');
-  buttons.className = 'control-row';
-  buttons.style.display = 'flex';
-  buttons.style.gap = '8px';
-  buttons.style.flexWrap = 'wrap';
+let zoomToFitTimeout = null;
+function refreshGraph() {{
+  buildVisibleData();
+  startPhysics(currentNodes, currentLinks);
+  createNodeMesh(currentNodes);
+  createEdgeMesh();
 
-  if (LARGE_GRAPH_MODE) {{
-    const overviewBtn = document.createElement('button');
-    overviewBtn.type = 'button';
-    overviewBtn.className = 'control-btn' + (viewMode === 'overview' ? ' active' : '');
-    overviewBtn.textContent = 'Community overview';
-    overviewBtn.addEventListener('click', () => {{
-      viewMode = 'overview';
-      activeCommunity = null;
-      activeNodeId = null;
-      pendingZoomToFit = true;
-      refreshGraph();
-      showOverviewHint();
-    }});
-    buttons.appendChild(overviewBtn);
-
-    const fullBtn = document.createElement('button');
-    fullBtn.type = 'button';
-    fullBtn.className = 'control-btn' + (viewMode === 'full' ? ' active' : '');
-    fullBtn.textContent = 'Load full graph';
-    fullBtn.addEventListener('click', () => {{
-      viewMode = 'full';
-      activeCommunity = null;
-      activeNodeId = null;
-      pendingZoomToFit = false;
-      refreshGraph();
-    }});
-    buttons.appendChild(fullBtn);
-
-    if ((viewMode === 'community' || viewMode === 'neighborhood') && activeCommunity !== null) {{
-      const communityBtn = document.createElement('button');
-      communityBtn.type = 'button';
-      communityBtn.className = 'control-btn' + (viewMode === 'community' ? ' active' : '');
-      communityBtn.textContent = communityLabel(activeCommunity);
-      communityBtn.addEventListener('click', () => openCommunity(activeCommunity));
-      buttons.appendChild(communityBtn);
-    }}
-
-    if (viewMode === 'neighborhood' && activeNodeId) {{
-      const nodeBtn = document.createElement('button');
-      nodeBtn.type = 'button';
-      nodeBtn.className = 'control-btn active';
-      nodeBtn.textContent = 'Node neighborhood';
-      nodeBtn.addEventListener('click', () => openNodeNeighborhood(activeNodeId));
-      buttons.appendChild(nodeBtn);
-    }}
+  if (currentNodes.length > 0) {{
+    if (zoomToFitTimeout) clearTimeout(zoomToFitTimeout);
+    zoomToFitTimeout = setTimeout(() => {{ zoomToFitTimeout = null; zoomToFit(); }}, 600);
+  }} else if (zoomToFitTimeout) {{
+    clearTimeout(zoomToFitTimeout);
+    zoomToFitTimeout = null;
   }}
 
-  const zoomInBtn = document.createElement('button');
-  zoomInBtn.type = 'button';
-  zoomInBtn.className = 'control-btn';
-  zoomInBtn.textContent = 'Zoom in';
-  zoomInBtn.addEventListener('click', () => zoomCamera(0.8));
-  buttons.appendChild(zoomInBtn);
-
-  const zoomOutBtn = document.createElement('button');
-  zoomOutBtn.type = 'button';
-  zoomOutBtn.className = 'control-btn';
-  zoomOutBtn.textContent = 'Zoom out';
-  zoomOutBtn.addEventListener('click', () => zoomCamera(1.25));
-  buttons.appendChild(zoomOutBtn);
-
-  const fitBtn = document.createElement('button');
-  fitBtn.type = 'button';
-  fitBtn.className = 'control-btn';
-  fitBtn.textContent = 'Fit view';
-  fitBtn.addEventListener('click', () => fitCurrentGraph());
-  buttons.appendChild(fitBtn);
-
-  const hint = document.createElement('div');
-  hint.className = 'mode-hint';
-  hint.textContent = LARGE_GRAPH_MODE
-    ? viewMode === 'overview'
-      ? 'Large graph mode is active: start from communities, then drill into a community or switch to the full graph if needed.'
-      : viewMode === 'neighborhood' && activeNodeId
-        ? 'Showing only the clicked node and its local neighborhood for faster interaction.'
-        : viewMode === 'community' && activeCommunity !== null
-          ? `Showing ${{communityLabel(activeCommunity)}} only for smoother interaction.`
-          : 'Showing the full graph. If wheel zoom is flaky, use the zoom buttons above.'
-    : 'Use the zoom controls above if browser gestures are unreliable.';
-
-  viewControlsEl.appendChild(buttons);
-  viewControlsEl.appendChild(hint);
+  updateNodeMatrices();
+  updateEdgePositions();
 }}
 
-function renderLegend() {{
-  legendEl.innerHTML = '';
-  for (const item of LEGEND) {{
-    const entry = document.createElement('div');
-    entry.className = 'legend-item' + (hiddenCommunities.has(item.cid) ? ' hidden' : '');
-    entry.innerHTML = `
-      <span class="legend-swatch" style="background:${{item.color}}"></span>
-      <span class="legend-text">${{item.label}}</span>
-      <span>${{item.count}}</span>
-    `;
-    entry.addEventListener('click', () => {{
-      if (hiddenCommunities.has(item.cid)) hiddenCommunities.delete(item.cid);
-      else hiddenCommunities.add(item.cid);
-      refreshGraph();
-    }});
-    legendEl.appendChild(entry);
-  }}
-}}
+function onMouseMove(event) {{
+  const rect = container.getBoundingClientRect();
+  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 
-function neighborIds(nodeId) {{
-  return [...(neighborIndex.get(nodeId) || [])];
-}}
+  if (!nodeMesh) return;
+  raycaster.setFromCamera(mouse, camera);
+  const intersection = raycaster.intersectObject(nodeMesh);
 
-function showCommunityInfo(communityId) {{
-  const communityNode = communityOverviewNodeById.get(`community:${{communityId}}`);
-  if (!communityNode) return;
-  const preview = communityNode.preview ? `<div class="info-row"><span class="info-label">Top concepts:</span>${{esc(communityNode.preview)}}</div>` : '';
-  infoContentEl.innerHTML = `
-    <div class="info-row"><span class="info-label">Community:</span>${{esc(communityNode.community_name)}}</div>
-    <div class="info-row"><span class="info-label">Nodes:</span>${{esc(communityNode.node_count)}}</div>
-    <div class="info-row"><span class="info-label">Internal edges:</span>${{esc(communityNode.edge_count)}}</div>
-    ${{preview}}
-    <div class="info-row"><a class="neighbor-link" data-open-community="${{communityId}}">Open community subgraph</a></div>
-  `;
-  const openLink = infoContentEl.querySelector('[data-open-community]');
-  if (openLink) {{
-    openLink.addEventListener('click', event => {{
-      event.preventDefault();
-      openCommunity(communityId);
-    }});
-  }}
-}}
-
-function showCommunitySubgraphInfo(communityId) {{
-  const communityNode = communityOverviewNodeById.get(`community:${{communityId}}`);
-  if (!communityNode) return;
-  const preview = communityNode.preview ? `<div class="info-row"><span class="info-label">Top concepts:</span>${{esc(communityNode.preview)}}</div>` : '';
-  infoContentEl.innerHTML = `
-    <div class="info-row"><span class="info-label">Community subgraph:</span>${{esc(communityNode.community_name)}}</div>
-    <div class="info-row"><span class="info-label">Nodes:</span>${{esc(communityNode.node_count)}}</div>
-    <div class="info-row"><span class="info-label">Internal edges:</span>${{esc(communityNode.edge_count)}}</div>
-    ${{preview}}
-    <div class="info-row"><a class="neighbor-link" data-show-overview="true">Back to graph overview</a></div>
-  `;
-  const backLink = infoContentEl.querySelector('[data-show-overview]');
-  if (backLink) {{
-    backLink.addEventListener('click', event => {{
-      event.preventDefault();
-      viewMode = 'overview';
-      activeCommunity = null;
-      activeNodeId = null;
-      pendingZoomToFit = true;
-      refreshGraph();
-      showOverviewHint();
-    }});
-  }}
-}}
-
-function showInfo(nodeId) {{
-  const node = nodeById.get(nodeId);
-  if (!node) return;
-  const totalNeighborCount = neighborIds(nodeId).length;
-  const neighbors = neighborIds(nodeId)
-    .map(id => nodeById.get(id))
-    .filter(Boolean)
-    .sort((a, b) => String(a.label).localeCompare(String(b.label)));
-  const neighborSummary = viewMode === 'neighborhood' && activeNodeId === nodeId && totalNeighborCount > MAX_NEIGHBORHOOD_NEIGHBORS
-    ? `<div class="info-row"><span class="info-label">Rendered:</span>${{esc(MAX_NEIGHBORHOOD_NEIGHBORS)}} of ${{esc(totalNeighborCount)}} neighbors</div>`
-    : '';
-  let html = `
-    <div class="info-row"><span class="info-label">Label:</span>${{esc(node.label)}}</div>
-    <div class="info-row"><span class="info-label">Community:</span>${{esc(node.community_name)}}</div>
-    <div class="info-row"><span class="info-label">Type:</span>${{esc(node.file_type || 'unknown')}}</div>
-    <div class="info-row"><span class="info-label">Degree:</span>${{esc(node.degree)}}</div>
-    <div class="info-row"><span class="info-label">File:</span>${{esc(node.source_file || '')}}</div>
-    ${{neighborSummary}}
-  `;
-  if (LARGE_GRAPH_MODE) {{
-    html += `<div class="info-row"><a class="neighbor-link" data-open-community="${{esc(node.community)}}">Open community view</a></div>`;
-  }}
-  if (neighbors.length) {{
-    html += '<div class="info-row"><span class="info-label">Neighbors:</span></div><ul class="neighbor-list">';
-    for (const neighbor of neighbors.slice(0, 24)) {{
-      html += `<li><a class="neighbor-link" data-node-id="${{esc(neighbor.id)}}">${{esc(neighbor.label)}}</a></li>`;
-    }}
-    html += '</ul>';
-  }}
-  infoContentEl.innerHTML = html;
-  for (const link of infoContentEl.querySelectorAll('.neighbor-link')) {{
-    link.addEventListener('click', event => {{
-      event.preventDefault();
-      focusNode(link.dataset.nodeId);
-    }});
-  }}
-  const openCommunityLink = infoContentEl.querySelector('[data-open-community]');
-  if (openCommunityLink) {{
-    openCommunityLink.addEventListener('click', event => {{
-      event.preventDefault();
-      openCommunity(Number(openCommunityLink.dataset.openCommunity));
-    }});
-  }}
-}}
-
-function openCommunity(communityId, focusNodeId = null) {{
-  hiddenCommunities.delete(communityId);
-  viewMode = 'community';
-  activeCommunity = communityId;
-  activeNodeId = null;
-  pendingZoomToFit = true;
-  refreshGraph();
-  if (focusNodeId) {{
-    requestAnimationFrame(() => focusNode(focusNodeId));
-  }} else {{
-    showCommunitySubgraphInfo(communityId);
-  }}
-}}
-
-function focusRenderedNode(nodeId) {{
-  let node = currentData.nodes.find(item => item.id === nodeId);
-  if (!node) {{
-    return false;
-  }}
-  showInfo(nodeId);
-  const x = Number(node.x) || 0;
-  const y = Number(node.y) || 0;
-  const z = Number(node.z) || 0;
-  const distance = 160;
-  const norm = Math.hypot(x, y, z) || 1;
-  Graph.cameraPosition(
-    {{ x: x + (x / norm) * distance, y: y + (y / norm) * distance, z: z + (z / norm) * distance }},
-    {{ x, y, z }},
-    1200,
-  );
-  return true;
-}}
-
-function commitGraphData(nextData) {{
-  const previousSize = currentData.nodes.length + currentData.links.length;
-  const nextSize = nextData.nodes.length + nextData.links.length;
-  const stagedReload = LARGE_GRAPH_MODE
-    && (viewMode === 'overview' || previousSize > 260 || nextSize > 260);
-  const progressiveFullGraph = LARGE_GRAPH_MODE
-    && viewMode === 'full'
-    && nextData.links.length > FULL_GRAPH_LINK_BATCH;
-
-  if (pendingRefreshFrame !== null) {{
-    cancelAnimationFrame(pendingRefreshFrame);
-    pendingRefreshFrame = null;
-  }}
-  if (progressiveLoadFrame !== null) {{
-    cancelAnimationFrame(progressiveLoadFrame);
-    progressiveLoadFrame = null;
-  }}
-
-  currentData = nextData;
-  renderLegend();
-  renderControls();
-
-  const finalizeZoom = () => {{
-    if (pendingZoomToFit) {{
-      pendingZoomToFit = false;
-      requestAnimationFrame(() => {{
-        if (typeof Graph.zoomToFit === 'function') {{
-          Graph.zoomToFit(viewMode === 'community' ? 900 : 700, viewMode === 'community' ? 70 : 90);
-        }}
-      }});
-    }}
-  }};
-
-  const startProgressiveFullGraphLoad = () => {{
-    pendingRefreshFrame = null;
-    applyViewTuning();
-    const nodes = currentData.nodes;
-    const links = currentData.links;
-    let loaded = 0;
-
-    const loadChunk = () => {{
-      progressiveLoadFrame = null;
-      loaded = Math.min(links.length, loaded + FULL_GRAPH_LINK_BATCH);
-      Graph.graphData({{ nodes, links: links.slice(0, loaded) }});
-      if (loaded < links.length && viewMode === 'full') {{
-        progressiveLoadFrame = requestAnimationFrame(loadChunk);
-      }}
-    }};
-
-    Graph.graphData({{ nodes, links: [] }});
-    finalizeZoom();
-    progressiveLoadFrame = requestAnimationFrame(loadChunk);
-  }};
-
-  const applyData = () => {{
-    pendingRefreshFrame = null;
-    if (progressiveFullGraph) {{
-      startProgressiveFullGraphLoad();
+  if (intersection.length > 0) {{
+    const instanceId = intersection[0].instanceId;
+    const node = currentNodes[instanceId];
+    if (node) {{
+      hoveredNodeId = node.id;
+      tooltip.innerHTML = '<strong>' + esc(node.label) + '</strong><br><span style="color:#9fb0c9;font-size:12px">' + esc(node.source_file || node.community_name || '') + '</span>';
+      tooltip.classList.add('visible');
+      let tx = event.clientX - rect.left + 14;
+      let ty = event.clientY - rect.top + 14;
+      if (tx + 280 > rect.width) tx = event.clientX - rect.left - 290;
+      if (ty + 80 > rect.height) ty = event.clientY - rect.top - 80;
+      tooltip.style.left = Math.max(0, tx) + 'px';
+      tooltip.style.top = Math.max(0, ty) + 'px';
+      renderer.domElement.style.cursor = 'pointer';
       return;
     }}
-    applyViewTuning();
-    Graph.graphData(currentData);
-    finalizeZoom();
-  }};
+  }}
+  hoveredNodeId = null;
+  tooltip.classList.remove('visible');
+  renderer.domElement.style.cursor = 'grab';
+}}
 
-  if (stagedReload) {{
-    Graph.graphData({{ nodes: [], links: [] }});
-    pendingRefreshFrame = requestAnimationFrame(applyData);
+function onClick(event) {{
+  if (!nodeMesh) return;
+  const rect = container.getBoundingClientRect();
+  mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+  const intersection = raycaster.intersectObject(nodeMesh);
+  if (intersection.length > 0) {{
+    const node = currentNodes[intersection[0].instanceId];
+    if (node) selectNode(node);
   }} else {{
-    applyData();
+    selectedNodeId = null;
+    updateSelectedNodeIndicator();
+    updateNodeDetails(null);
   }}
 }}
 
-function openNodeNeighborhood(nodeId) {{
-  const baseNode = nodeById.get(nodeId);
-  if (!baseNode) return;
-  hiddenCommunities.delete(baseNode.community);
-  viewMode = 'neighborhood';
-  activeCommunity = baseNode.community;
-  activeNodeId = nodeId;
-  pendingZoomToFit = false;
+function selectNode(node) {{
+  selectedNodeId = node.id;
+  updateNodeDetails(node);
+  updateSelectedNodeIndicator();
+  if (node.kind === 'community') {{
+    openCommunity(parseInt(node.id.split(':')[1]));
+  }}
+}}
+
+function updateSelectedNodeIndicator() {{
+  if (selectedNodeIndicator) {{ scene.remove(selectedNodeIndicator); selectedNodeIndicator.dispose(); selectedNodeIndicator = null; }}
+  if (!selectedNodeId || !nodePositions) return;
+  const idx = currentNodeIndexMap.get(selectedNodeId);
+  if (idx === undefined) return;
+  const node = currentNodes[idx];
+  if (!node) return;
+
+  const sizeScale = currentNodes.length > 2000 ? 0.35 : (currentNodes.length > 500 ? 0.22 : 0.15);
+  const s = (node.size || 10) * sizeScale * 1.6;
+  const geometry = new THREE.SphereGeometry(1, 16, 12);
+  const material = new THREE.MeshBasicMaterial({{ color: 0xffffff, transparent: true, opacity: 0.25, wireframe: true }});
+  selectedNodeIndicator = new THREE.Mesh(geometry, material);
+  selectedNodeIndicator.position.set(nodePositions[idx * 3], nodePositions[idx * 3 + 1], nodePositions[idx * 3 + 2]);
+  selectedNodeIndicator.scale.set(s, s, s);
+  scene.add(selectedNodeIndicator);
+}}
+
+function updateNodeDetails(node) {{
+  const el = document.getElementById('node-details');
+  if (!node) {{
+    el.innerHTML = '<div class="empty-state">Click or hover a node to see details.</div>';
+    return;
+  }}
+  let html = '<strong>' + esc(node.label) + '</strong><br>';
+  html += 'Type: ' + esc(node.file_type || 'unknown') + '<br>';
+  if (node.source_file) html += 'File: ' + esc(node.source_file) + '<br>';
+  if (node.community_name) html += 'Community: ' + esc(node.community_name) + '<br>';
+  if (node.degree !== undefined) html += 'Degree: ' + node.degree + '<br>';
+  if (node.node_count !== undefined) html += 'Nodes: ' + node.node_count + ', Edges: ' + node.edge_count + '<br>';
+  if (node.preview) html += 'Preview: ' + esc(node.preview) + '<br>';
+
+  if (node.kind !== 'community') {{
+    const neighbors = [];
+    for (const l of BASE_LINKS) {{
+      if (l.source === node.id) neighbors.push(l.target);
+      if (l.target === node.id) neighbors.push(l.source);
+    }}
+    if (neighbors.length) {{
+      html += '<div style="margin-top:8px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px;"><strong>Neighbors</strong></div>';
+      html += '<div class="community-nodes">';
+      for (const nid of [...new Set(neighbors)].slice(0, 20)) {{
+        const n = nodeById.get(nid);
+        if (n) html += '<div class="community-node" onclick="focusNode(&quot;' + esc(n.id) + '&quot;)">' + esc(n.label) + '</div>';
+      }}
+      html += '</div>';
+    }}
+  }}
+  el.innerHTML = html;
+}}
+
+function setViewMode(mode) {{
+  viewMode = mode;
+  if (mode !== 'community') activeCommunity = null;
+  if (mode !== 'neighborhood') activeNodeId = null;
   refreshGraph();
-  requestAnimationFrame(() => focusRenderedNode(nodeId));
+  updateControlButtons();
+}}
+
+function openCommunity(cid, focusNodeId = null) {{
+  viewMode = 'community';
+  activeCommunity = cid;
+  activeNodeId = focusNodeId;
+  refreshGraph();
+  updateControlButtons();
+  if (focusNodeId) {{
+    setTimeout(() => {{
+      if (activeNodeId !== focusNodeId || viewMode !== 'community') return;
+      const node = currentNodes.find(n => n.id === focusNodeId);
+      if (node) focusCameraOnNode(node);
+    }}, 400);
+  }}
+}}
+
+function focusCameraOnNode(node) {{
+  const idx = currentNodeIndexMap.get(node.id);
+  if (idx === undefined || !nodePositions) return;
+  const x = nodePositions[idx * 3];
+  const y = nodePositions[idx * 3 + 1];
+  const z = nodePositions[idx * 3 + 2];
+  controls.target.set(x, y, z);
+  _offset.copy(camera.position).sub(controls.target);
+  const dist = Math.max(_offset.length(), 100);
+  _offset.normalize().multiplyScalar(dist);
+  camera.position.copy(controls.target).add(_offset);
+  controls.update();
 }}
 
 function focusNode(nodeId) {{
   const baseNode = nodeById.get(nodeId);
   if (!baseNode) return;
   if (LARGE_GRAPH_MODE) {{
-    if (viewMode === 'neighborhood' && activeNodeId === nodeId && focusRenderedNode(nodeId)) {{
-      return;
-    }}
-    openNodeNeighborhood(nodeId);
+    viewMode = 'neighborhood';
+    activeNodeId = nodeId;
+    refreshGraph();
+    const node = currentNodes.find(n => n.id === nodeId);
+    if (node) selectNode(node);
+    setTimeout(() => {{
+      if (activeNodeId !== nodeId || viewMode !== 'neighborhood') return;
+      const node = currentNodes.find(n => n.id === nodeId);
+      if (node) focusCameraOnNode(node);
+    }}, 400);
     return;
   }}
   if (viewMode === 'overview') {{
     openCommunity(baseNode.community, nodeId);
     return;
   }}
-  let node = currentData.nodes.find(item => item.id === nodeId);
-  if (!node) {{
-    if (viewMode === 'community' && activeCommunity !== baseNode.community) {{
-      openCommunity(baseNode.community, nodeId);
-      return;
-    }}
+  let idx = currentNodes.findIndex(n => n.id === nodeId);
+  if (idx < 0) {{
     hiddenCommunities.delete(baseNode.community);
-    if (viewMode === 'community') activeCommunity = baseNode.community;
+    if (viewMode === 'community') {{
+      activeCommunity = baseNode.community;
+    }} else if (viewMode === 'neighborhood') {{
+      viewMode = 'full';
+      activeNodeId = null;
+    }}
     refreshGraph();
-    node = currentData.nodes.find(item => item.id === nodeId);
-    if (!node) return;
+    syncLegendOpacity();
+    idx = currentNodes.findIndex(n => n.id === nodeId);
   }}
-  focusRenderedNode(nodeId);
+  if (idx >= 0) {{
+    selectNode(currentNodes[idx]);
+    focusCameraOnNode(currentNodes[idx]);
+  }}
 }}
 
-function refreshGraph() {{
-  if ((viewMode === 'community' || viewMode === 'neighborhood')
-      && activeCommunity !== null
-      && hiddenCommunities.has(activeCommunity)) {{
-    viewMode = LARGE_GRAPH_MODE ? 'overview' : 'full';
-    activeCommunity = null;
-    activeNodeId = null;
+function updateControlButtons() {{
+  document.getElementById('btn-full').classList.toggle('active', viewMode === 'full');
+  document.getElementById('btn-overview').classList.toggle('active', viewMode === 'overview');
+  const backBtn = document.getElementById('btn-back');
+  if (backBtn) backBtn.style.display = (viewMode === 'community' || viewMode === 'neighborhood') ? 'inline-block' : 'none';
+}}
+
+function syncLegendOpacity() {{
+  const rows = document.querySelectorAll('#legend .legend-row');
+  rows.forEach((row, index) => {{
+    const cid = LEGEND_DATA[index]?.cid;
+    if (cid !== undefined) {{
+      row.style.opacity = hiddenCommunities.has(cid) ? '0.4' : '1';
+    }}
+  }});
+}}
+
+function renderLegend() {{
+  const el = document.getElementById('legend');
+  el.innerHTML = '';
+  for (const item of LEGEND_DATA) {{
+    const row = document.createElement('div');
+    row.className = 'legend-row';
+    row.innerHTML = '<div class="legend-color" style="background:' + item.color + '"></div><div>' + esc(item.label) + ' (' + item.count + ')</div>';
+    row.addEventListener('click', () => {{
+      if (hiddenCommunities.has(item.cid)) {{
+        hiddenCommunities.delete(item.cid);
+      }} else {{
+        hiddenCommunities.add(item.cid);
+      }}
+      row.style.opacity = hiddenCommunities.has(item.cid) ? '0.4' : '1';
+      refreshGraph();
+    }});
+    el.appendChild(row);
   }}
-  commitGraphData(buildVisibleData());
 }}
 
 function renderSearchResults(results) {{
-  if (!results.length) {{
-    searchResultsEl.style.display = 'none';
-    searchResultsEl.innerHTML = '';
-    return;
-  }}
-  searchResultsEl.style.display = 'block';
-  searchResultsEl.innerHTML = '';
+  const el = document.getElementById('search-results');
+  if (!results.length) {{ el.style.display = 'none'; el.innerHTML = ''; return; }}
+  el.style.display = 'block';
+  el.innerHTML = '';
   for (const node of results) {{
     const item = document.createElement('div');
     item.className = 'search-item';
-    item.innerHTML = `<strong>${{esc(node.label)}}</strong><br><span style="color:#9fb0c9">${{esc(node.source_file || node.community_name)}}</span>`;
+    item.innerHTML = '<strong>' + esc(node.label) + '</strong><br><span style="color:#9fb0c9">' + esc(node.source_file || node.community_name || '') + '</span>';
     item.addEventListener('click', () => {{
-      searchEl.value = '';
+      document.getElementById('search').value = '';
       renderSearchResults([]);
       focusNode(node.id);
     }});
-    searchResultsEl.appendChild(item);
+    el.appendChild(item);
   }}
 }}
 
-searchEl.addEventListener('input', () => {{
-  const query = searchEl.value.trim().toLowerCase();
-  if (!query) {{
-    renderSearchResults([]);
-    return;
-  }}
+document.getElementById('search').addEventListener('input', (e) => {{
+  const query = e.target.value.trim().toLowerCase();
+  if (!query) {{ renderSearchResults([]); return; }}
   const results = BASE_NODES
-    .filter(node =>
-      String(node.label).toLowerCase().includes(query) ||
-      String(node.source_file || '').toLowerCase().includes(query))
+    .filter(n => String(n.label).toLowerCase().includes(query) || String(n.source_file || '').toLowerCase().includes(query))
     .slice(0, 12);
   renderSearchResults(results);
 }});
 
-document.addEventListener('click', event => {{
-  if (!searchResultsEl.contains(event.target) && event.target !== searchEl) {{
-    renderSearchResults([]);
-  }}
+document.addEventListener('click', (e) => {{
+  const resultsEl = document.getElementById('search-results');
+  const searchEl = document.getElementById('search');
+  if (!resultsEl.contains(e.target) && e.target !== searchEl) renderSearchResults([]);
 }});
 
-refreshGraph();
-if (LARGE_GRAPH_MODE) {{
-  showOverviewHint();
+container.addEventListener('mousemove', onMouseMove);
+container.addEventListener('mouseleave', () => {{
+  hoveredNodeId = null;
+  tooltip.classList.remove('visible');
+  renderer.domElement.style.cursor = 'grab';
+}});
+container.addEventListener('click', onClick);
+window.addEventListener('resize', () => {{
+  camera.aspect = container.clientWidth / container.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(container.clientWidth, container.clientHeight);
+}});
+
+function esc(s) {{
+  return String(s ?? '').replace(/[&<>"']/g, m => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[m]));
 }}
+
+function animate() {{
+  requestAnimationFrame(animate);
+  controls.update();
+
+  if (needsLayoutUpdate && nodePositions) {{
+    needsLayoutUpdate = false;
+    updateNodeMatrices();
+    updateEdgePositions();
+  }}
+
+  if (selectedNodeIndicator && selectedNodeId && nodePositions) {{
+    const idx = currentNodeIndexMap.get(selectedNodeId);
+    if (idx !== undefined) {{
+      selectedNodeIndicator.position.set(nodePositions[idx * 3], nodePositions[idx * 3 + 1], nodePositions[idx * 3 + 2]);
+    }} else {{
+      scene.remove(selectedNodeIndicator);
+      selectedNodeIndicator = null;
+    }}
+  }}
+
+  renderer.render(scene, camera);
+}}
+
+renderLegend();
+refreshGraph();
+updateControlButtons();
+animate();
+
+// Expose functions for inline onclick handlers
+window.setViewMode = setViewMode;
+window.focusNode = focusNode;
+window.openCommunity = openCommunity;
+window.zoomToFit = zoomToFit;
+window.zoomCamera = zoomCamera;
 </script>
 </body>
 </html>"#,
@@ -6086,7 +6297,7 @@ mod tests {
     }
 
     #[test]
-    fn export_html_3d_contains_force_graph_and_legend() {
+    fn export_html_3d_contains_three_js_and_legend() {
         let graph = merge_extractions(&[json!({
             "nodes": [
                 {"id": "n1", "label": "Parser", "file_type": "code", "source_file": "parser.py"},
@@ -6100,7 +6311,9 @@ mod tests {
 
         let html = export_html_3d(&graph, &communities, &HashMap::new(), "graph-3d.html");
 
-        assert!(html.contains("3d-force-graph"));
+        assert!(html.contains("three"));
+        assert!(html.contains("OrbitControls"));
+        assert!(html.contains("InstancedMesh"));
         assert!(html.contains("Community 0"));
         assert!(html.contains("BASE_NODES"));
         assert!(html.contains("BASE_LINKS"));
@@ -6130,20 +6343,14 @@ mod tests {
         let html = export_html_3d(&graph, &communities, &HashMap::new(), "graph-3d.html");
 
         assert!(html.contains("const LARGE_GRAPH_MODE = true;"));
-        assert!(html.contains("Community overview"));
+        assert!(html.contains("Overview"));
         assert!(html.contains("COMMUNITY_OVERVIEW"));
-        assert!(html.contains("openNodeNeighborhood"));
-        assert!(html.contains("Node neighborhood"));
-        assert!(html.contains("openCommunity(node.community);"));
-        assert!(html.contains("showCommunitySubgraphInfo"));
-        assert!(html.contains("Back to graph overview"));
-        assert!(html.contains("FULL_GRAPH_LINK_BATCH"));
-        assert!(html.contains("controls.enableZoom = true;"));
-        assert!(html.contains("startProgressiveFullGraphLoad"));
-        assert!(html.contains("function zoomCamera(scale)"));
-        assert!(html.contains("Zoom in"));
-        assert!(html.contains("Zoom out"));
-        assert!(html.contains("Fit view"));
-        assert!(html.contains("Graph.zoomToFit"));
+        assert!(html.contains("focusNode"));
+        assert!(html.contains("neighborhood"));
+        assert!(html.contains("Worker"));
+        assert!(html.contains("InstancedMesh"));
+        assert!(html.contains("CylinderGeometry"));
+        assert!(html.contains("OrbitControls"));
+        assert!(html.contains("zoomToFit"));
     }
 }

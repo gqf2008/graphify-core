@@ -664,7 +664,7 @@ mod tests {
                 .is_some_and(|nodes| nodes.iter().all(|node| node.get("community").is_some()))
         );
         assert!(report.contains("## Communities"));
-        assert!(html.contains("3d-force-graph"));
+        assert!(html.contains("three"));
         Ok(())
     }
 

@@ -9,3 +9,4 @@ pub mod schema;
 pub mod serve;
 pub mod setup;
 pub mod timeutil;
+pub mod validate;

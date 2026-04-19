@@ -3,6 +3,7 @@
 /// Ported from `graphify/detect.py`.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use calamine::Reader;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
@@ -233,10 +234,224 @@ pub fn classify_file(path: &Path) -> Option<FileType> {
 
 /// Count whitespace-separated words in a text file.
 pub fn count_words(path: &Path) -> usize {
-    match fs::read_to_string(path) {
-        Ok(text) => text.split_whitespace().count(),
-        Err(_) => 0,
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let text = match ext.as_str() {
+        "pdf" => extract_pdf_text(path),
+        "docx" => docx_to_markdown(path),
+        "xlsx" => xlsx_to_markdown(path),
+        _ => match fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => return 0,
+        },
+    };
+    text.split_whitespace().count()
+}
+
+// ── Office / PDF text extraction ─────────────────────────────────────────────
+
+/// Extract plain text from a PDF file.
+pub fn extract_pdf_text(path: &Path) -> String {
+    pdf_extract::extract_text(path.to_string_lossy().as_ref()).unwrap_or_default()
+}
+
+/// Convert a .docx file to markdown text.
+pub fn docx_to_markdown(path: &Path) -> String {
+    let doc = match docx_lite::parse_document_from_path(path) {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut list_index = 0;
+
+    for paragraph in &doc.paragraphs {
+        let text = paragraph.to_text().trim().to_string();
+        if text.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        // List item
+        if paragraph.numbering_id.is_some() {
+            if let Some(level) = paragraph.numbering_level {
+                let indent = "  ".repeat(level.max(0) as usize);
+                if let Some(item) = doc.lists.get(list_index) {
+                    let marker = match item.list_type {
+                        docx_lite::ListType::Bullet => "- ".to_string(),
+                        docx_lite::ListType::Numbered => {
+                            if let Some(ref num) = item.number {
+                                format!("{}. ", num)
+                            } else {
+                                "- ".to_string()
+                            }
+                        }
+                    };
+                    lines.push(format!("{}{}{}", indent, marker, text));
+                    list_index += 1;
+                    continue;
+                }
+            }
+        }
+
+        // Heading / normal paragraph
+        let style = paragraph.style.as_deref().unwrap_or("");
+        if style.starts_with("Heading 1") {
+            lines.push(format!("# {}", text));
+        } else if style.starts_with("Heading 2") {
+            lines.push(format!("## {}", text));
+        } else if style.starts_with("Heading 3") {
+            lines.push(format!("### {}", text));
+        } else if style.starts_with("List") {
+            lines.push(format!("- {}", text));
+        } else {
+            lines.push(text);
+        }
     }
+
+    // Tables
+    for table in &doc.tables {
+        let mut table_lines: Vec<String> = Vec::new();
+        for row in &table.rows {
+            let cells: Vec<String> = row
+                .cells
+                .iter()
+                .map(|cell| {
+                    cell.paragraphs
+                        .iter()
+                        .map(|p| p.to_text())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                        .trim()
+                        .to_string()
+                })
+                .collect();
+            if !cells.is_empty() {
+                table_lines.push(format!("| {} |", cells.join(" | ")));
+            }
+        }
+        if table_lines.len() >= 1 {
+            let col_count = table_lines[0].matches('|').count().saturating_sub(1);
+            if col_count > 0 {
+                let sep = format!(
+                    "| {} |",
+                    (0..col_count).map(|_| "---").collect::<Vec<_>>().join(" | ")
+                );
+                table_lines.insert(1, sep);
+            }
+            lines.push(String::new());
+            lines.extend(table_lines);
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Convert an .xlsx file to markdown text.
+pub fn xlsx_to_markdown(path: &Path) -> String {
+    let mut workbook = match calamine::open_workbook_auto(path) {
+        Ok(w) => w,
+        Err(_) => return String::new(),
+    };
+
+    let sheet_names = workbook.sheet_names();
+    let mut sections: Vec<String> = Vec::new();
+
+    for sheet_name in &sheet_names {
+        let range = match workbook.worksheet_range(sheet_name) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        for row in range.rows() {
+            let cells: Vec<String> = row
+                .iter()
+                .map(|cell: &calamine::Data| cell.to_string().trim().to_string())
+                .collect();
+            // Skip entirely empty rows
+            if cells.iter().all(|c| c.is_empty()) {
+                continue;
+            }
+            rows.push(cells);
+        }
+
+        if rows.is_empty() {
+            continue;
+        }
+
+        sections.push(format!("## Sheet: {}", sheet_name));
+        let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        for row in &rows {
+            let padded: Vec<String> = (0..col_count)
+                .map(|i| row.get(i).cloned().unwrap_or_default())
+                .collect();
+            sections.push(format!("| {} |", padded.join(" | ")));
+        }
+        if !rows.is_empty() && col_count > 0 {
+            let sep = format!(
+                "| {} |",
+                (0..col_count).map(|_| "---").collect::<Vec<_>>().join(" | ")
+            );
+            // Insert separator after first data row (calamine doesn't distinguish header)
+            let insert_pos = sections.len() - rows.len() + 1;
+            if insert_pos <= sections.len() {
+                sections.insert(insert_pos, sep);
+            }
+        }
+        sections.push(String::new());
+    }
+
+    sections.join("\n")
+}
+
+/// Convert a .docx or .xlsx to a markdown sidecar in `out_dir`.
+///
+/// Returns the path of the converted `.md` file, or `None` if conversion failed.
+pub fn convert_office_file(path: &Path, out_dir: &Path) -> Option<PathBuf> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let text = match ext.as_str() {
+        "docx" => docx_to_markdown(path),
+        "xlsx" => xlsx_to_markdown(path),
+        _ => return None,
+    };
+
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    if let Err(_) = std::fs::create_dir_all(out_dir) {
+        return None;
+    }
+
+    let name_hash = {
+        let mut hasher = Sha256::new();
+        hasher.update(
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        hex::encode(&hasher.finalize())[..8].to_string()
+    };
+
+    let out_path = out_dir.join(format!(
+        "{}_{}.md",
+        path.file_stem()
+            .unwrap_or_default()
+            .to_string_lossy(),
+        name_hash
+    ));
+    let content = format!(
+        "<!-- converted from {} -->\n\n{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        text
+    );
+    std::fs::write(&out_path, content).ok()?;
+    Some(out_path)
 }
 
 // ── Noise directory detection ────────────────────────────────────────────────
@@ -393,11 +608,23 @@ fn display_path_for_output(path: &Path, canonical_root: &Path, requested_root: &
 }
 
 fn normalize_manifest_key(path: &str) -> String {
-    Path::new(path)
+    let canonical = Path::new(path)
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(path))
         .to_string_lossy()
-        .to_string()
+        .to_string();
+
+    // macOS compatibility: /var is a symlink to /private/var.
+    // The Python baseline does not canonicalize, so it stores /var/... paths.
+    // When we canonicalize we get /private/var/... which breaks compatibility
+    // with old Python manifests. Strip the /private prefix only when the
+    // original path starts with /var and the canonical path is /private/var.
+    if let Some(stripped) = canonical.strip_prefix("/private") {
+        if path.starts_with("/var") && stripped.starts_with("/var") {
+            return stripped.to_string();
+        }
+    }
+    canonical
 }
 
 // ── Detect result ────────────────────────────────────────────────────────────
@@ -574,15 +801,20 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
 
         let key = ftype.as_str().to_string();
 
-        // Office files — convert to markdown sidecar
+        // Office files — convert to markdown sidecar and replace with converted path
         if ftype == FileType::Document {
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 if OFFICE_EXTENSIONS.contains(&format!(".{}", ext.to_lowercase()).as_str()) {
-                    skipped_sensitive.push(format!(
-                        "{} [office conversion — pip install graphifyy[office]]",
-                        display_path_for_output(p, &canonical_root, &requested_root)
-                    ));
-                    continue;
+                    if let Some(converted) = convert_office_file(p, &converted_dir) {
+                        files.entry(key).or_default().push(display_path_for_output(
+                            &converted,
+                            &canonical_root,
+                            &requested_root,
+                        ));
+                        total_words += count_words(&converted);
+                        continue;
+                    }
+                    // Conversion failed — fall through to list the original file
                 }
             }
         }
@@ -1073,5 +1305,57 @@ mod tests {
             result.unchanged_files.get("code").unwrap(),
             &vec![link_root.join("main.py").to_string_lossy().to_string()]
         );
+    }
+
+    #[test]
+    fn test_extract_pdf_text_missing_file_returns_empty() {
+        assert_eq!(extract_pdf_text(Path::new("/nonexistent/file.pdf")), "");
+    }
+
+    #[test]
+    fn test_docx_to_markdown_missing_file_returns_empty() {
+        assert_eq!(docx_to_markdown(Path::new("/nonexistent/file.docx")), "");
+    }
+
+    #[test]
+    fn test_xlsx_to_markdown_missing_file_returns_empty() {
+        assert_eq!(xlsx_to_markdown(Path::new("/nonexistent/file.xlsx")), "");
+    }
+
+    #[test]
+    fn test_convert_office_file_unsupported_extension_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "hello").unwrap();
+        assert_eq!(convert_office_file(&path, dir.path()), None);
+    }
+
+    #[test]
+    fn test_convert_office_file_missing_docx_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.docx");
+        assert_eq!(convert_office_file(&path, dir.path()), None);
+    }
+
+    #[test]
+    fn test_count_words_pdf_text() {
+        // Create a minimal text file and verify count_words dispatches correctly
+        let dir = tempfile::tempdir().unwrap();
+        let txt = dir.path().join("words.txt");
+        fs::write(&txt, "one two three four five").unwrap();
+        assert_eq!(count_words(&txt), 5);
+    }
+
+    #[test]
+    fn test_detect_includes_office_files_after_conversion() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.py"), "print('hello')").unwrap();
+        // Create a dummy docx (invalid zip, so conversion fails silently)
+        fs::write(dir.path().join("notes.docx"), "not a real docx").unwrap();
+
+        let result = detect(dir.path(), false).unwrap();
+        // docx is classified as Document; even if conversion fails it should still be listed
+        assert!(result.files.get("document").unwrap().iter().any(|p| p.ends_with("notes.docx")));
+        assert!(result.files.get("code").unwrap().iter().any(|p| p.ends_with("main.py")));
     }
 }

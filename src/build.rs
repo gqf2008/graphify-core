@@ -2934,11 +2934,13 @@ const _edgeColor = new THREE.Color();
 
 let nodeMesh = null;
 let edgeMesh = null;
+let edgeGroup = null;
 let nodePositions = null;
 let worker = null;
 let needsLayoutUpdate = false;
 let currentNodeIndexMap = new Map();
 let physicsGen = 0;
+let targetPositions = null;
 
 function buildVisibleData() {{
   if (viewMode === 'full') {{
@@ -3004,7 +3006,12 @@ function createNodeMesh(nodes) {{
 
 let edgeColorsNeedUpdate = false;
 function createEdgeMesh() {{
-  if (edgeMesh) {{ scene.remove(edgeMesh); edgeMesh.dispose(); }}
+  if (edgeMesh) {{ scene.remove(edgeMesh); edgeMesh.dispose(); edgeMesh = null; }}
+  if (edgeGroup) {{
+    edgeGroup.children.forEach(c => c.geometry.dispose());
+    scene.remove(edgeGroup);
+    edgeGroup = null;
+  }}
   if (!currentLinks.length) return;
 
   // Pre-compute and cache edge colors to avoid repeated hexToRgb
@@ -3016,19 +3023,40 @@ function createEdgeMesh() {{
     }}
   }}
 
-  const geometry = new THREE.CylinderGeometry(1, 1, 1, 4, 1, true);
-  const material = new THREE.MeshBasicMaterial({{
-    color: 0xffffff,
-    transparent: true,
-    opacity: 0.6,
-    depthWrite: false,
-  }});
-
-  edgeMesh = new THREE.InstancedMesh(geometry, material, currentLinks.length);
-  edgeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  edgeMesh.frustumCulled = false;
-  scene.add(edgeMesh);
-  edgeColorsNeedUpdate = true;
+  if (LARGE_GRAPH_MODE || currentLinks.length > 1000) {{
+    const geometry = new THREE.CylinderGeometry(1, 1, 1, 4, 1, true);
+    const material = new THREE.MeshBasicMaterial({{
+      color: 0xffffff,
+      transparent: true,
+      opacity: 0.6,
+      depthWrite: false,
+    }});
+    edgeMesh = new THREE.InstancedMesh(geometry, material, currentLinks.length);
+    edgeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    edgeMesh.frustumCulled = false;
+    scene.add(edgeMesh);
+    edgeColorsNeedUpdate = true;
+  }} else {{
+    edgeGroup = new THREE.Group();
+    for (let i = 0; i < currentLinks.length; i++) {{
+      const c = currentLinks[i]._rgb || hexToRgb(currentLinks[i].color || '#888888');
+      const material = new THREE.MeshBasicMaterial({{
+        color: new THREE.Color(c.r, c.g, c.b),
+        transparent: true,
+        opacity: 0.6,
+        depthWrite: false,
+      }});
+      const geometry = new THREE.TubeGeometry(
+        new THREE.QuadraticBezierCurve3(
+          new THREE.Vector3(), new THREE.Vector3(), new THREE.Vector3()
+        ), 4, 0.06, 3, false
+      );
+      const mesh = new THREE.Mesh(geometry, material);
+      mesh.userData.linkIndex = i;
+      edgeGroup.add(mesh);
+    }}
+    scene.add(edgeGroup);
+  }}
 }}
 
 function updateNodeMatrices() {{
@@ -3049,42 +3077,69 @@ function updateNodeMatrices() {{
 }}
 
 function updateEdgePositions() {{
-  if (!edgeMesh || !nodePositions) return;
-  const edgeRadius = 0.06;
+  if (edgeMesh && nodePositions) {{
+    const edgeRadius = 0.06;
+    let idx = 0;
+    for (const link of currentLinks) {{
+      const si = currentNodeIndexMap.get(link.source);
+      const ti = currentNodeIndexMap.get(link.target);
+      if (si === undefined || ti === undefined || si === ti) continue;
 
-  let idx = 0;
-  for (const link of currentLinks) {{
-    const si = currentNodeIndexMap.get(link.source);
-    const ti = currentNodeIndexMap.get(link.target);
-    if (si === undefined || ti === undefined || si === ti) continue;
+      const sx = nodePositions[si * 3], sy = nodePositions[si * 3 + 1], sz = nodePositions[si * 3 + 2];
+      const tx = nodePositions[ti * 3], ty = nodePositions[ti * 3 + 1], tz = nodePositions[ti * 3 + 2];
 
-    const sx = nodePositions[si * 3], sy = nodePositions[si * 3 + 1], sz = nodePositions[si * 3 + 2];
-    const tx = nodePositions[ti * 3], ty = nodePositions[ti * 3 + 1], tz = nodePositions[ti * 3 + 2];
+      _pos.set(sx, sy, sz);
+      _end.set(tx, ty, tz);
+      _center.addVectors(_pos, _end).multiplyScalar(0.5);
+      _dir.subVectors(_end, _pos);
+      const len = _dir.length();
+      if (len < 0.001) continue;
+      _dir.normalize();
+      _quat.setFromUnitVectors(_up, _dir);
+      _scale.set(edgeRadius, len, edgeRadius);
+      _matrix.compose(_center, _quat, _scale);
+      edgeMesh.setMatrixAt(idx, _matrix);
 
-    _pos.set(sx, sy, sz);
-    _end.set(tx, ty, tz);
-    _center.addVectors(_pos, _end).multiplyScalar(0.5);
-    _dir.subVectors(_end, _pos);
-    const len = _dir.length();
-    if (len < 0.001) continue;
-    _dir.normalize();
-    _quat.setFromUnitVectors(_up, _dir);
-    _scale.set(edgeRadius, len, edgeRadius);
-    _matrix.compose(_center, _quat, _scale);
-    edgeMesh.setMatrixAt(idx, _matrix);
-
-    const c = link._rgb || hexToRgb(link.color || '#888888');
-    _edgeColor.setRGB(c.r, c.g, c.b);
-    edgeMesh.setColorAt(idx, _edgeColor);
-    idx++;
+      const c = link._rgb || hexToRgb(link.color || '#888888');
+      _edgeColor.setRGB(c.r, c.g, c.b);
+      edgeMesh.setColorAt(idx, _edgeColor);
+      idx++;
+    }}
+    edgeMesh.instanceMatrix.needsUpdate = true;
+    if (edgeColorsNeedUpdate) {{
+      edgeMesh.instanceColor.needsUpdate = true;
+      edgeColorsNeedUpdate = false;
+    }}
+    edgeMesh.count = idx;
   }}
 
-  edgeMesh.instanceMatrix.needsUpdate = true;
-  if (edgeColorsNeedUpdate) {{
-    edgeMesh.instanceColor.needsUpdate = true;
-    edgeColorsNeedUpdate = false;
+  if (edgeGroup && nodePositions) {{
+    for (const mesh of edgeGroup.children) {{
+      const link = currentLinks[mesh.userData.linkIndex];
+      const si = currentNodeIndexMap.get(link.source);
+      const ti = currentNodeIndexMap.get(link.target);
+      if (si === undefined || ti === undefined) {{ mesh.visible = false; continue; }}
+
+      const sx = nodePositions[si * 3], sy = nodePositions[si * 3 + 1], sz = nodePositions[si * 3 + 2];
+      const tx = nodePositions[ti * 3], ty = nodePositions[ti * 3 + 1], tz = nodePositions[ti * 3 + 2];
+
+      const start = new THREE.Vector3(sx, sy, sz);
+      const end = new THREE.Vector3(tx, ty, tz);
+      const mid = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+      const dir = new THREE.Vector3().subVectors(end, start);
+      const len = dir.length();
+      const perp = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0, 1, 0)).normalize();
+      if (perp.lengthSq() < 0.001) perp.set(1, 0, 0);
+      const control = mid.clone().add(perp.multiplyScalar(len * 0.15));
+
+      mesh.geometry.dispose();
+      mesh.geometry = new THREE.TubeGeometry(
+        new THREE.QuadraticBezierCurve3(start, control, end),
+        4, 0.06, 3, false
+      );
+      mesh.visible = true;
+    }}
   }}
-  edgeMesh.count = idx;
 }}
 
 let workerUrl = null;
@@ -3132,7 +3187,7 @@ function tick() {{
   // Physics params tuned to reduce oscillation
   const repulsion = 2000;
   const attraction = 0.015;
-  const damping = 0.85;
+  const damping = 0.92;
   const centerGravity = 0.005;
   const idealDist = 40 + Math.sqrt(Math.max(n, 50)) * 2;
 
@@ -3159,6 +3214,19 @@ function tick() {{
   }}
 
   let totalEnergy = 0;
+
+  // Compute community centroids for community gravity
+  const communityCenters = new Map();
+  for (let i = 0; i < n; i++) {{
+    const cid = nodes[i].community;
+    if (!communityCenters.has(cid)) communityCenters.set(cid, {{x:0, y:0, z:0, count:0}});
+    const c = communityCenters.get(cid);
+    c.x += positions[i*3]; c.y += positions[i*3+1]; c.z += positions[i*3+2]; c.count++;
+  }}
+  for (const c of communityCenters.values()) {{
+    c.x /= c.count; c.y /= c.count; c.z /= c.count;
+  }}
+  const communityGravity = 0.004;
 
   for (let i = 0; i < n; i++) {{
     let fx = 0, fy = 0, fz = 0;
@@ -3214,6 +3282,13 @@ function tick() {{
     fy -= positions[i*3+1] * centerGravity;
     fz -= positions[i*3+2] * centerGravity;
 
+    const center = communityCenters.get(nodes[i].community);
+    if (center) {{
+      fx += (center.x - positions[i*3]) * communityGravity;
+      fy += (center.y - positions[i*3+1]) * communityGravity;
+      fz += (center.z - positions[i*3+2]) * communityGravity;
+    }}
+
     velocities[i*3] += fx;
     velocities[i*3+1] += fy;
     velocities[i*3+2] += fz;
@@ -3260,7 +3335,7 @@ function tick() {{
   worker.onmessage = (e) => {{
     if (e.data.type === 'tick') {{
       if (expectedGen !== physicsGen) return;
-      nodePositions = e.data.positions;
+      targetPositions = e.data.positions;
       needsLayoutUpdate = true;
     }}
     if (e.data.type === 'converged') {{
@@ -3619,7 +3694,24 @@ function animate() {{
   requestAnimationFrame(animate);
   controls.update();
 
-  if (needsLayoutUpdate && nodePositions) {{
+  // Smooth interpolation to eliminate visual jitter
+  if (targetPositions && nodePositions) {{
+    let changed = false;
+    const alpha = 0.12;
+    for (let i = 0; i < nodePositions.length; i++) {{
+      const diff = targetPositions[i] - nodePositions[i];
+      if (Math.abs(diff) > 0.001) {{
+        nodePositions[i] += diff * alpha;
+        changed = true;
+      }}
+    }}
+    if (changed) {{
+      updateNodeMatrices();
+      updateEdgePositions();
+    }} else {{
+      targetPositions = null;
+    }}
+  }} else if (needsLayoutUpdate && nodePositions) {{
     needsLayoutUpdate = false;
     updateNodeMatrices();
     updateEdgePositions();

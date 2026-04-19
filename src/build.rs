@@ -3214,10 +3214,36 @@ self.onmessage = function(e) {{
     positions = new Float32Array(nodes.length * 3);
     velocities = new Float32Array(nodes.length * 3);
     const spread = 200 + Math.sqrt(nodes.length) * 15;
+
+    // Pre-compute community anchors on a sphere so nodes of the same
+    // community start near each other, forming visible clusters even
+    // before the physics simulation converges.
+    const communityIds = [...new Set(nodes.map(n => n.community).filter(c => c !== null && c !== undefined))];
+    const communityAnchors = new Map();
+    const goldenAngle = Math.PI * (3 - Math.sqrt(5));
+    for (let i = 0; i < communityIds.length; i++) {{
+      const y = 1 - (i / Math.max(communityIds.length - 1, 1)) * 2;
+      const radius = Math.sqrt(1 - y * y);
+      const theta = goldenAngle * i;
+      communityAnchors.set(communityIds[i], {{
+        x: Math.cos(theta) * radius * spread * 0.5,
+        y: y * spread * 0.5,
+        z: Math.sin(theta) * radius * spread * 0.5
+      }});
+    }}
+
     for (let i = 0; i < nodes.length; i++) {{
-      positions[i*3] = (Math.random() - 0.5) * spread;
-      positions[i*3+1] = (Math.random() - 0.5) * spread;
-      positions[i*3+2] = (Math.random() - 0.5) * spread;
+      const anchor = communityAnchors.get(nodes[i].community);
+      if (anchor) {{
+        const jitter = spread * 0.06; // tight cluster around anchor
+        positions[i*3]   = anchor.x + (Math.random() - 0.5) * jitter;
+        positions[i*3+1] = anchor.y + (Math.random() - 0.5) * jitter;
+        positions[i*3+2] = anchor.z + (Math.random() - 0.5) * jitter;
+      }} else {{
+        positions[i*3]   = (Math.random() - 0.5) * spread;
+        positions[i*3+1] = (Math.random() - 0.5) * spread;
+        positions[i*3+2] = (Math.random() - 0.5) * spread;
+      }}
     }}
     edgeMap = null;
     tickCount = 0;
@@ -3277,7 +3303,7 @@ function tick() {{
   for (const c of communityCenters.values()) {{
     c.x /= c.count; c.y /= c.count; c.z /= c.count;
   }}
-  const communityGravity = 0.004;
+  const communityGravity = 0.025;
 
   for (let i = 0; i < n; i++) {{
     let fx = 0, fy = 0, fz = 0;

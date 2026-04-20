@@ -1022,6 +1022,30 @@ fn walk_tree<'a>(
 
 // ── Class handling ────────────────────────────────────────────────────────────
 
+/// Map a tree-sitter AST node kind to the correct semantic node_type.
+/// Types like interface/enum/type_alias are distinct from classes and should
+/// be labeled accordingly for downstream consumers.
+fn class_node_type(kind: &str) -> &'static str {
+    match kind {
+        "interface_declaration" | "protocol_declaration" => "interface",
+        "enum_declaration" => "enum",
+        "type_alias_declaration" => "type_alias",
+        "struct_declaration" | "struct_specifier" | "struct_item" | "struct_definition" => "struct",
+        "trait_item" | "trait_declaration" | "trait_definition" => "trait",
+        "impl_item" => "impl",
+        "actor_declaration" => "actor",
+        "union_declaration" => "union",
+        "abstract_definition" => "abstract_type",
+        "primitive_definition" => "primitive_type",
+        "module" | "module_declaration" => "module",
+        "category_declaration" => "category",
+        "extension_declaration" => "extension",
+        "record_declaration" => "record",
+        "object_declaration" | "object_definition" => "object",
+        _ => "class",
+    }
+}
+
 fn handle_class<'a>(
     node: TsNode<'a>,
     _parent_class_id: Option<&str>,
@@ -1082,7 +1106,7 @@ fn handle_class<'a>(
             file_type: "code".to_string(),
             source_file: source_file.to_string(),
             source_location: Some(format!("L{line_no}")),
-            node_type: Some("class".to_string()),
+            node_type: Some(class_node_type(node.kind()).to_string()),
             docstring: None,
             parameters: Vec::new(),
             signature: None,
@@ -1267,6 +1291,7 @@ fn handle_function<'a>(
             .and_then(|decl| resolve_c_like_function_name(decl, source, ext != "c" && ext != "h"))
     } else {
         resolve_name(node, source, cfg)
+            .or_else(|| resolve_arrow_or_func_expr_name(node, source))
     };
     let Some(func_name) = func_name else {
         return;
@@ -2358,6 +2383,23 @@ fn resolve_name(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Option
         }
     }
 
+    None
+}
+
+/// Resolve the name of an arrow_function or function expression that is the
+/// value of a variable_declarator, e.g. `const foo = () => {}` or
+/// `const bar = function() {}`. The arrow/function node itself has no name
+/// field — the name comes from the parent declarator.
+fn resolve_arrow_or_func_expr_name(node: TsNode<'_>, source: &[u8]) -> Option<String> {
+    if node.kind() != "arrow_function" && node.kind() != "function" {
+        return None;
+    }
+    let parent = node.parent()?;
+    if parent.kind() == "variable_declarator" {
+        if let Some(name_node) = parent.child_by_field_name("name") {
+            return node_text(name_node, source);
+        }
+    }
     None
 }
 

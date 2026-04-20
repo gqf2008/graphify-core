@@ -1709,6 +1709,160 @@ pub fn suggest_questions(
     questions
 }
 
+// ── Graph diff ────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraphDiff {
+    pub new_nodes: Vec<DiffNode>,
+    pub removed_nodes: Vec<DiffNode>,
+    pub new_edges: Vec<DiffEdge>,
+    pub removed_edges: Vec<DiffEdge>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffNode {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffEdge {
+    pub source: String,
+    pub target: String,
+    pub relation: String,
+    pub confidence: String,
+}
+
+pub fn graph_diff(old: &Graph, new: &Graph) -> GraphDiff {
+    let old_ids: HashSet<&str> = old.nodes.iter().map(|n| n.id.as_str()).collect();
+    let new_ids: HashSet<&str> = new.nodes.iter().map(|n| n.id.as_str()).collect();
+
+    let old_id_to_label: HashMap<&str, &str> =
+        old.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
+    let new_id_to_label: HashMap<&str, &str> =
+        new.nodes.iter().map(|n| (n.id.as_str(), n.label.as_str())).collect();
+
+    let new_nodes: Vec<DiffNode> = new_ids
+        .difference(&old_ids)
+        .map(|&id| DiffNode {
+            id: id.to_string(),
+            label: new_id_to_label.get(id).unwrap_or(&id).to_string(),
+        })
+        .collect();
+
+    let removed_nodes: Vec<DiffNode> = old_ids
+        .difference(&new_ids)
+        .map(|&id| DiffNode {
+            id: id.to_string(),
+            label: old_id_to_label.get(id).unwrap_or(&id).to_string(),
+        })
+        .collect();
+
+    let old_edge_keys: HashSet<(String, String, String)> = old
+        .edges
+        .iter()
+        .map(|e| {
+            let (lo, hi) = if e.source <= e.target {
+                (&e.source, &e.target)
+            } else {
+                (&e.target, &e.source)
+            };
+            (lo.clone(), hi.clone(), e.relation.clone())
+        })
+        .collect();
+
+    let new_edge_keys: HashSet<(String, String, String)> = new
+        .edges
+        .iter()
+        .map(|e| {
+            let (lo, hi) = if e.source <= e.target {
+                (&e.source, &e.target)
+            } else {
+                (&e.target, &e.source)
+            };
+            (lo.clone(), hi.clone(), e.relation.clone())
+        })
+        .collect();
+
+    let new_edges: Vec<DiffEdge> = new
+        .edges
+        .iter()
+        .filter(|e| {
+            let (lo, hi) = if e.source <= e.target {
+                (&e.source, &e.target)
+            } else {
+                (&e.target, &e.source)
+            };
+            !old_edge_keys.contains(&(lo.clone(), hi.clone(), e.relation.clone()))
+        })
+        .map(|e| DiffEdge {
+            source: e.source.clone(),
+            target: e.target.clone(),
+            relation: e.relation.clone(),
+            confidence: e.confidence.clone(),
+        })
+        .collect();
+
+    let removed_edges: Vec<DiffEdge> = old
+        .edges
+        .iter()
+        .filter(|e| {
+            let (lo, hi) = if e.source <= e.target {
+                (&e.source, &e.target)
+            } else {
+                (&e.target, &e.source)
+            };
+            !new_edge_keys.contains(&(lo.clone(), hi.clone(), e.relation.clone()))
+        })
+        .map(|e| DiffEdge {
+            source: e.source.clone(),
+            target: e.target.clone(),
+            relation: e.relation.clone(),
+            confidence: e.confidence.clone(),
+        })
+        .collect();
+
+    let mut parts: Vec<String> = Vec::new();
+    let nn = new_nodes.len();
+    let ne = new_edges.len();
+    let rn = removed_nodes.len();
+    let re = removed_edges.len();
+    if nn > 0 {
+        parts.push(format!("{} new node{}", nn, if nn == 1 { "" } else { "s" }));
+    }
+    if ne > 0 {
+        parts.push(format!("{} new edge{}", ne, if ne == 1 { "" } else { "s" }));
+    }
+    if rn > 0 {
+        parts.push(format!(
+            "{} node{} removed",
+            rn,
+            if rn == 1 { "" } else { "s" }
+        ));
+    }
+    if re > 0 {
+        parts.push(format!(
+            "{} edge{} removed",
+            re,
+            if re == 1 { "" } else { "s" }
+        ));
+    }
+    let summary = if parts.is_empty() {
+        "no changes".to_string()
+    } else {
+        parts.join(", ")
+    };
+
+    GraphDiff {
+        new_nodes,
+        removed_nodes,
+        new_edges,
+        removed_edges,
+        summary,
+    }
+}
+
 pub fn analyze(
     graph: &Graph,
     communities: &HashMap<usize, Vec<String>>,

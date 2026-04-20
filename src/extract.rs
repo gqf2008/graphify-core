@@ -2028,7 +2028,9 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
             if node.node_type.as_deref() == Some("file") {
                 continue;
             }
-            if node.node_type.as_deref() != Some("class") {
+            // Match Python parity: index both classes and functions
+            // (not method stubs ending with ")" or file nodes ending with ".py")
+            if node.label.ends_with(')') || node.label.ends_with(".py") {
                 continue;
             }
             let Some(stem) = Path::new(&node.source_file)
@@ -2245,7 +2247,7 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
             if let Some(attr) = func_node.child_by_field_name(cfg.call_accessor_field) {
                 return node_text(attr, source).map(|text| ResolvedCall {
                     callee_name: text,
-                    allow_cross_file: receiver_call.is_some(),
+                    allow_cross_file: true,
                     receiver_call,
                 });
             }
@@ -2254,7 +2256,7 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
         if let Some(last) = named_children(func_node).into_iter().last() {
             return node_text(last, source).map(|text| ResolvedCall {
                 callee_name: text,
-                allow_cross_file: receiver_call.is_some(),
+                allow_cross_file: true,
                 receiver_call,
             });
         }
@@ -6629,7 +6631,7 @@ impl CreateDirAll for Path {
     }
 
     #[test]
-    fn does_not_infer_cross_file_rust_method_calls() {
+    fn infers_cross_file_rust_method_calls() {
         let dir = tempfile::tempdir().unwrap();
         let defs = dir.path().join("defs.rs");
         let main = dir.path().join("main.rs");
@@ -6675,7 +6677,8 @@ pub fn build() {
             .map(|node| node.id.clone())
             .unwrap();
 
-        assert!(!result.edges.iter().any(|edge| {
+        // Accessor calls now resolve cross-file (matching Python parity)
+        assert!(result.edges.iter().any(|edge| {
             edge.source == build_id && edge.target == as_str_id && edge.relation == "calls"
         }));
     }

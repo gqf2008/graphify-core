@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -839,7 +841,7 @@ fn extract_generic_from_source(
     })?;
 
     let tree = parser
-        .parse(&source, None)
+        .parse(source, None)
         .ok_or_else(|| anyhow!("Parser returned no syntax tree for {}", path.display()))?;
     let root = tree.root_node();
 
@@ -878,7 +880,7 @@ fn extract_generic_from_source(
     walk_tree(
         root,
         None,
-        &source,
+        source,
         &source_file,
         stem,
         &file_id,
@@ -958,13 +960,13 @@ fn walk_tree<'a>(
     let t = node.kind();
 
     // Import types — handle and don't recurse
-    if cfg.import_types.iter().any(|it| *it == t) {
+    if cfg.import_types.contains(&t) {
         handle_import(node, source, file_id, source_file, cfg, edges);
         return;
     }
 
     // Class types
-    if cfg.class_types.iter().any(|ct| *ct == t) {
+    if cfg.class_types.contains(&t) {
         handle_class(
             node,
             parent_class_id,
@@ -983,7 +985,7 @@ fn walk_tree<'a>(
     }
 
     // Function types
-    if cfg.function_types.iter().any(|ft| *ft == t) {
+    if cfg.function_types.contains(&t) {
         handle_function(
             node,
             parent_class_id,
@@ -1247,18 +1249,16 @@ fn resolve_impl_type(node: TsNode<'_>, source: &[u8], _stem: &str) -> Option<Str
     let raw = node_text(node, source);
     let mut type_names = Vec::new();
     for child in named_children(node) {
-        if child.kind() == "type_identifier" {
-            if let Some(type_name) = node_text(child, source) {
+        if child.kind() == "type_identifier"
+            && let Some(type_name) = node_text(child, source) {
                 type_names.push(type_name);
             }
-        }
         if child.kind() == "trait_bound" {
             for sub in named_children(child) {
-                if sub.kind() == "type_identifier" {
-                    if let Some(type_name) = node_text(sub, source) {
+                if sub.kind() == "type_identifier"
+                    && let Some(type_name) = node_text(sub, source) {
                         type_names.push(type_name);
                     }
-                }
             }
         }
     }
@@ -1308,23 +1308,21 @@ fn handle_function<'a>(
                 for child in named_children(param) {
                     if child.kind() == "pointer_type" {
                         for sub in named_children(child) {
-                            if sub.kind() == "type_identifier" {
-                                if let Some(type_name) = node_text(sub, source) {
+                            if sub.kind() == "type_identifier"
+                                && let Some(type_name) = node_text(sub, source) {
                                     return Some(make_id(&format!(
                                         "{}_{type_name}",
                                         package_scope(source_file, stem)
                                     )));
                                 }
-                            }
                         }
-                    } else if child.kind() == "type_identifier" {
-                        if let Some(type_name) = node_text(child, source) {
+                    } else if child.kind() == "type_identifier"
+                        && let Some(type_name) = node_text(child, source) {
                             return Some(make_id(&format!(
                                 "{}_{type_name}",
                                 package_scope(source_file, stem)
                             )));
                         }
-                    }
                 }
             }
             None
@@ -1381,14 +1379,13 @@ fn handle_function<'a>(
         },
     );
 
-    if ext == "rs" {
-        if let Some(return_type_name) = rust_return_type_name(node, source) {
+    if ext == "rs"
+        && let Some(return_type_name) = rust_return_type_name(node, source) {
             function_returns.push(FunctionReturn {
                 function_name: func_name.clone(),
                 return_type_name,
             });
         }
-    }
 
     // Collect calls inside this function body
     let body = find_body(node, cfg);
@@ -1467,7 +1464,7 @@ fn handle_import(
     let kind = node.kind();
     let ext = source_extension(source_file);
 
-    if !cfg.import_types.iter().any(|it| *it == kind) {
+    if !cfg.import_types.contains(&kind) {
         return;
     }
 
@@ -2123,8 +2120,8 @@ fn collect_python_cross_file_import_edges(
     seen_edges: &mut HashSet<(String, String, usize)>,
     edges: &mut Vec<Edge>,
 ) {
-    if node.kind() == "import_from_statement" {
-        if let Some(import_statement) = parse_python_import_from_statement(node, source) {
+    if node.kind() == "import_from_statement"
+        && let Some(import_statement) = parse_python_import_from_statement(node, source) {
             let line_no = node.start_position().row + 1;
             if let Some(targets) = stem_to_entities.get(&import_statement.target_stem) {
                 for imported_name in import_statement.imported_names {
@@ -2153,7 +2150,6 @@ fn collect_python_cross_file_import_edges(
                 }
             }
         }
-    }
 
     for child in named_children(node) {
         collect_python_cross_file_import_edges(
@@ -2220,12 +2216,12 @@ fn collect_calls(
 ) {
     let t = node.kind();
 
-    if cfg.function_boundary_types.iter().any(|bt| *bt == t) {
+    if cfg.function_boundary_types.contains(&t) {
         return;
     }
 
-    if cfg.call_types.iter().any(|ct| *ct == t) {
-        if let Some(resolved) = resolve_callee(node, source, cfg) {
+    if cfg.call_types.contains(&t)
+        && let Some(resolved) = resolve_callee(node, source, cfg) {
             pending_calls.push(PendingCall {
                 caller_id: caller_id.to_string(),
                 callee_name: resolved.callee_name,
@@ -2234,7 +2230,6 @@ fn collect_calls(
                 receiver_call: resolved.receiver_call,
             });
         }
-    }
 
     for child in named_children(node) {
         collect_calls(child, caller_id, source, cfg, pending_calls);
@@ -2268,15 +2263,14 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
         } else {
             None
         };
-        if !cfg.call_accessor_field.is_empty() {
-            if let Some(attr) = func_node.child_by_field_name(cfg.call_accessor_field) {
+        if !cfg.call_accessor_field.is_empty()
+            && let Some(attr) = func_node.child_by_field_name(cfg.call_accessor_field) {
                 return node_text(attr, source).map(|text| ResolvedCall {
                     callee_name: text,
                     allow_cross_file: true,
                     receiver_call,
                 });
             }
-        }
         // Last named child as fallback
         if let Some(last) = named_children(func_node).into_iter().last() {
             return node_text(last, source).map(|text| ResolvedCall {
@@ -2332,11 +2326,10 @@ fn resolve_c_like_function_name(node: TsNode<'_>, source: &[u8], is_cpp: bool) -
     if node.kind() == "identifier" {
         return node_text(node, source);
     }
-    if is_cpp && node.kind() == "qualified_identifier" {
-        if let Some(name_node) = node.child_by_field_name("name") {
+    if is_cpp && node.kind() == "qualified_identifier"
+        && let Some(name_node) = node.child_by_field_name("name") {
             return node_text(name_node, source);
         }
-    }
     if let Some(decl) = node.child_by_field_name("declarator") {
         return resolve_c_like_function_name(decl, source, is_cpp);
     }
@@ -2351,11 +2344,10 @@ fn resolve_c_like_function_name(node: TsNode<'_>, source: &[u8], is_cpp: bool) -
 // ── Name resolution ───────────────────────────────────────────────────────────
 
 fn resolve_name(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Option<String> {
-    if !cfg.name_field.is_empty() {
-        if let Some(name_node) = node.child_by_field_name(cfg.name_field) {
+    if !cfg.name_field.is_empty()
+        && let Some(name_node) = node.child_by_field_name(cfg.name_field) {
             return node_text(name_node, source);
         }
-    }
 
     for child_type in cfg.name_fallback_child_types {
         for child in named_children(node) {
@@ -2395,20 +2387,18 @@ fn resolve_arrow_or_func_expr_name(node: TsNode<'_>, source: &[u8]) -> Option<St
         return None;
     }
     let parent = node.parent()?;
-    if parent.kind() == "variable_declarator" {
-        if let Some(name_node) = parent.child_by_field_name("name") {
+    if parent.kind() == "variable_declarator"
+        && let Some(name_node) = parent.child_by_field_name("name") {
             return node_text(name_node, source);
         }
-    }
     None
 }
 
 fn find_body<'a>(node: TsNode<'a>, cfg: &LanguageConfig) -> Option<TsNode<'a>> {
-    if !cfg.body_field.is_empty() {
-        if let Some(b) = node.child_by_field_name(cfg.body_field) {
+    if !cfg.body_field.is_empty()
+        && let Some(b) = node.child_by_field_name(cfg.body_field) {
             return Some(b);
         }
-    }
     for child_type in cfg.body_fallback_child_types {
         for child in named_children(node) {
             if child.kind() == *child_type {
@@ -2426,11 +2416,10 @@ fn collect_identifiers<'a>(node: TsNode<'a>, source: &'a [u8]) -> Vec<String> {
 }
 
 fn collect_identifiers_inner(node: TsNode<'_>, source: &[u8], ids: &mut Vec<String>) {
-    if node.kind() == "identifier" || node.kind() == "type_identifier" {
-        if let Some(text) = node_text(node, source) {
+    if (node.kind() == "identifier" || node.kind() == "type_identifier")
+        && let Some(text) = node_text(node, source) {
             ids.push(text);
         }
-    }
     for child in named_children(node) {
         collect_identifiers_inner(child, source, ids);
     }
@@ -2595,20 +2584,17 @@ fn walk_python_docstrings(
 }
 
 fn python_docstring(node: TsNode<'_>, source: &[u8]) -> Option<(String, usize)> {
-    for child in named_children(node) {
-        if child.kind() == "expression_statement" {
-            for sub in named_children(child) {
-                if matches!(sub.kind(), "string" | "concatenated_string") {
-                    let raw = node_text(sub, source)?;
-                    let text = trim_python_docstring(&raw);
-                    if text.chars().count() > 20 {
-                        return Some((text, child.start_position().row + 1));
-                    }
+    let child = named_children(node).into_iter().next()?;
+    if child.kind() == "expression_statement" {
+        for sub in named_children(child) {
+            if matches!(sub.kind(), "string" | "concatenated_string") {
+                let raw = node_text(sub, source)?;
+                let text = trim_python_docstring(&raw);
+                if text.chars().count() > 20 {
+                    return Some((text, child.start_position().row + 1));
                 }
             }
-            break;
         }
-        break;
     }
     None
 }
@@ -2633,8 +2619,7 @@ fn add_rationale_node_and_edge(
 ) {
     let label = text
         .replace("\r\n", " ")
-        .replace('\r', " ")
-        .replace('\n', " ")
+        .replace(['\r', '\n'], " ")
         .trim()
         .chars()
         .take(80)
@@ -2999,8 +2984,8 @@ fn extract_csharp_file(path: &Path) -> Result<Extraction> {
         seen_ids: &mut HashSet<String>,
         seen_edges: &mut HashSet<(String, String, String, Option<String>)>,
     ) {
-        if node.kind() == "namespace_declaration" {
-            if let Some(name) = node
+        if node.kind() == "namespace_declaration"
+            && let Some(name) = node
                 .child_by_field_name("name")
                 .and_then(|child| node_text(child, source))
             {
@@ -3032,7 +3017,6 @@ fn extract_csharp_file(path: &Path) -> Result<Extraction> {
                     edges.push(edge);
                 }
             }
-        }
 
         for child in named_children(node) {
             walk(
@@ -3093,11 +3077,10 @@ fn extract_julia_file(path: &Path) -> Result<Extraction> {
             if child.kind() != "call_expression" {
                 continue;
             }
-            if let Some(callee) = child.child(0) {
-                if callee.kind() == "identifier" {
+            if let Some(callee) = child.child(0)
+                && callee.kind() == "identifier" {
                     return node_text(callee, source);
                 }
-            }
         }
         None
     }
@@ -3242,8 +3225,7 @@ fn extract_julia_file(path: &Path) -> Result<Extraction> {
                             if let Some(last) = identifiers
                                 .last()
                                 .and_then(|child| node_text(*child, source))
-                            {
-                                if identifiers.len() >= 2 {
+                                && identifiers.len() >= 2 {
                                     push_edge(
                                         edges,
                                         EdgeSpec {
@@ -3255,7 +3237,6 @@ fn extract_julia_file(path: &Path) -> Result<Extraction> {
                                         },
                                     );
                                 }
-                            }
                         }
                     } else if let Some(name) = all_children(type_head)
                         .into_iter()
@@ -3289,8 +3270,7 @@ fn extract_julia_file(path: &Path) -> Result<Extraction> {
                 if let Some(type_head) = all_children(node)
                     .into_iter()
                     .find(|child| child.kind() == "type_head")
-                {
-                    if let Some(name) = all_children(type_head)
+                    && let Some(name) = all_children(type_head)
                         .into_iter()
                         .find(|child| child.kind() == "identifier")
                         .and_then(|child| node_text(child, source))
@@ -3309,15 +3289,13 @@ fn extract_julia_file(path: &Path) -> Result<Extraction> {
                             },
                         );
                     }
-                }
                 return;
             }
             "function_definition" => {
                 if let Some(signature) = all_children(node)
                     .into_iter()
                     .find(|child| child.kind() == "signature")
-                {
-                    if let Some(func_name) = func_name_from_signature(signature, source) {
+                    && let Some(func_name) = func_name_from_signature(signature, source) {
                         let func_id = make_id(&format!("{stem}_{func_name}"));
                         let line_no = node.start_position().row + 1;
                         add_code_node(
@@ -3340,15 +3318,14 @@ fn extract_julia_file(path: &Path) -> Result<Extraction> {
                         );
                         function_bodies.push((func_id, node));
                     }
-                }
                 return;
             }
             "assignment" => {
-                if let Some(lhs) = node.child(0) {
-                    if lhs.kind() == "call_expression" {
-                        if let Some(callee) = lhs.child(0) {
-                            if callee.kind() == "identifier" {
-                                if let Some(func_name) = node_text(callee, source) {
+                if let Some(lhs) = node.child(0)
+                    && lhs.kind() == "call_expression"
+                        && let Some(callee) = lhs.child(0)
+                            && callee.kind() == "identifier"
+                                && let Some(func_name) = node_text(callee, source) {
                                     let func_id = make_id(&format!("{stem}_{func_name}"));
                                     let line_no = node.start_position().row + 1;
                                     add_code_node(
@@ -3375,10 +3352,6 @@ fn extract_julia_file(path: &Path) -> Result<Extraction> {
                                         function_bodies.push((func_id, rhs));
                                     }
                                 }
-                            }
-                        }
-                    }
-                }
                 return;
             }
             "using_statement" | "import_statement" => {
@@ -3546,8 +3519,8 @@ fn extract_zig_file(path: &Path) -> Result<Extraction> {
                             _ => {}
                         }
                     }
-                    if matches!(builtin.as_deref(), Some("@import" | "@cImport")) {
-                        if let Some(arguments) = arguments {
+                    if matches!(builtin.as_deref(), Some("@import" | "@cImport"))
+                        && let Some(arguments) = arguments {
                             for arg in all_children(arguments) {
                                 if !matches!(arg.kind(), "string_literal" | "string") {
                                     continue;
@@ -3577,7 +3550,6 @@ fn extract_zig_file(path: &Path) -> Result<Extraction> {
                                 }
                             }
                         }
-                    }
                 }
                 "field_expression" => {
                     extract_import(child, file_id, source, source_file, edges);
@@ -3600,9 +3572,9 @@ fn extract_zig_file(path: &Path) -> Result<Extraction> {
         if node.kind() == "function_declaration" {
             return;
         }
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                if let Some(callee) = node_text(function_node, source) {
+        if node.kind() == "call_expression"
+            && let Some(function_node) = node.child_by_field_name("function")
+                && let Some(callee) = node_text(function_node, source) {
                     let callee = callee.split('.').next_back().unwrap_or(callee.as_str());
                     let target = nodes.iter().find_map(|node| {
                         (node.label == format!("{callee}()")
@@ -3625,8 +3597,6 @@ fn extract_zig_file(path: &Path) -> Result<Extraction> {
                         }
                     }
                 }
-            }
-        }
 
         for child in all_children(node) {
             walk_calls(
@@ -3904,8 +3874,8 @@ fn extract_powershell_file(path: &Path) -> Result<Extraction> {
                 .and_then(|child| node_text(child, source));
             if let Some(command_name) = command_name {
                 let lowered = command_name.to_lowercase();
-                if !skip_keywords.contains(lowered.as_str()) {
-                    if let Some(target_id) = label_to_id.get(&lowered) {
+                if !skip_keywords.contains(lowered.as_str())
+                    && let Some(target_id) = label_to_id.get(&lowered) {
                         let pair = (caller_id.to_string(), target_id.clone());
                         if caller_id != target_id && seen_pairs.insert(pair.clone()) {
                             push_edge_with_confidence(
@@ -3920,7 +3890,6 @@ fn extract_powershell_file(path: &Path) -> Result<Extraction> {
                             );
                         }
                     }
-                }
             }
         }
 
@@ -4085,11 +4054,10 @@ fn extract_powershell_file(path: &Path) -> Result<Extraction> {
                             continue;
                         }
                         for element in all_children(child) {
-                            if element.kind() == "generic_token" {
-                                if let Some(token) = node_text(element, source) {
+                            if element.kind() == "generic_token"
+                                && let Some(token) = node_text(element, source) {
                                     tokens.push(token);
                                 }
-                            }
                         }
                     }
                     let module_tokens: Vec<String> = tokens
@@ -4220,11 +4188,10 @@ fn extract_objc_file(path: &Path) -> Result<Extraction> {
                             continue;
                         }
                         for selector in all_children(sub) {
-                            if selector.kind() == "selector" {
-                                if let Some(part) = node_text(selector, source) {
+                            if selector.kind() == "selector"
+                                && let Some(part) = node_text(selector, source) {
                                     selector_parts.push(part);
                                 }
-                            }
                         }
                     }
                 }
@@ -4406,8 +4373,8 @@ fn extract_objc_file(path: &Path) -> Result<Extraction> {
                                     continue;
                                 }
                                 for ty in all_children(sub) {
-                                    if ty.kind() == "type_identifier" {
-                                        if let Some(proto_name) = node_text(ty, source) {
+                                    if ty.kind() == "type_identifier"
+                                        && let Some(proto_name) = node_text(ty, source) {
                                             push_edge(
                                                 edges,
                                                 EdgeSpec {
@@ -4419,7 +4386,6 @@ fn extract_objc_file(path: &Path) -> Result<Extraction> {
                                                 },
                                             );
                                         }
-                                    }
                                 }
                             }
                         }
@@ -4544,11 +4510,10 @@ fn extract_objc_file(path: &Path) -> Result<Extraction> {
                 let container = parent_id.unwrap_or(file_id);
                 let mut parts = Vec::new();
                 for child in all_children(node) {
-                    if child.kind() == "identifier" {
-                        if let Some(part) = node_text(child, source) {
+                    if child.kind() == "identifier"
+                        && let Some(part) = node_text(child, source) {
                             parts.push(part);
                         }
-                    }
                 }
                 let method_name = parts.join("");
                 if method_name.is_empty() {
@@ -4712,8 +4677,8 @@ fn extract_elixir_file(path: &Path) -> Result<Extraction> {
         }
 
         for child in all_children(node) {
-            if child.kind() == "identifier" {
-                if let Some(keyword) = node_text(child, source) {
+            if child.kind() == "identifier"
+                && let Some(keyword) = node_text(child, source) {
                     if skip_keywords.contains(keyword.as_str()) {
                         for nested in all_children(node) {
                             walk_calls(
@@ -4731,7 +4696,6 @@ fn extract_elixir_file(path: &Path) -> Result<Extraction> {
                     }
                     break;
                 }
-            }
         }
 
         let mut callee_name = None;
@@ -4754,8 +4718,8 @@ fn extract_elixir_file(path: &Path) -> Result<Extraction> {
             }
         }
 
-        if let Some(callee_name) = callee_name {
-            if let Some(target_id) = label_to_id.get(&callee_name.to_lowercase()) {
+        if let Some(callee_name) = callee_name
+            && let Some(target_id) = label_to_id.get(&callee_name.to_lowercase()) {
                 let pair = (caller_id.to_string(), target_id.clone());
                 if caller_id != target_id && seen_pairs.insert(pair.clone()) {
                     push_edge_with_confidence(
@@ -4770,7 +4734,6 @@ fn extract_elixir_file(path: &Path) -> Result<Extraction> {
                     );
                 }
             }
-        }
 
         for child in all_children(node) {
             walk_calls(
@@ -4953,8 +4916,8 @@ fn extract_elixir_file(path: &Path) -> Result<Extraction> {
         }
 
         if import_keywords.contains(keyword.as_str()) {
-            if let Some(arguments) = arguments_node {
-                if let Some(module_name) = alias_text(arguments, source) {
+            if let Some(arguments) = arguments_node
+                && let Some(module_name) = alias_text(arguments, source) {
                     push_edge(
                         edges,
                         EdgeSpec {
@@ -4966,7 +4929,6 @@ fn extract_elixir_file(path: &Path) -> Result<Extraction> {
                         },
                     );
                 }
-            }
             return;
         }
 
@@ -5130,8 +5092,8 @@ fn extract_swift_file(path: &Path) -> Result<Extraction> {
                 }
             }
             "extension_declaration" => {
-                if let Some(raw) = node_text(node, source) {
-                    if let Some(caps) = extension_re.captures(&raw) {
+                if let Some(raw) = node_text(node, source)
+                    && let Some(caps) = extension_re.captures(&raw) {
                         let type_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
                         if !type_name.is_empty() {
                             let line_no = node.start_position().row + 1;
@@ -5185,14 +5147,13 @@ fn extract_swift_file(path: &Path) -> Result<Extraction> {
                             return;
                         }
                     }
-                }
             }
             "enum_entry" => {
                 if let Some(parent_type_id) = parent_type_id {
                     let line_no = node.start_position().row + 1;
                     for child in all_children(node) {
-                        if child.kind() == "simple_identifier" {
-                            if let Some(case_name) = node_text(child, source) {
+                        if child.kind() == "simple_identifier"
+                            && let Some(case_name) = node_text(child, source) {
                                 let case_id = make_id(&format!("{parent_type_id}_{case_name}"));
                                 add_code_node(
                                     nodes,
@@ -5218,7 +5179,6 @@ fn extract_swift_file(path: &Path) -> Result<Extraction> {
                                 };
                                 insert_edge_once(edges, seen_edges, edge);
                             }
-                        }
                     }
                     return;
                 }
@@ -5259,8 +5219,8 @@ fn extract_swift_file(path: &Path) -> Result<Extraction> {
                 }
             }
             "function_declaration" => {
-                if let Some(parent_type_id) = parent_type_id {
-                    if let Some(func_name) = find_swift_name(node, source) {
+                if let Some(parent_type_id) = parent_type_id
+                    && let Some(func_name) = find_swift_name(node, source) {
                         let line_no = node.start_position().row + 1;
                         let func_id = make_id(&format!("{parent_type_id}_{func_name}"));
                         add_code_node(
@@ -5287,7 +5247,6 @@ fn extract_swift_file(path: &Path) -> Result<Extraction> {
                         };
                         insert_edge_once(edges, seen_edges, edge);
                     }
-                }
             }
             _ => {}
         }
@@ -5959,11 +5918,10 @@ fn markdown_heading_label(line: &str) -> Option<String> {
 }
 
 fn strip_frontmatter(text: &str) -> String {
-    if let Some(rest) = text.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---\n") {
+    if let Some(rest) = text.strip_prefix("---\n")
+        && let Some(end) = rest.find("\n---\n") {
             return rest[end + 5..].to_string();
         }
-    }
     text.to_string()
 }
 

@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use rayon::prelude::*;
 use rustworkx_core::community::leiden_communities;
 use rustworkx_core::petgraph::graph::{NodeIndex, UnGraph};
@@ -197,16 +199,14 @@ fn normalize_edge(edge: &serde_json::Value) -> Option<Edge> {
     let mut value = edge.clone();
     let object = value.as_object_mut()?;
 
-    if !object.contains_key("source") {
-        if let Some(source) = object.get("from").cloned() {
+    if !object.contains_key("source")
+        && let Some(source) = object.get("from").cloned() {
             object.insert("source".to_string(), source);
         }
-    }
-    if !object.contains_key("target") {
-        if let Some(target) = object.get("to").cloned() {
+    if !object.contains_key("target")
+        && let Some(target) = object.get("to").cloned() {
             object.insert("target".to_string(), target);
         }
-    }
 
     serde_json::from_value::<Edge>(value).ok()
 }
@@ -461,11 +461,10 @@ fn is_file_node(node: &Node, degree: usize) -> bool {
     if node.source_file.is_empty() {
         return false;
     }
-    if let Some(filename) = node.source_file.rsplit('/').next() {
-        if node.label == filename {
+    if let Some(filename) = node.source_file.rsplit('/').next()
+        && node.label == filename {
             return true;
         }
-    }
     if node.label.starts_with('.') && node.label.ends_with("()") {
         return true;
     }
@@ -479,11 +478,10 @@ fn is_concept_node(node: &Node) -> bool {
     if node.source_file.is_empty() {
         return true;
     }
-    if let Some(filename) = node.source_file.rsplit('/').next() {
-        if !filename.contains('.') {
+    if let Some(filename) = node.source_file.rsplit('/').next()
+        && !filename.contains('.') {
             return true;
         }
-    }
     false
 }
 
@@ -877,12 +875,11 @@ fn surprise_score(
     if let (Some(&cu), Some(&cv)) = (
         node_community.get(src.id.as_str()),
         node_community.get(tgt.id.as_str()),
-    ) {
-        if cu != cv {
+    )
+        && cu != cv {
             score += 1;
             reasons.push("bridges separate communities".to_string());
         }
-    }
 
     if edge.relation == "semantically_similar_to" {
         score = (score as f64 * 1.5).round() as usize;
@@ -1126,11 +1123,10 @@ fn decompose_hangul_syllable(out: &mut String, ch: char) -> bool {
     if let Some(vowel) = char::from_u32(V_BASE + v_index) {
         out.push(vowel);
     }
-    if t_index != 0 {
-        if let Some(tail) = char::from_u32(T_BASE + t_index) {
+    if t_index != 0
+        && let Some(tail) = char::from_u32(T_BASE + t_index) {
             out.push(tail);
         }
-    }
     true
 }
 
@@ -1289,8 +1285,7 @@ fn safe_note_name(label: &str) -> String {
     let mut cleaned = String::new();
     for ch in label
         .replace("\r\n", " ")
-        .replace('\r', " ")
-        .replace('\n', " ")
+        .replace(['\r', '\n'], " ")
         .chars()
     {
         if !matches!(
@@ -1913,7 +1908,7 @@ pub fn generate_report(
     } else {
         let total_score: f64 = inferred_edges
             .iter()
-            .map(|edge| edge.confidence_score.unwrap_or(0.5) as f64)
+            .map(|edge| edge.confidence_score.unwrap_or(0.5))
             .sum();
         Some(((total_score / inferred_edges.len() as f64) * 100.0).round() / 100.0)
     };
@@ -4676,8 +4671,8 @@ fn community_wiki_article(
             if node_set.contains(other_id) {
                 continue;
             }
-            if let Some(other_cid) = node_community.get(other_id).copied() {
-                if other_cid != community_id {
+            if let Some(other_cid) = node_community.get(other_id).copied()
+                && other_cid != community_id {
                     let other_label = labels
                         .get(&other_cid)
                         .cloned()
@@ -4686,7 +4681,6 @@ fn community_wiki_article(
                     cross_order.entry(other_label.clone()).or_insert(next_idx);
                     *cross_counts.entry(other_label).or_default() += 1;
                 }
-            }
         }
     }
     let total_edges = conf_counts.values().sum::<usize>().max(1);

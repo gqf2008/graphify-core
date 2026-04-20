@@ -32,9 +32,7 @@ pub fn run_stdio_server(graph_path: &Path) -> Result<()> {
 }
 
 fn handle_message(request: &Value, graph_path: &Path) -> Option<Value> {
-    let Some(object) = request.as_object() else {
-        return None;
-    };
+    let object = request.as_object()?;
     let method = object.get("method").and_then(Value::as_str)?;
     let id = object.get("id").cloned();
 

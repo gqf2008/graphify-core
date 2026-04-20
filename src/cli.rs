@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn parse_graph_value(value: &Value) -> Result<graphify_core::build::Graph> {
@@ -1510,20 +1510,17 @@ fn maybe_python_ingest_fallback(
 }
 
 fn find_python_bin() -> Option<String> {
-    if let Ok(explicit) = env::var("GRAPHIFY_PYTHON_BIN") {
-        if !explicit.trim().is_empty() {
+    if let Ok(explicit) = env::var("GRAPHIFY_PYTHON_BIN")
+        && !explicit.trim().is_empty() {
             return Some(explicit);
         }
-    }
     for candidate in ["python3", "python"] {
         if let Ok(output) = std::process::Command::new(candidate)
             .arg("--version")
             .output()
-        {
-            if output.status.success() {
+            && output.status.success() {
                 return Some(candidate.to_string());
             }
-        }
     }
     None
 }
@@ -1532,14 +1529,14 @@ fn today_utc() -> String {
     timeutil::current_utc_datetime().date_string()
 }
 
-fn require_path_exists(path: &PathBuf) -> Result<()> {
+fn require_path_exists(path: &Path) -> Result<()> {
     if !path.exists() {
         bail!("error: path not found: {}", path.display());
     }
     Ok(())
 }
 
-fn run_agents_action(platform: &str, action: InstallAction, project_dir: &PathBuf) -> Result<()> {
+fn run_agents_action(platform: &str, action: InstallAction, project_dir: &Path) -> Result<()> {
     let lines = match action {
         InstallAction::Install => setup::agents_install(project_dir, platform)?,
         InstallAction::Uninstall => setup::agents_uninstall(project_dir, platform)?,

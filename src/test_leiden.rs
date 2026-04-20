@@ -36,7 +36,7 @@ fn compute_modularity(pg_graph: &UnGraph<(), f64>, communities: &rustworkx_core:
             }
         }
     }
-    q = q / (2.0 * m);
+    q /= 2.0 * m;
     (q, num_communities.len())
 }
 
@@ -62,12 +62,11 @@ fn main() {
         }
     }
     for edge in &graph.links {
-        if let (Some(&src), Some(&tgt)) = (node_indices.get(&edge.source), node_indices.get(&edge.target)) {
-            if src != tgt {
+        if let (Some(&src), Some(&tgt)) = (node_indices.get(&edge.source), node_indices.get(&edge.target))
+            && src != tgt {
                 let weight = if edge.value == 0.0 { 1.0 } else { edge.value };
                 pg_graph.add_edge(src, tgt, weight);
             }
-        }
     }
     println!("Graph: {} nodes, {} edges", pg_graph.node_count(), pg_graph.edge_count());
 

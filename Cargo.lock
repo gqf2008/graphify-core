@@ -509,6 +509,7 @@ dependencies = [
  "hex",
  "ignore",
  "pdf-extract",
+ "rand",
  "rayon",
  "regex",
  "rustworkx-core",
@@ -1078,7 +1079,6 @@ dependencies = [
 [[package]]
 name = "rustworkx-core"
 version = "0.17.1"
-source = "git+https://github.com/gqf2008/rustworkx?rev=086a96204c0282f89574686041337dd66e29f0c2#086a96204c0282f89574686041337dd66e29f0c2"
 dependencies = [
  "fixedbitset",
  "foldhash",

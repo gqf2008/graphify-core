@@ -95,7 +95,7 @@ The project is organized as a library (`src/lib.rs`) with two binary entry point
 
 - **`detect`** — File discovery, type classification (code/document/paper/image/video), corpus health checks, `.graphifyignore` support, sensitive-file skipping, and office-file conversion (.docx/.xlsx → markdown sidecars).
 - **`extract`** — AST-based structural extraction using tree-sitter. Supports 20+ languages plus embedded-script extraction for Vue/Svelte. Extracts classes, functions, imports, calls, inheritance, and rationale comments.
-- **`build`** — Graph construction (`merge_extractions`), normalization, community detection (Louvain), cohesion scoring, god-node ranking, surprising-connection detection, report generation, and exports (JSON, Cypher, GraphML, HTML, SVG, Obsidian, Wiki).
+- **`build`** — Graph construction (`merge_extractions`), normalization, community detection (Leiden via rustworkx-core's ported graspologic-native implementation), cohesion scoring, god-node ranking, surprising-connection detection, report generation, and exports (JSON, Cypher, GraphML, HTML, SVG, Obsidian, Wiki).
 - **`pipeline`** — End-to-end orchestration: `rebuild_code`, `cluster_only`, and `watch`. Preserves non-code semantic nodes/edges across rebuilds.
 - **`query`** — Graph traversal (BFS/DFS), shortest path, node explanation, neighbor lookup, community listing, god-node ranking, and stats.
 - **`serve`** — MCP stdio server exposing graph query tools to AI assistants.

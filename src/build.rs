@@ -1,6 +1,7 @@
 use rayon::prelude::*;
 use rustworkx_core::community::leiden_communities;
 use rustworkx_core::petgraph::graph::{NodeIndex, UnGraph};
+
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
@@ -210,11 +211,29 @@ fn normalize_edge(edge: &serde_json::Value) -> Option<Edge> {
     serde_json::from_value::<Edge>(value).ok()
 }
 
-// ── Community detection (Leiden via rustworkx-core) ───────────────────────────
+// ── Community detection (Leiden via graspologic-native) ─────────────────────
+
+/// Run Leiden community detection using rustworkx-core's ported
+/// graspologic-native implementation.
+fn run_graspologic_leiden(pg_graph: &UnGraph<(), f64>) -> HashMap<u32, Vec<usize>> {
+    let communities = leiden_communities(
+        pg_graph,
+        Some(1),      // max_iterations — same default as graspologic Python
+        Some(1.0),    // resolution
+        Some(0.001),  // randomness
+        Some(42),     // seed
+    );
+
+    let mut result: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (node_id, label) in communities {
+        result.entry(label).or_default().push(node_id.index());
+    }
+    result
+}
 
 const MAX_COMMUNITY_FRACTION: f64 = 0.25;
 const MIN_SPLIT_SIZE: usize = 10;
-const BOUNDARY_REFINEMENT_MAX_DEGREE: usize = 2;
+
 
 pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
     if graph.nodes.is_empty() {
@@ -276,13 +295,15 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
             }
         }
 
-        let communities_map = leiden_communities(&pg_graph, None, None, Some(0.001), None);
-        for (local_idx, pg_node) in pg_nodes.iter().enumerate() {
-            let raw_label = communities_map.get(pg_node).copied().unwrap_or(local_idx as u32);
-            groups.entry(raw_label).or_default().push(connected_nodes[local_idx]);
+        let communities_map = run_graspologic_leiden(&pg_graph);
+        for (raw_label, node_ids) in communities_map {
+            for node_id in node_ids {
+                groups.entry(raw_label).or_default().push(connected_nodes[node_id]);
+            }
         }
         next_label = groups.keys().copied().max().map(|m| m + 1).unwrap_or(0);
     }
+    // Debug removed
 
     for isolate_idx in isolates {
         groups.entry(next_label).or_default().push(isolate_idx);
@@ -291,6 +312,7 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
 
     let mut final_communities: Vec<Vec<String>> = Vec::new();
     let max_size = std::cmp::max(MIN_SPLIT_SIZE, (n as f64 * MAX_COMMUNITY_FRACTION) as usize);
+    // Debug removed
 
     for members in groups.into_values() {
         let nodes: Vec<String> = members.into_iter().map(|idx| graph.nodes[idx].id.clone()).collect();
@@ -306,7 +328,8 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
         }
     }
 
-    let mut indexed_communities: Vec<Vec<usize>> = final_communities
+    // Debug removed
+    let indexed_communities: Vec<Vec<usize>> = final_communities
         .into_iter()
         .map(|nodes| {
             let mut members: Vec<usize> = nodes
@@ -325,87 +348,12 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
         .filter(|members| !members.is_empty())
         .map(|members| members.into_iter().map(|idx| graph.nodes[idx].id.clone()).collect())
         .collect();
-    // Only merge truly tiny communities (singletons / pairs) to avoid
-    // over-aggregation on large graphs.  Previous threshold of n/100 was
-    // far too aggressive — e.g. 5559 nodes → threshold 55, which collapsed
-    // ~1000 communities down to 5.  A fixed floor of 3 keeps the graph
-    // readable without destroying meaningful structure.
-    let min_community_size = if n < 50 { 1 } else { 3 };
-    named_communities = merge_small_communities(graph, named_communities, min_community_size);
+    // Align with Python original: isolates remain as singleton communities.
+    // The Python implementation has no merge_small_communities step.
     named_communities.iter_mut().for_each(|v| v.sort());
     named_communities
         .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
     named_communities.into_iter().enumerate().collect()
-}
-
-fn merge_small_communities(
-    graph: &Graph,
-    communities: Vec<Vec<String>>,
-    min_size: usize,
-) -> Vec<Vec<String>> {
-    if communities.len() <= 1 {
-        return communities;
-    }
-
-    let mut large: Vec<Vec<String>> = Vec::new();
-    let mut small: Vec<Vec<String>> = Vec::new();
-    for c in communities {
-        if c.len() < min_size {
-            small.push(c);
-        } else {
-            large.push(c);
-        }
-    }
-
-    if small.is_empty() {
-        return large;
-    }
-
-    if large.is_empty() {
-        let mut sorted = small;
-        sorted.sort_by_key(|c| std::cmp::Reverse(c.len()));
-        let mut result: Vec<Vec<String>> = Vec::new();
-        if let Some(first) = sorted.pop() {
-            result.push(first);
-        }
-        for c in sorted {
-            result.last_mut().unwrap().extend(c);
-        }
-        return result;
-    }
-
-    let node_to_community: HashMap<String, usize> = large
-        .iter()
-        .enumerate()
-        .flat_map(|(i, c)| c.iter().map(move |node| (node.clone(), i)))
-        .collect();
-
-    for small_comm in small {
-        let mut neighbor_counts: HashMap<usize, usize> = HashMap::new();
-        for node in &small_comm {
-            for edge in &graph.edges {
-                let other = if edge.source == *node {
-                    edge.target.as_str()
-                } else if edge.target == *node {
-                    edge.source.as_str()
-                } else {
-                    continue;
-                };
-                if let Some(&cid) = node_to_community.get(other) {
-                    *neighbor_counts.entry(cid).or_default() += 1;
-                }
-            }
-        }
-
-        let target = neighbor_counts
-            .into_iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(cid, _)| cid)
-            .unwrap_or(0);
-        large[target].extend(small_comm);
-    }
-
-    large.into_iter().filter(|c| !c.is_empty()).collect()
 }
 
 fn split_community(
@@ -449,11 +397,12 @@ fn split_community(
         }
     }
 
-    let communities = leiden_communities(&pg_graph, None, None, Some(0.001), None);
+    let communities_map = run_graspologic_leiden(&pg_graph);
     let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (local_idx, pg_node) in pg_nodes.iter().enumerate() {
-        let label = communities.get(pg_node).copied().unwrap_or(local_idx as u32);
-        groups.entry(label).or_default().push(local_idx);
+    for (label, node_ids) in communities_map {
+        for node_id in node_ids {
+            groups.entry(label).or_default().push(node_id);
+        }
     }
 
     if groups.len() <= 1 {
@@ -469,115 +418,6 @@ fn split_community(
             community
         })
         .collect()
-}
-
-fn refine_boundary_nodes(graph: &Graph, communities: &mut [Vec<usize>]) {
-    let (_, adj, edge_lookup) = graph_adjacency(graph);
-    let mut node_to_community = vec![usize::MAX; graph.nodes.len()];
-    for (cid, members) in communities.iter().enumerate() {
-        for &node_idx in members {
-            node_to_community[node_idx] = cid;
-        }
-    }
-
-    for node_idx in 0..graph.nodes.len() {
-        let node = &graph.nodes[node_idx];
-        if adj[node_idx].is_empty()
-            || adj[node_idx].len() > BOUNDARY_REFINEMENT_MAX_DEGREE
-            || node.source_file.is_empty()
-            || node_to_community[node_idx] == usize::MAX
-        {
-            continue;
-        }
-
-        let current_cid = node_to_community[node_idx];
-        let mut weight_by_community: BTreeMap<usize, f64> = BTreeMap::new();
-        for &neighbor_idx in &adj[node_idx] {
-            let neighbor_cid = node_to_community[neighbor_idx];
-            if neighbor_cid == usize::MAX {
-                continue;
-            }
-            let pair = if node_idx <= neighbor_idx {
-                (node_idx, neighbor_idx)
-            } else {
-                (neighbor_idx, node_idx)
-            };
-            let weight = edge_lookup
-                .get(&pair)
-                .map(|edge| normalize_weight(edge.weight))
-                .unwrap_or(1.0);
-            *weight_by_community.entry(neighbor_cid).or_default() += weight;
-        }
-        if weight_by_community.len() < 2 {
-            continue;
-        }
-
-        let best_weight = weight_by_community.values().copied().fold(0.0, f64::max);
-        let tied_communities: Vec<usize> = weight_by_community
-            .iter()
-            .filter_map(|(&cid, &weight)| {
-                ((weight - best_weight).abs() <= f64::EPSILON).then_some(cid)
-            })
-            .collect();
-        if tied_communities.len() < 2 || !tied_communities.contains(&current_cid) {
-            continue;
-        }
-
-        let current_score =
-            boundary_affinity_score(graph, communities, &adj, node_idx, current_cid);
-        let mut best_cid = current_cid;
-        let mut best_score = current_score;
-        for cid in tied_communities {
-            if cid == current_cid {
-                continue;
-            }
-            let candidate_score = boundary_affinity_score(graph, communities, &adj, node_idx, cid);
-            if candidate_score > best_score {
-                best_cid = cid;
-                best_score = candidate_score;
-            }
-        }
-
-        if best_cid != current_cid {
-            communities[current_cid].retain(|&member| member != node_idx);
-            communities[best_cid].push(node_idx);
-            communities[best_cid].sort_unstable();
-            node_to_community[node_idx] = best_cid;
-        }
-    }
-}
-
-fn boundary_affinity_score(
-    graph: &Graph,
-    communities: &[Vec<usize>],
-    adj: &[Vec<usize>],
-    node_idx: usize,
-    candidate_cid: usize,
-) -> (usize, usize, usize) {
-    let node = &graph.nodes[node_idx];
-    let source_file = node.source_file.as_str();
-    let mut same_file_count = 0usize;
-    let mut file_anchor_count = 0usize;
-    let mut direct_neighbor_count = 0usize;
-    let neighbor_set: HashSet<usize> = adj[node_idx].iter().copied().collect();
-
-    for &member_idx in &communities[candidate_cid] {
-        if member_idx == node_idx {
-            continue;
-        }
-        let member = &graph.nodes[member_idx];
-        if member.source_file == source_file {
-            same_file_count += 1;
-            if member.node_type.as_deref() == Some("file") {
-                file_anchor_count += 1;
-            }
-        }
-        if neighbor_set.contains(&member_idx) {
-            direct_neighbor_count += 1;
-        }
-    }
-
-    (file_anchor_count, same_file_count, direct_neighbor_count)
 }
 
 // ── Analysis ──────────────────────────────────────────────────────────────────
@@ -3433,13 +3273,17 @@ function generateDeterministicLayout(nodes, links) {{
   const communities = Array.from(communityNodes.keys());
   const goldenAngle = Math.PI * (3 - Math.sqrt(5));
   const communityPositions = new Map();
-  for (let i = 0; i < communities.length; i++) {{
-    const y = 1 - (i / (communities.length - 1)) * 2;
-    const radius = Math.sqrt(1 - y * y);
-    const theta = goldenAngle * i;
-    const x = Math.cos(theta) * radius;
-    const z = Math.sin(theta) * radius;
-    communityPositions.set(communities[i], {{x: x * 600, y: y * 600, z: z * 600}});
+  if (communities.length === 1) {{
+    communityPositions.set(communities[0], {{x: 0, y: 0, z: 0}});
+  }} else {{
+    for (let i = 0; i < communities.length; i++) {{
+      const y = 1 - (i / (communities.length - 1)) * 2;
+      const radius = Math.sqrt(1 - y * y);
+      const theta = goldenAngle * i;
+      const x = Math.cos(theta) * radius;
+      const z = Math.sin(theta) * radius;
+      communityPositions.set(communities[i], {{x: x * 600, y: y * 600, z: z * 600}});
+    }}
   }}
   for (const [cid, nodeIndices] of communityNodes) {{
     const center = communityPositions.get(cid);
@@ -3597,7 +3441,7 @@ function selectNode(node) {{
 }}
 
 function updateSelectedNodeIndicator() {{
-  if (selectedNodeIndicator) {{ scene.remove(selectedNodeIndicator); selectedNodeIndicator.dispose(); selectedNodeIndicator = null; }}
+  if (selectedNodeIndicator) {{ scene.remove(selectedNodeIndicator); selectedNodeIndicator.geometry.dispose(); selectedNodeIndicator.material.dispose(); selectedNodeIndicator = null; }}
   if (!selectedNodeId || !nodePositions) return;
   const idx = currentNodeIndexMap.get(selectedNodeId);
   if (idx === undefined) return;
@@ -5266,7 +5110,7 @@ mod tests {
     use super::{
         Graph, build_wiki_export_context, cluster, coerce_graph, community_wiki_article,
         export_canvas_data, export_html, export_html_3d, export_json_data, export_svg,
-        god_node_wiki_article, god_nodes, merge_extractions, refine_boundary_nodes,
+        god_node_wiki_article, god_nodes, merge_extractions,
         suggest_questions, surprising_connections,
     };
     use crate::schema::{Edge, Node};
@@ -5906,31 +5750,6 @@ mod tests {
             communities.get(&1),
             Some(&vec!["z1".to_string(), "z2".to_string()])
         );
-    }
-
-    #[test]
-    fn refine_boundary_nodes_prefers_same_file_anchor_on_tie() {
-        let graph = merge_extractions(&[json!({
-            "nodes": [
-                {"id": "helper", "label": "helper()", "file_type": "code", "source_file": "a.py", "node_type": "function"},
-                {"id": "file_a", "label": "a.py", "file_type": "code", "source_file": "a.py", "node_type": "file"},
-                {"id": "peer_a", "label": "peer_a()", "file_type": "code", "source_file": "a.py", "node_type": "function"},
-                {"id": "external", "label": "external()", "file_type": "code", "source_file": "b.py", "node_type": "function"}
-            ],
-            "edges": [
-                {"source": "helper", "target": "file_a", "relation": "contains", "confidence": "EXTRACTED", "source_file": "a.py"},
-                {"source": "helper", "target": "external", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py"}
-            ]
-        })]);
-
-        let mut communities = vec![vec![0usize, 3usize], vec![1usize, 2usize]];
-        refine_boundary_nodes(&graph, &mut communities);
-        communities
-            .iter_mut()
-            .for_each(|members| members.sort_unstable());
-
-        assert!(communities.contains(&vec![0usize, 1usize, 2usize]));
-        assert!(communities.contains(&vec![3usize]));
     }
 
     #[test]

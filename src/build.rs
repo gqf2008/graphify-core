@@ -6069,3 +6069,17 @@ mod tests {
         assert!(html.contains("zoomToFit"));
     }
 }
+
+pub fn export_binary(
+    graph: &Graph,
+    communities: &HashMap<usize, Vec<String>>,
+    community_labels: &HashMap<usize, String>,
+    output_path: &Path,
+) -> anyhow::Result<usize> {
+    let layout = crate::layout::compute_layout(graph, communities);
+    let data = crate::binary_schema::encode(graph, communities, community_labels, &layout);
+    let size = data.len();
+    fs::write(output_path, &data)
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {}", output_path.display(), e))?;
+    Ok(size)
+}

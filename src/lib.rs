@@ -1,7 +1,9 @@
+pub mod binary_schema;
 pub mod build;
 pub mod detect;
 pub mod extract;
 pub mod ingest;
+pub mod layout;
 pub mod memory;
 pub mod pipeline;
 pub mod query;

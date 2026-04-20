@@ -17,6 +17,14 @@ path = "src/main.rs"
 name = "graphify"
 path = "src/cli.rs"
 
+[[bin]]
+name = "test-leiden"
+path = "src/test_leiden.rs"
+
+[[bin]]
+name = "test-binary"
+path = "src/test_binary.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -56,7 +64,17 @@ regex = "1.12.3"
 pdf-extract = "0.10.0"
 docx-lite = "0.2.0"
 calamine = "0.34.0"
+bincode = { version = "2", features = ["serde"] }
+eframe = { version = "0.34.1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+viewer = ["dep:eframe"]
+
+[[bin]]
+name = "graphify-viewer"
+path = "src/viewer.rs"
+required-features = ["viewer"]
 

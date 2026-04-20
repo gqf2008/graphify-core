@@ -520,6 +520,12 @@ fn write_graph_outputs(
     let graph_json = graph_json?;
     let wiki_articles = wiki_articles?;
 
+    // Write binary graph file (non-blocking — failure is non-fatal)
+    let bin_path = out_dir.join("graph.bin");
+    if let Err(e) = build::export_binary(graph, &communities, &community_labels, &bin_path) {
+        eprintln!("warning: failed to write graph.bin: {e:#}");
+    }
+
     // Merge analysis results into graph.json for parity benchmarking
     let mut graph_value: Value = serde_json::from_str(&graph_json)
         .context("cannot parse graph.json for analysis merge")?;

@@ -246,11 +246,10 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
 }
 
 fn find_curl_bin() -> Option<String> {
-    if let Ok(explicit) = env::var("GRAPHIFY_CURL_BIN") {
-        if !explicit.trim().is_empty() {
+    if let Ok(explicit) = env::var("GRAPHIFY_CURL_BIN")
+        && !explicit.trim().is_empty() {
             return Some(explicit);
         }
-    }
     Some("curl".to_string())
 }
 
@@ -308,8 +307,7 @@ fn safe_fetch_text(url: &str, max_bytes: usize, timeout_secs: u32) -> Result<Str
 fn yaml_str(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('"', "\\\"")
-        .replace('\n', " ")
-        .replace('\r', " ")
+        .replace(['\n', '\r'], " ")
 }
 
 fn safe_filename(url: &str, suffix: &str) -> String {

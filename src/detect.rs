@@ -272,8 +272,8 @@ pub fn docx_to_markdown(path: &Path) -> String {
         }
 
         // List item
-        if paragraph.numbering_id.is_some() {
-            if let Some(level) = paragraph.numbering_level {
+        if paragraph.numbering_id.is_some()
+            && let Some(level) = paragraph.numbering_level {
                 let indent = "  ".repeat(level.max(0) as usize);
                 if let Some(item) = doc.lists.get(list_index) {
                     let marker = match item.list_type {
@@ -291,7 +291,6 @@ pub fn docx_to_markdown(path: &Path) -> String {
                     continue;
                 }
             }
-        }
 
         // Heading / normal paragraph
         let style = paragraph.style.as_deref().unwrap_or("");
@@ -329,7 +328,7 @@ pub fn docx_to_markdown(path: &Path) -> String {
                 table_lines.push(format!("| {} |", cells.join(" | ")));
             }
         }
-        if table_lines.len() >= 1 {
+        if !table_lines.is_empty() {
             let col_count = table_lines[0].matches('|').count().saturating_sub(1);
             if col_count > 0 {
                 let sep = format!(
@@ -423,7 +422,7 @@ pub fn convert_office_file(path: &Path, out_dir: &Path) -> Option<PathBuf> {
         return None;
     }
 
-    if let Err(_) = std::fs::create_dir_all(out_dir) {
+    if std::fs::create_dir_all(out_dir).is_err() {
         return None;
     }
 
@@ -435,7 +434,7 @@ pub fn convert_office_file(path: &Path, out_dir: &Path) -> Option<PathBuf> {
                 .to_string_lossy()
                 .as_bytes(),
         );
-        hex::encode(&hasher.finalize())[..8].to_string()
+        hex::encode(hasher.finalize())[..8].to_string()
     };
 
     let out_path = out_dir.join(format!(
@@ -486,8 +485,8 @@ fn load_graphifyignore(root: &Path) -> Vec<IgnorePattern> {
 
     loop {
         let ignore_file = current.join(".graphifyignore");
-        if ignore_file.exists() {
-            if let Ok(content) = fs::read_to_string(&ignore_file) {
+        if ignore_file.exists()
+            && let Ok(content) = fs::read_to_string(&ignore_file) {
                 for line in content.lines() {
                     let line = line.trim();
                     if line.is_empty() || line.starts_with('#') {
@@ -499,7 +498,6 @@ fn load_graphifyignore(root: &Path) -> Vec<IgnorePattern> {
                     });
                 }
             }
-        }
 
         if current.join(".git").exists() {
             break;
@@ -541,14 +539,13 @@ fn is_ignored(path: &Path, root: &Path, patterns: &[IgnorePattern]) -> bool {
         }
 
         // Try relative to anchor dir
-        if ip.anchor != root {
-            if let Ok(rel) = path.strip_prefix(&ip.anchor) {
+        if ip.anchor != root
+            && let Ok(rel) = path.strip_prefix(&ip.anchor) {
                 let rel_str = rel.to_string_lossy();
                 if matches_path(&rel_str, &filename, pat) {
                     return true;
                 }
             }
-        }
     }
 
     false
@@ -619,11 +616,10 @@ fn normalize_manifest_key(path: &str) -> String {
     // When we canonicalize we get /private/var/... which breaks compatibility
     // with old Python manifests. Strip the /private prefix only when the
     // original path starts with /var and the canonical path is /private/var.
-    if let Some(stripped) = canonical.strip_prefix("/private") {
-        if path.starts_with("/var") && stripped.starts_with("/var") {
+    if let Some(stripped) = canonical.strip_prefix("/private")
+        && path.starts_with("/var") && stripped.starts_with("/var") {
             return stripped.to_string();
         }
-    }
     canonical
 }
 
@@ -709,19 +705,16 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 if follow_symlinks && path.is_symlink() {
                     // Cycle detection for symlinks
-                    if let Ok(real) = path.canonicalize() {
-                        if let Some(parent_real) = path.parent().and_then(|p| p.canonicalize().ok())
-                        {
-                            if parent_real == real || parent_real.starts_with(&real) {
+                    if let Ok(real) = path.canonicalize()
+                        && let Some(parent_real) = path.parent().and_then(|p| p.canonicalize().ok())
+                            && (parent_real == real || parent_real.starts_with(&real)) {
                                 continue;
                             }
-                        }
-                    }
                 }
 
                 let dp = &path;
-                if !in_memory_tree {
-                    if let Some(name) = dp.file_name().and_then(|n| n.to_str()) {
+                if !in_memory_tree
+                    && let Some(name) = dp.file_name().and_then(|n| n.to_str()) {
                         if name.starts_with('.') || is_noise_dir(name) {
                             continue;
                         }
@@ -729,7 +722,6 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
                             continue;
                         }
                     }
-                }
                 continue;
             }
 
@@ -756,11 +748,10 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
                 continue;
             }
 
-            if !in_memory_tree {
-                if is_ignored(&path, &canonical_root, &ignore_patterns) {
+            if !in_memory_tree
+                && is_ignored(&path, &canonical_root, &ignore_patterns) {
                     continue;
                 }
-            }
 
             // Skip files inside our own converted/ dir
             if path.starts_with(&converted_dir) {
@@ -802,10 +793,10 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
         let key = ftype.as_str().to_string();
 
         // Office files — convert to markdown sidecar and replace with converted path
-        if ftype == FileType::Document {
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if OFFICE_EXTENSIONS.contains(&format!(".{}", ext.to_lowercase()).as_str()) {
-                    if let Some(converted) = convert_office_file(p, &converted_dir) {
+        if ftype == FileType::Document
+            && let Some(ext) = p.extension().and_then(|e| e.to_str())
+                && OFFICE_EXTENSIONS.contains(&format!(".{}", ext.to_lowercase()).as_str())
+                    && let Some(converted) = convert_office_file(p, &converted_dir) {
                         files.entry(key).or_default().push(display_path_for_output(
                             &converted,
                             &canonical_root,
@@ -815,9 +806,6 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
                         continue;
                     }
                     // Conversion failed — fall through to list the original file
-                }
-            }
-        }
 
         files.entry(key).or_default().push(display_path_for_output(
             p,
@@ -891,13 +879,11 @@ pub fn save_manifest(
 
     for file_list in files.values() {
         for f in file_list {
-            if let Ok(meta) = fs::metadata(f) {
-                if let Ok(modified) = meta.modified() {
-                    if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+            if let Ok(meta) = fs::metadata(f)
+                && let Ok(modified) = meta.modified()
+                    && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
                         manifest.insert(f.clone(), dur.as_secs_f64());
                     }
-                }
-            }
         }
     }
 

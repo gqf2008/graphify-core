@@ -148,7 +148,7 @@ pub fn encode(
     let max_comm = communities.keys().max().copied().unwrap_or(0);
     let mut bin_communities: Vec<BinCommunity> = Vec::with_capacity(max_comm + 1);
     for comm_id in 0..=max_comm {
-        let members = communities.get(&comm_id);
+        let _members = communities.get(&comm_id);
         let node_start = bin_nodes
             .iter()
             .position(|n| n.community == comm_id as u32)
@@ -188,7 +188,7 @@ pub fn decode(data: &[u8]) -> Result<BinGraph, bincode::error::DecodeError> {
     Ok(graph)
 }
 
-fn count_cross_edges(edges: &[BinEdge], nodes: &[BinNode], start: u32, end: u32) -> u32 {
+fn count_cross_edges(edges: &[BinEdge], nodes: &[BinNode], start: u32, _end: u32) -> u32 {
     let mut count = 0u32;
     for edge in edges {
         let src_comm = nodes.get(edge.source as usize).map(|n| n.community);

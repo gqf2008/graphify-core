@@ -681,8 +681,7 @@ fn hooks_dir(root: &Path) -> Result<PathBuf> {
         .arg(root)
         .args(["config", "core.hooksPath"])
         .output()
-    {
-        if output.status.success() {
+        && output.status.success() {
             let custom = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !custom.is_empty() {
                 let path = PathBuf::from(custom);
@@ -695,7 +694,6 @@ fn hooks_dir(root: &Path) -> Result<PathBuf> {
                 return Ok(hooks_dir);
             }
         }
-    }
 
     let hooks_dir = root.join(".git/hooks");
     fs::create_dir_all(&hooks_dir)?;

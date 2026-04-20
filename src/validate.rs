@@ -36,20 +36,19 @@ pub fn validate_extraction(data: &Value) -> Vec<String> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("?");
                 for field in ["id", "label", "file_type", "source_file"] {
-                    if !node.get(field).is_some() {
+                    if node.get(field).is_none() {
                         errors.push(format!(
                             "Node {i} (id={node_id:?}) missing required field '{field}'"
                         ));
                     }
                 }
-                if let Some(ft) = node.get("file_type").and_then(|v| v.as_str()) {
-                    if !VALID_FILE_TYPES.contains(&ft) {
+                if let Some(ft) = node.get("file_type").and_then(|v| v.as_str())
+                    && !VALID_FILE_TYPES.contains(&ft) {
                         errors.push(format!(
                             "Node {i} (id={node_id:?}) has invalid file_type '{ft}' \
                              — must be one of {VALID_FILE_TYPES:?}"
                         ));
                     }
-                }
             }
         }
         Some(_) => errors.push("'nodes' must be a list".to_string()),
@@ -82,32 +81,29 @@ pub fn validate_extraction(data: &Value) -> Vec<String> {
                     continue;
                 }
                 for field in ["source", "target", "relation", "confidence", "source_file"] {
-                    if !edge.get(field).is_some() {
+                    if edge.get(field).is_none() {
                         errors.push(format!("Edge {i} missing required field '{field}'"));
                     }
                 }
-                if let Some(conf) = edge.get("confidence").and_then(|v| v.as_str()) {
-                    if !VALID_CONFIDENCES.contains(&conf) {
+                if let Some(conf) = edge.get("confidence").and_then(|v| v.as_str())
+                    && !VALID_CONFIDENCES.contains(&conf) {
                         errors.push(format!(
                             "Edge {i} has invalid confidence '{conf}' \
                              — must be one of {VALID_CONFIDENCES:?}"
                         ));
                     }
-                }
-                if let Some(src) = edge.get("source").and_then(|v| v.as_str()) {
-                    if !node_ids.is_empty() && !node_ids.contains(src) {
+                if let Some(src) = edge.get("source").and_then(|v| v.as_str())
+                    && !node_ids.is_empty() && !node_ids.contains(src) {
                         errors.push(format!(
                             "Edge {i} source '{src}' does not match any node id"
                         ));
                     }
-                }
-                if let Some(tgt) = edge.get("target").and_then(|v| v.as_str()) {
-                    if !node_ids.is_empty() && !node_ids.contains(tgt) {
+                if let Some(tgt) = edge.get("target").and_then(|v| v.as_str())
+                    && !node_ids.is_empty() && !node_ids.contains(tgt) {
                         errors.push(format!(
                             "Edge {i} target '{tgt}' does not match any node id"
                         ));
                     }
-                }
             }
         }
         Some(_) => errors.push("'edges' must be a list".to_string()),

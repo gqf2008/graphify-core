@@ -124,12 +124,11 @@ fn community_fr_layout(
     for edge in &graph.edges {
         let src_comm = node_comm.get(edge.source.as_str());
         let tgt_comm = node_comm.get(edge.target.as_str());
-        if let (Some(&sc), Some(&tc)) = (src_comm, tgt_comm) {
-            if sc != tc {
+        if let (Some(&sc), Some(&tc)) = (src_comm, tgt_comm)
+            && sc != tc {
                 let key = (sc.min(tc), sc.max(tc));
                 *cross_weight.entry(key).or_insert(0.0) += edge.weight as f32;
             }
-        }
     }
 
     // Compute repulsion radii for hard-shell constraint

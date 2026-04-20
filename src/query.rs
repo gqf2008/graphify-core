@@ -196,14 +196,13 @@ pub fn path_text(
     };
 
     let hops = path_nodes.len().saturating_sub(1);
-    if let Some(limit) = max_hops {
-        if hops > limit {
+    if let Some(limit) = max_hops
+        && hops > limit {
             return Ok(format!(
                 "Path exceeds max_hops={} ({} hops found).",
                 limit, hops
             ));
         }
-    }
 
     let mut segments: Vec<String> = Vec::new();
     for (index, window) in path_nodes.windows(2).enumerate() {
@@ -884,11 +883,10 @@ fn is_file_node(node: &QueryNode, degree: usize) -> bool {
     if node.source_file.is_empty() {
         return false;
     }
-    if let Some(filename) = node.source_file.rsplit('/').next() {
-        if node.label == filename {
+    if let Some(filename) = node.source_file.rsplit('/').next()
+        && node.label == filename {
             return true;
         }
-    }
     if node.label.starts_with('.') && node.label.ends_with("()") {
         return true;
     }

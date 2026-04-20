@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
-use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use graphify_core::layout;
 use graphify_core::binary_schema;
 

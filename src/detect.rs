@@ -42,7 +42,7 @@ static CODE_EXTENSIONS: &[&str] = &[
     ".ejs",
 ];
 
-static DOC_EXTENSIONS: &[&str] = &[".md", ".txt", ".rst"];
+static DOC_EXTENSIONS: &[&str] = &[".md", ".mdx", ".html", ".txt", ".rst"];
 static PAPER_EXTENSIONS: &[&str] = &[".pdf"];
 static IMAGE_EXTENSIONS: &[&str] = &[".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"];
 static OFFICE_EXTENSIONS: &[&str] = &[".docx", ".xlsx"];

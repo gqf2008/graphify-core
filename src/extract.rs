@@ -1487,19 +1487,18 @@ fn handle_import(
                 let Some(raw) = node_text(path_node, source) else {
                     continue;
                 };
-                let module = raw
-                    .trim_matches('"')
-                    .split('/')
-                    .next_back()
-                    .unwrap_or(raw.as_str());
-                if module.is_empty() {
+                let pkg_path = raw.trim_matches('"');
+                if pkg_path.is_empty() {
                     continue;
                 }
+                // Prefix with "go_pkg_" so stdlib names (e.g. "context")
+                // don't collide with local files of the same basename. (#431)
+                let target_id = make_id(&format!("go_pkg_{}", pkg_path));
                 push_edge(
                     edges,
                     EdgeSpec {
                         source: file_id.to_string(),
-                        target: make_id(module),
+                        target: target_id,
                         relation: "imports_from".to_string(),
                         source_file: source_file.to_string(),
                         line_no: spec.start_position().row + 1,

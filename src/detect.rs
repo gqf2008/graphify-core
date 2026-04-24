@@ -69,6 +69,7 @@ static SKIP_DIRS: &[&str] = &[
     ".ruff_cache",
     ".tox",
     ".eggs",
+    "graphify-out",
 ];
 
 static SKIP_FILES: &[&str] = &[

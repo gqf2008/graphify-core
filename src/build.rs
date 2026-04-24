@@ -4,12 +4,13 @@ use rayon::prelude::*;
 use rustworkx_core::community::leiden_communities;
 use rustworkx_core::petgraph::graph::{NodeIndex, UnGraph};
 
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use crate::schema::{Edge, Node};
@@ -170,6 +171,153 @@ pub fn merge_extractions(extractions: &[serde_json::Value]) -> Graph {
         input_tokens,
         output_tokens,
     })
+}
+
+pub fn prune_dangling_edges(graph: &mut Graph) {
+    let node_ids: std::collections::HashSet<&str> =
+        graph.nodes.iter().map(|n| n.id.as_str()).collect();
+    graph
+        .edges
+        .retain(|edge| node_ids.contains(edge.source.as_str()) && node_ids.contains(edge.target.as_str()));
+}
+
+pub fn deduplicate_by_label(graph: &mut Graph) {
+    let mut label_to_canonical: HashMap<String, String> = HashMap::new();
+    let mut node_norms: HashMap<&str, String> = HashMap::new();
+    for node in &graph.nodes {
+        let norm = normalize_id(&node.label);
+        label_to_canonical
+            .entry(norm.clone())
+            .and_modify(|canonical| {
+                if !node.id.contains("_chunk") && node.id.len() < canonical.len() {
+                    *canonical = node.id.clone();
+                }
+            })
+            .or_insert_with(|| node.id.clone());
+        node_norms.insert(node.id.as_str(), norm);
+    }
+
+    let remap: HashMap<String, String> = graph
+        .nodes
+        .iter()
+        .map(|n| {
+            let norm = node_norms.get(n.id.as_str()).cloned().unwrap_or_else(|| normalize_id(&n.label));
+            let canonical = label_to_canonical.get(&norm).cloned().unwrap_or_else(|| n.id.clone());
+            (n.id.clone(), canonical)
+        })
+        .collect();
+
+    let canonical_set: HashSet<&str> = remap.values().map(|s| s.as_str()).collect();
+    graph.nodes.retain(|n| {
+        let canonical = remap.get(&n.id).map(|s| s.as_str()).unwrap_or(&n.id);
+        canonical == n.id || !canonical_set.contains(&n.id.as_str())
+    });
+    for node in &mut graph.nodes {
+        if let Some(canonical) = remap.get(&node.id) {
+            if *canonical != node.id {
+                node.id = canonical.clone();
+            }
+        }
+    }
+    for edge in &mut graph.edges {
+        if let Some(c) = remap.get(&edge.source) {
+            edge.source = c.clone();
+        }
+        if let Some(c) = remap.get(&edge.target) {
+            edge.target = c.clone();
+        }
+    }
+    graph.edges.retain(|e| e.source != e.target);
+}
+
+pub fn build_merge(
+    graph_paths: &[PathBuf],
+    output: Option<&Path>,
+) -> Result<Graph> {
+    use std::fs;
+
+    if graph_paths.len() < 2 {
+        bail!("at least two graph.json paths are required");
+    }
+
+    for path in graph_paths {
+        if !path.exists() {
+            bail!("not found: {}", path.display());
+        }
+    }
+
+    let mut merged_nodes: Vec<Node> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut all_edges: Vec<Edge> = Vec::new();
+    let mut all_hyperedges: Vec<serde_json::Value> = Vec::new();
+    let mut input_tokens: u32 = 0;
+    let mut output_tokens: u32 = 0;
+
+    for path in graph_paths {
+        let raw = fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).with_context(|| format!("invalid JSON in {}", path.display()))?;
+        let graph = coerce_graph(&value).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+
+        let repo_tag = path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or_else(|| {
+                path.parent()
+                    .and_then(|p| p.file_name())
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+            });
+
+        for mut node in graph.nodes {
+            if !seen_ids.insert(node.id.clone()) {
+                continue;
+            }
+            node.extra.insert(
+                "repo".to_string(),
+                serde_json::Value::String(repo_tag.to_string()),
+            );
+            merged_nodes.push(node);
+        }
+        all_edges.extend(graph.edges);
+        all_hyperedges.extend(graph.hyperedges);
+        input_tokens += graph.input_tokens;
+        output_tokens += graph.output_tokens;
+    }
+
+    let mut merged = normalize_graph(Graph {
+        nodes: merged_nodes,
+        edges: all_edges,
+        hyperedges: all_hyperedges,
+        neighbor_order: BTreeMap::new(),
+        input_tokens,
+        output_tokens,
+    });
+
+    deduplicate_by_label(&mut merged);
+    prune_dangling_edges(&mut merged);
+
+    if let Some(out_path) = output {
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let communities: HashMap<usize, Vec<String>> = HashMap::new();
+        let json_data = export_json_data(&merged, &communities);
+        fs::write(out_path, serde_json::to_string_pretty(&json_data)?)?;
+        eprintln!(
+            "Merged {} graphs → {} nodes, {} edges",
+            graph_paths.len(),
+            merged.nodes.len(),
+            merged.edges.len()
+        );
+        eprintln!("Written to: {}", out_path.display());
+    }
+
+    Ok(merged)
 }
 
 pub fn coerce_graph(value: &serde_json::Value) -> Result<Graph, serde_json::Error> {
@@ -440,6 +588,8 @@ pub struct SurprisingConnection {
     pub why: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence_score: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -458,13 +608,15 @@ pub struct AnalysisResult {
 }
 
 fn is_file_node(node: &Node, degree: usize) -> bool {
-    if node.source_file.is_empty() {
+    if node.label.is_empty() {
         return false;
     }
-    if let Some(filename) = node.source_file.rsplit('/').next()
-        && node.label == filename {
-            return true;
-        }
+    if !node.source_file.is_empty() {
+        if let Some(filename) = node.source_file.rsplit('/').next()
+            && node.label == filename {
+                return true;
+            }
+    }
     if node.label.starts_with('.') && node.label.ends_with("()") {
         return true;
     }
@@ -820,6 +972,7 @@ pub fn surprising_connections(
                         reasons.join("; ")
                     },
                     note: String::new(),
+                    confidence_score: edge.confidence_score,
                 },
             ));
         }
@@ -966,6 +1119,7 @@ fn cross_community_surprises(
                     relation: edge.relation.clone(),
                     why: String::new(),
                     note: format!("Bridges graph structure (betweenness={score:.3})"),
+                    confidence_score: edge.confidence_score,
                 })
             })
             .take(top_n)
@@ -1024,6 +1178,7 @@ fn cross_community_surprises(
                 relation: edge.relation.clone(),
                 why: format!("Bridges community {cid_u} → community {cid_v}"),
                 note: String::new(),
+                confidence_score: edge.confidence_score,
             },
         ));
     }
@@ -1959,6 +2114,21 @@ pub fn generate_report(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
+    let node_map: HashMap<&str, &Node> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let non_file_node_ids: HashSet<&str> = graph
+        .nodes
+        .iter()
+        .filter(|n| {
+            let d = *degree.get(n.id.as_str()).unwrap_or(&0);
+            !is_file_node(n, d)
+        })
+        .map(|n| n.id.as_str())
+        .collect();
+    let non_empty_count = communities
+        .iter()
+        .filter(|(_, nodes)| nodes.iter().any(|id| non_file_node_ids.contains(id.as_str())))
+        .count();
+
     lines.extend([
         String::new(),
         "## Summary".to_string(),
@@ -1966,7 +2136,7 @@ pub fn generate_report(
             "- {} nodes · {} edges · {} communities detected",
             graph.nodes.len(),
             report_edges.len(),
-            communities.len()
+            non_empty_count
         ),
         extraction_line,
         format!(
@@ -1982,6 +2152,11 @@ pub fn generate_report(
         let mut sorted_cids: Vec<usize> = communities.keys().copied().collect();
         sorted_cids.sort_unstable();
         for cid in sorted_cids {
+            let nodes = communities.get(&cid).cloned().unwrap_or_default();
+            let has_non_file = nodes.iter().any(|id| non_file_node_ids.contains(id.as_str()));
+            if !has_non_file {
+                continue;
+            }
             let label = community_labels
                 .get(&cid)
                 .cloned()
@@ -1998,7 +2173,7 @@ pub fn generate_report(
     lines.push("## God Nodes (most connected - your core abstractions)".to_string());
     for (idx, node) in god_node_list.iter().enumerate() {
         lines.push(format!(
-            "{}. `{}` - {} degree",
+            "{}. `{}` - {} edges",
             idx + 1,
             node.label,
             node.degree
@@ -2015,10 +2190,7 @@ pub fn generate_report(
         for surprise in surprise_list {
             let note = surprise.note.as_str();
             let conf_tag = if surprise.confidence == "INFERRED" {
-                let matching_edge = graph.edges.iter().find(|edge| {
-                    edge.confidence == "INFERRED" && edge.relation == surprise.relation
-                });
-                if let Some(score) = matching_edge.and_then(|edge| edge.confidence_score) {
+                if let Some(score) = surprise.confidence_score {
                     format!("INFERRED {:.2}", score)
                 } else {
                     surprise.confidence.clone()
@@ -2082,7 +2254,6 @@ pub fn generate_report(
 
     lines.push(String::new());
     lines.push("## Communities".to_string());
-    let node_map: HashMap<&str, &Node> = graph.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let mut sorted_cids: Vec<usize> = communities.keys().copied().collect();
     sorted_cids.sort_unstable();
     for cid in sorted_cids {
@@ -2094,16 +2265,12 @@ pub fn generate_report(
         let score = cohesion_scores.get(&cid).copied().unwrap_or(0.0);
         let real_nodes: Vec<String> = nodes
             .iter()
-            .filter_map(|node_id| {
-                let node = node_map.get(node_id.as_str()).copied()?;
-                let node_degree = *degree.get(node_id).unwrap_or(&0);
-                if is_file_node(node, node_degree) {
-                    None
-                } else {
-                    Some(node.label.clone())
-                }
-            })
+            .filter(|id| non_file_node_ids.contains(id.as_str()))
+            .filter_map(|node_id| node_map.get(node_id.as_str()).map(|n| n.label.clone()))
             .collect();
+        if real_nodes.is_empty() {
+            continue;
+        }
         let display = real_nodes
             .iter()
             .take(8)
@@ -2156,13 +2323,16 @@ pub fn generate_report(
         .nodes
         .iter()
         .filter(|node| {
-            let node_degree = *degree.get(node.id.as_str()).unwrap_or(&0);
-            node_degree <= 1 && !is_file_node(node, node_degree) && !is_concept_node(node)
+            let d = *degree.get(node.id.as_str()).unwrap_or(&0);
+            d <= 1 && non_file_node_ids.contains(node.id.as_str()) && !is_concept_node(node)
         })
         .collect();
     let mut thin_communities: Vec<(usize, Vec<String>)> = communities
         .iter()
-        .filter(|(_, nodes)| nodes.len() < 3)
+        .filter(|(_, nodes)| {
+            let non_file_count = nodes.iter().filter(|id| non_file_node_ids.contains(id.as_str())).count();
+            non_file_count > 0 && non_file_count < 3
+        })
         .map(|(&cid, nodes)| (cid, nodes.clone()))
         .collect();
     thin_communities.sort_by_key(|(cid, _)| *cid);
@@ -2625,12 +2795,29 @@ network.on('afterDrawing', function(ctx) {{
     )
 }
 
+const MAX_NODES_FOR_VIZ: usize = 5000;
+
+fn check_viz_limit(graph: &Graph) -> std::io::Result<()> {
+    if graph.nodes.len() > MAX_NODES_FOR_VIZ {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Graph has {} nodes, exceeds visualization limit of {}",
+                graph.nodes.len(),
+                MAX_NODES_FOR_VIZ
+            ),
+        ));
+    }
+    Ok(())
+}
+
 pub fn export_html_to_path(
     graph: &Graph,
     communities: &HashMap<usize, Vec<String>>,
     community_labels: &HashMap<usize, String>,
     output_path: &Path,
 ) -> std::io::Result<()> {
+    check_viz_limit(graph)?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -3873,6 +4060,7 @@ pub fn export_html_3d_to_path(
     community_labels: &HashMap<usize, String>,
     output_path: &Path,
 ) -> std::io::Result<()> {
+    check_viz_limit(graph)?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }

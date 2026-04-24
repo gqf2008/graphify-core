@@ -538,8 +538,21 @@ fn write_graph_outputs(
     let graph_json = serde_json::to_string_pretty(&graph_value)
         .context("cannot re-serialize graph.json after merge")?;
 
-    fs::write(&graph_path, graph_json)
-        .with_context(|| format!("cannot write {}", graph_path.display()))?;
+    // Shrink guard: refuse to overwrite graph.json with a smaller graph
+    let existing_node_count = fs::read_to_string(&graph_path).ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("nodes").and_then(|n| n.as_array()).map(|a| a.len()))
+        .unwrap_or(0);
+    if graph.nodes.len() < existing_node_count {
+        eprintln!(
+            "warning: new graph ({} nodes) is smaller than existing ({} nodes). \
+             Refusing to overwrite. Delete graphify-out/graph.json manually if intentional.",
+            graph.nodes.len(), existing_node_count
+        );
+    } else {
+        fs::write(&graph_path, graph_json)
+            .with_context(|| format!("cannot write {}", graph_path.display()))?;
+    }
     fs::write(&html_path, graph_html)
         .with_context(|| format!("cannot write {}", html_path.display()))?;
     fs::write(&report_path, report)

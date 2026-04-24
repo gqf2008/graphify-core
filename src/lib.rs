@@ -1,5 +1,6 @@
 pub mod binary_schema;
 pub mod build;
+pub mod clone;
 pub mod detect;
 pub mod extract;
 pub mod ingest;

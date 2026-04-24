@@ -414,6 +414,40 @@ enum Commands {
         json_output: bool,
     },
 
+    /// Clone a public GitHub repo and run the full graphify pipeline
+    Clone {
+        /// GitHub URL (e.g., https://github.com/owner/repo)
+        url: String,
+
+        /// Branch or tag to check out
+        #[arg(long)]
+        branch: Option<String>,
+
+        /// Output directory (clones here instead of ~/.graphify/repos)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Merge multiple graph.json files into one cross-repo graph
+    #[command(name = "merge-graphs")]
+    MergeGraphs {
+        /// Graph JSON files to merge
+        #[arg(required = true, num_args = 1..)]
+        graphs: Vec<PathBuf>,
+
+        /// Output path for merged graph (defaults to graphify-out/merged-graph.json)
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Check if semantic re-extraction is pending (cron-safe)
+    #[command(name = "check-update")]
+    CheckUpdate {
+        /// Root directory containing graphify-out/
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+
     #[command(hide = true, name = "detect")]
     Detect {
         root: PathBuf,
@@ -1118,6 +1152,25 @@ fn main() -> Result<()> {
                         added.path.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 }
+            }
+        }
+        Commands::Clone { url, branch, out } => {
+            let repo_dir = graphify_core::clone::clone_and_build(
+                &url,
+                branch.as_deref(),
+                out.as_deref(),
+            )?;
+            println!("{}", repo_dir.display());
+        }
+        Commands::MergeGraphs { graphs, out } => {
+            let output = out.clone().unwrap_or_else(|| PathBuf::from("graphify-out/merged-graph.json"));
+            graphify_core::build::build_merge(&graphs, Some(&output))?;
+        }
+        Commands::CheckUpdate { path } => {
+            let needs_update = path.join("graphify-out").join("needs_update");
+            if needs_update.exists() {
+                println!("[graphify check-update] Pending non-code changes in {}.", path.display());
+                println!("[graphify check-update] Run `graphify update .` or use /graphify --update to apply semantic re-extraction.");
             }
         }
         Commands::Detect {

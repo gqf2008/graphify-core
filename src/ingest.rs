@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -119,7 +120,13 @@ pub fn add_url(
                 kind: "image".to_string(),
             })
         }
-        UrlType::Youtube => bail!("Rust add does not ingest YouTube directly; use Python fallback"),
+        UrlType::Youtube => {
+            let out = download_youtube_audio(url, target_dir)?;
+            Ok(AddedFile {
+                path: out,
+                kind: "youtube".to_string(),
+            })
+        }
         UrlType::Tweet => {
             let (content, filename) = fetch_tweet(url, author, contributor)?;
             let out = save_text_file(target_dir, &filename, &content)?;
@@ -288,6 +295,7 @@ fn run_curl(url: &str, max_time_secs: u32) -> Result<Vec<u8>> {
 }
 
 fn safe_fetch(url: &str, max_bytes: usize, timeout_secs: u32) -> Result<Vec<u8>> {
+    validate_url(url)?;
     let bytes = run_curl(url, timeout_secs)?;
     if bytes.len() > max_bytes {
         bail!(
@@ -302,6 +310,115 @@ fn safe_fetch(url: &str, max_bytes: usize, timeout_secs: u32) -> Result<Vec<u8>>
 fn safe_fetch_text(url: &str, max_bytes: usize, timeout_secs: u32) -> Result<String> {
     let bytes = safe_fetch(url, max_bytes, timeout_secs)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+const MAX_LABEL_LEN: usize = 256;
+
+/// Strip ASCII control characters and cap label length.
+pub fn sanitize_label(text: Option<&str>) -> String {
+    let text = text.unwrap_or("");
+    let text: String = text
+        .chars()
+        .filter(|&c| {
+            let code = c as u32;
+            !(code <= 0x1f || code == 0x7f)
+        })
+        .collect();
+    text.chars().take(MAX_LABEL_LEN).collect()
+}
+
+/// Resolve *path* and verify it stays inside *base*.
+///
+/// *base* defaults to the `graphify-out` directory relative to CWD.
+/// Raises an error if the path escapes base or if the file does not exist.
+pub fn validate_graph_path(path: &Path, base: Option<&Path>) -> Result<PathBuf> {
+    let base = match base {
+        Some(b) => b.to_path_buf(),
+        None => {
+            let hint = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            let mut found = None;
+            for candidate in
+                std::iter::once(hint.clone()).chain(hint.ancestors().skip(1).map(|p| p.to_path_buf()))
+            {
+                if candidate.file_name() == Some(std::ffi::OsStr::new("graphify-out")) {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join("graphify-out")
+            })
+        }
+    };
+
+    if !base.exists() {
+        bail!(
+            "Graph base directory does not exist: {}. Run /graphify first to build the graph.",
+            base.display()
+        );
+    }
+
+    let base = base.canonicalize()
+        .with_context(|| format!("cannot resolve base: {}", base.display()))?;
+
+    // Try canonicalize first (resolves symlinks); fall back to manual normalization
+    // so that non-existent paths with `..` components still get checked for escapes.
+    let resolved = path.canonicalize().unwrap_or_else(|_| {
+        let normalized = normalize_path(&if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        });
+        // Walk up and canonicalize the deepest existing ancestor so that
+        // macOS /private prefixes stay aligned with the canonicalized base.
+        let mut current = normalized.as_path();
+        while let Some(parent) = current.parent() {
+            if let Ok(canonical) = parent.canonicalize() {
+                let suffix = normalized.strip_prefix(parent).unwrap_or(Path::new(""));
+                return canonical.join(suffix);
+            }
+            current = parent;
+        }
+        normalized
+    });
+
+    if !resolved.starts_with(&base) {
+        bail!(
+            "Path {} escapes the allowed directory {}. Only paths inside graphify-out/ are permitted.",
+            resolved.display(),
+            base.display()
+        );
+    }
+
+    if !resolved.exists() {
+        bail!("Graph file not found: {}", resolved.display());
+    }
+
+    Ok(resolved)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(p) => result.push(p.as_os_str()),
+            std::path::Component::RootDir => result.push("/"),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::Normal(name) => result.push(name),
+        }
+    }
+    result
 }
 
 fn yaml_str(text: &str) -> String {
@@ -472,6 +589,81 @@ fn fetch_arxiv(
     Ok((content, format!("arxiv_{}.md", arxiv_id.replace('.', "_"))))
 }
 
+fn find_yt_dlp() -> Option<String> {
+    if let Ok(explicit) = env::var("GRAPHIFY_YT_DLP_BIN")
+        && !explicit.trim().is_empty()
+    {
+        return Some(explicit);
+    }
+    // Try yt-dlp first, then youtube-dl
+    for cmd in ["yt-dlp", "youtube-dl"] {
+        if Command::new(cmd).arg("--version").output().is_ok() {
+            return Some(cmd.to_string());
+        }
+    }
+    None
+}
+
+fn download_youtube_audio(url: &str, target_dir: &Path) -> Result<PathBuf> {
+    let yt_dlp = find_yt_dlp()
+        .ok_or_else(|| anyhow!("yt-dlp not found. Install it to ingest YouTube URLs: https://github.com/yt-dlp/yt-dlp"))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(url.as_bytes());
+    let url_hash = hex::encode(hasher.finalize())[..12].to_string();
+
+    let out_template = target_dir.join(format!("yt_{url_hash}.%(ext)s"));
+    let _ = fs::create_dir_all(target_dir);
+
+    // Check for already-downloaded file
+    let candidates = ["m4a", "opus", "mp3", "ogg", "wav", "webm"];
+    for ext in &candidates {
+        let candidate = target_dir.join(format!("yt_{url_hash}.{ext}"));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    let output = Command::new(&yt_dlp)
+        .args([
+            "--format", "bestaudio[ext=m4a]/bestaudio/best",
+            "--outtmpl", &out_template.to_string_lossy(),
+            "--quiet",
+            "--no-warnings",
+            "--noplaylist",
+            "--no-post-overwrites",
+            url,
+        ])
+        .output()
+        .with_context(|| format!("failed to execute {yt_dlp} for {url}"))?;
+
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("{yt_dlp} failed for {url:?}: {detail}")
+    }
+
+    // yt-dlp may have picked a different extension than expected
+    for ext in &candidates {
+        let candidate = target_dir.join(format!("yt_{url_hash}.{ext}"));
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    // Fallback: glob the directory for any yt_<hash>.* file
+    if let Ok(entries) = fs::read_dir(target_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(&format!("yt_{url_hash}.")) {
+                return Ok(entry.path());
+            }
+        }
+    }
+
+    bail!("yt-dlp reported success but no output file found for {url:?}")
+}
+
 fn download_binary(url: &str, suffix: &str, target_dir: &Path) -> Result<PathBuf> {
     let filename = safe_filename(url, suffix);
     let out_path = unique_target_path(target_dir, &filename)?;
@@ -562,9 +754,54 @@ mod tests {
         );
         assert_eq!(detect_url_type("https://youtu.be/abc"), UrlType::Youtube);
         assert_eq!(
+            detect_url_type("https://youtube.com/watch?v=abc"),
+            UrlType::Youtube
+        );
+        assert_eq!(
             detect_url_type("https://example.invalid/page"),
             UrlType::Webpage
         );
+        assert_eq!(
+            detect_url_type("https://github.com/owner/repo"),
+            UrlType::Github
+        );
+        assert_eq!(
+            detect_url_type("https://twitter.com/user/status/123"),
+            UrlType::Tweet
+        );
+    }
+
+    #[test]
+    fn validate_url_accepts_http() {
+        assert!(validate_url("http://example.com/page").is_ok());
+    }
+
+    #[test]
+    fn validate_url_accepts_https() {
+        assert!(validate_url("https://arxiv.org/abs/1706.03762").is_ok());
+    }
+
+    #[test]
+    fn validate_url_rejects_file() {
+        let err = validate_url("file:///etc/passwd").unwrap_err().to_string();
+        assert!(err.contains("file") || err.contains("scheme"), "expected scheme error, got: {err}");
+    }
+
+    #[test]
+    fn validate_url_rejects_ftp() {
+        let err = validate_url("ftp://files.example.com/data.zip").unwrap_err().to_string();
+        assert!(err.contains("ftp") || err.contains("scheme"), "expected scheme error, got: {err}");
+    }
+
+    #[test]
+    fn validate_url_rejects_data() {
+        let err = validate_url("data:text/html,<script>alert(1)</script>").unwrap_err().to_string();
+        assert!(err.contains("data") || err.contains("scheme"), "expected scheme error, got: {err}");
+    }
+
+    #[test]
+    fn validate_url_rejects_empty_scheme() {
+        assert!(validate_url("//no-scheme.example.com").is_err());
     }
 
     #[test]
@@ -572,6 +809,24 @@ mod tests {
         assert!(validate_url("file:///tmp/test").is_err());
         assert!(validate_url("http://127.0.0.1/test").is_err());
         assert!(validate_url("http://localhost/test").is_err());
+    }
+
+    #[test]
+    fn safe_fetch_rejects_file_url() {
+        let err = safe_fetch("file:///etc/passwd", MAX_FETCH_BYTES, 30).unwrap_err().to_string();
+        assert!(err.contains("file") || err.contains("scheme"), "expected scheme error, got: {err}");
+    }
+
+    #[test]
+    fn safe_fetch_rejects_ftp_url() {
+        let err = safe_fetch("ftp://example.com/file.zip", MAX_FETCH_BYTES, 30).unwrap_err().to_string();
+        assert!(err.contains("ftp") || err.contains("scheme"), "expected scheme error, got: {err}");
+    }
+
+    #[test]
+    fn safe_fetch_text_rejects_file_url() {
+        let err = safe_fetch_text("file:///etc/passwd", MAX_TEXT_BYTES, 15).unwrap_err().to_string();
+        assert!(err.contains("file") || err.contains("scheme"), "expected scheme error, got: {err}");
     }
 
     #[test]
@@ -622,5 +877,86 @@ mod tests {
         assert!(content.contains("# Example Title"));
         assert!(content.contains("Source: https://docs.example/page"));
         assert!(content.contains("Hello world"));
+    }
+
+    #[test]
+    fn sanitize_label_passthrough_html_chars() {
+        assert_eq!(sanitize_label(Some("<script>")), "<script>");
+        assert_eq!(sanitize_label(Some("foo & bar")), "foo & bar");
+    }
+
+    #[test]
+    fn sanitize_label_strips_control_chars() {
+        let result = sanitize_label(Some("hello\x00\x1fworld"));
+        assert!(!result.contains('\x00'));
+        assert!(!result.contains('\x1f'));
+        assert!(result.contains("helloworld"));
+    }
+
+    #[test]
+    fn sanitize_label_caps_at_256() {
+        let long_label = "a".repeat(300);
+        assert!(sanitize_label(Some(&long_label)).len() <= 256);
+    }
+
+    #[test]
+    fn sanitize_label_safe_passthrough() {
+        assert_eq!(sanitize_label(Some("MyClass")), "MyClass");
+        assert_eq!(sanitize_label(Some("extract_python")), "extract_python");
+    }
+
+    #[test]
+    fn sanitize_label_none_returns_empty() {
+        assert_eq!(sanitize_label(None), "");
+    }
+
+    #[test]
+    fn validate_graph_path_allows_inside_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("graphify-out");
+        fs::create_dir_all(&base).unwrap();
+        let graph = base.join("graph.json");
+        fs::write(&graph, "{}").unwrap();
+        let result = validate_graph_path(&graph, Some(&base)).unwrap();
+        assert_eq!(result, graph.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn validate_graph_path_blocks_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("graphify-out");
+        fs::create_dir_all(&base).unwrap();
+        let evil = base.join("..").join("etc_passwd");
+        let err = validate_graph_path(&evil, Some(&base))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("escapes"), "expected path escape error, got: {err}");
+    }
+
+    #[test]
+    fn validate_graph_path_requires_base_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("graphify-out");
+        let err = validate_graph_path(&base.join("graph.json"), Some(&base))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not exist"),
+            "expected base missing error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_graph_path_raises_if_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("graphify-out");
+        fs::create_dir_all(&base).unwrap();
+        let err = validate_graph_path(&base.join("missing.json"), Some(&base))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("not found") || err.contains("No such file"),
+            "expected file not found error, got: {err}"
+        );
     }
 }

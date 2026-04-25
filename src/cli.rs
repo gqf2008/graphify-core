@@ -414,6 +414,29 @@ enum Commands {
         json_output: bool,
     },
 
+    /// Transcribe audio/video files to .txt using a local Whisper CLI
+    Transcribe {
+        /// Audio or video file paths to transcribe
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<PathBuf>,
+
+        /// Output directory for transcripts
+        #[arg(long = "output-dir", default_value = "graphify-out/transcripts")]
+        output_dir: PathBuf,
+
+        /// Whisper model name (default: base)
+        #[arg(long, default_value = "base")]
+        model: String,
+
+        /// Initial prompt / domain hint for Whisper
+        #[arg(long)]
+        prompt: Option<String>,
+
+        /// Re-transcribe even if transcript already exists
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+
     /// Clone a public GitHub repo and run the full graphify pipeline
     Clone {
         /// GitHub URL (e.g., https://github.com/owner/repo)
@@ -490,6 +513,24 @@ enum Commands {
 
     #[command(hide = true, name = "export-cypher")]
     ExportCypher {},
+
+    #[command(hide = true, name = "export-neo4j")]
+    ExportNeo4j {
+        #[arg(long, default_value = "graphify-out/graph.json")]
+        graph: PathBuf,
+
+        #[arg(long, default_value = "http://localhost:7474")]
+        uri: String,
+
+        #[arg(long, default_value = "neo4j")]
+        user: String,
+
+        #[arg(long)]
+        password: String,
+
+        #[arg(long)]
+        database: Option<String>,
+    },
 
     #[command(hide = true, name = "export-graphml")]
     ExportGraphml {},
@@ -1154,6 +1195,32 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Commands::Transcribe {
+            paths,
+            output_dir,
+            model,
+            prompt,
+            force,
+        } => {
+            unsafe {
+                std::env::set_var("GRAPHIFY_WHISPER_MODEL", model);
+            }
+            let mut ok = 0;
+            for p in &paths {
+                match graphify_core::transcribe::transcribe(p, Some(&output_dir), prompt.as_deref(), force) {
+                    Ok(t) => {
+                        println!("{}", t.display());
+                        ok += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("[graphify transcribe] Failed {}: {e}", p.display());
+                    }
+                }
+            }
+            if ok != paths.len() {
+                eprintln!("Warning: {} of {} file(s) failed to transcribe.", paths.len() - ok, paths.len());
+            }
+        }
         Commands::Clone { url, branch, out } => {
             let repo_dir = graphify_core::clone::clone_and_build(
                 &url,
@@ -1279,6 +1346,31 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&json!({ "content": content }))?
             );
+        }
+        Commands::ExportNeo4j {
+            graph,
+            uri,
+            user,
+            password,
+            database,
+        } => {
+            let text = std::fs::read_to_string(&graph)
+                .with_context(|| format!("cannot read graph file: {}", graph.display()))?;
+            let raw: Value = serde_json::from_str(&text)?;
+            let graph_value = raw.get("graph").unwrap_or(&raw).clone();
+            let g = parse_graph_value(&graph_value)?;
+            let communities: Option<HashMap<usize, Vec<String>>> = raw
+                .get("communities")
+                .and_then(|c| serde_json::from_value(c.clone()).ok());
+            let (nodes, edges) = graphify_core::build::push_to_neo4j(
+                &g,
+                &uri,
+                &user,
+                &password,
+                database.as_deref(),
+                communities.as_ref(),
+            )?;
+            println!("Pushed {} nodes and {} edges to Neo4j.", nodes, edges);
         }
         Commands::ExportGraphml {} => {
             let mut stdin = String::new();

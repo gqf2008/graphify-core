@@ -69,6 +69,25 @@ enum Commands {
     /// Export Neo4j Cypher text
     ExportCypher {},
 
+    /// Push graph nodes and edges to a Neo4j database
+    ExportNeo4j {
+        /// Neo4j URI (e.g. http://localhost:7474)
+        #[arg(long, default_value = "http://localhost:7474")]
+        uri: String,
+
+        /// Neo4j username
+        #[arg(long, default_value = "neo4j")]
+        user: String,
+
+        /// Neo4j password
+        #[arg(long)]
+        password: String,
+
+        /// Neo4j database name
+        #[arg(long)]
+        database: Option<String>,
+    },
+
     /// Export GraphML text
     ExportGraphml {},
 
@@ -486,6 +505,32 @@ fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({ "content": content }))?
+            );
+        }
+        Commands::ExportNeo4j {
+            uri,
+            user,
+            password,
+            database,
+        } => {
+            let mut stdin = String::new();
+            std::io::stdin().read_to_string(&mut stdin)?;
+            if stdin.trim().is_empty() {
+                bail!("export-neo4j expects graph JSON on stdin");
+            }
+            let input: ExportJsonInput = serde_json::from_str(&stdin)?;
+            let graph = parse_graph_value(&input.graph)?;
+            let (nodes, edges) = build::push_to_neo4j(
+                &graph,
+                &uri,
+                &user,
+                &password,
+                database.as_deref(),
+                Some(&input.communities),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "nodes_pushed": nodes, "edges_pushed": edges }))?
             );
         }
         Commands::ExportGraphml {} => {

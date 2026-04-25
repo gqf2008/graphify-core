@@ -264,4 +264,27 @@ mod tests {
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Extraction JSON has"));
     }
+
+    #[test]
+    fn test_not_a_dict() {
+        let data = serde_json::json!(["not", "a", "dict"]);
+        let errs = validate_extraction(&data);
+        assert_eq!(errs.len(), 1);
+    }
+
+    #[test]
+    fn test_assert_valid_passes_silently() {
+        let data = serde_json::json!({
+            "nodes": [valid_node(), {
+                "id": "n2",
+                "label": "B",
+                "file_type": "code",
+                "source_file": "b.py"
+            }],
+            "edges": [valid_edge()],
+            "input_tokens": 0,
+            "output_tokens": 0
+        });
+        assert!(assert_valid(&data).is_ok());
+    }
 }

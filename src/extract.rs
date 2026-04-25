@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use tree_sitter::{Language, Node as TsNode, Parser};
 
+use crate::cache;
 use crate::detect::{FileType, classify_file};
 use crate::schema::{Edge, Extraction, FunctionReturn, Node, RawCall};
 
@@ -564,6 +565,65 @@ pub fn extract_paths(paths: &[String]) -> Result<Extraction> {
 
     resolve_cross_file_calls(&mut combined);
 
+    Ok(combined)
+}
+
+/// Extract paths with per-file caching.
+///
+/// For each path, checks `graphify-out/cache/` first. If a cached extraction
+/// exists and the file hash matches, the cached result is used directly.
+/// Uncached files are extracted normally and the results are saved back to
+/// cache keyed by source_file.
+pub fn extract_paths_cached(paths: &[String], cache_root: &Path) -> Result<Extraction> {
+    if paths.is_empty() {
+        return Ok(Extraction::default());
+    }
+
+    // Split into cached and uncached.
+    let mut combined = Extraction::default();
+    let mut uncached: Vec<String> = Vec::new();
+
+    for path_str in paths {
+        let path = Path::new(path_str);
+        match cache::load_cached(path, cache_root) {
+            Some(cached) => append_extraction(&mut combined, cached),
+            None => uncached.push(path_str.clone()),
+        }
+    }
+
+    if uncached.is_empty() {
+        return Ok(combined);
+    }
+
+    let fresh = extract_paths(&uncached)?;
+
+    // Save per-file results to cache.
+    let mut by_file: HashMap<PathBuf, Extraction> = HashMap::new();
+    for node in &fresh.nodes {
+        let src = PathBuf::from(&node.source_file);
+        by_file.entry(src).or_default().nodes.push(node.clone());
+    }
+    for edge in &fresh.edges {
+        let src = PathBuf::from(&edge.source_file);
+        by_file.entry(src).or_default().edges.push(edge.clone());
+    }
+    for hyperedge in &fresh.hyperedges {
+        if let Some(src) = hyperedge.get("source_file").and_then(|v| v.as_str()) {
+            by_file.entry(PathBuf::from(src)).or_default().hyperedges.push(hyperedge.clone());
+        }
+    }
+    for (fpath, per_file) in by_file {
+        let abs = if fpath.is_absolute() {
+            fpath
+        } else {
+            cache_root.join(fpath)
+        };
+        if abs.is_file() {
+            let _ = cache::save_cached(&abs, &per_file, cache_root);
+        }
+    }
+
+    append_extraction(&mut combined, fresh);
     Ok(combined)
 }
 

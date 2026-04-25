@@ -65,4 +65,9 @@ pdf-extract = "0.10.0"
 docx-lite = "0.2.0"
 calamine = "0.34.0"
 bincode = { version = "2", features = ["serde"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
 

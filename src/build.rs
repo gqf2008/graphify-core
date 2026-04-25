@@ -6,6 +6,7 @@ use rustworkx_core::petgraph::graph::{NodeIndex, UnGraph};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -174,7 +175,7 @@ pub fn merge_extractions(extractions: &[serde_json::Value]) -> Graph {
 }
 
 pub fn prune_dangling_edges(graph: &mut Graph) {
-    let node_ids: std::collections::HashSet<&str> =
+    let node_ids: HashSet<&str> =
         graph.nodes.iter().map(|n| n.id.as_str()).collect();
     graph
         .edges
@@ -183,49 +184,39 @@ pub fn prune_dangling_edges(graph: &mut Graph) {
 
 pub fn deduplicate_by_label(graph: &mut Graph) {
     let mut label_to_canonical: HashMap<String, String> = HashMap::new();
-    let mut node_norms: HashMap<&str, String> = HashMap::new();
     for node in &graph.nodes {
         let norm = normalize_id(&node.label);
         label_to_canonical
-            .entry(norm.clone())
+            .entry(norm)
             .and_modify(|canonical| {
                 if !node.id.contains("_chunk") && node.id.len() < canonical.len() {
                     *canonical = node.id.clone();
                 }
             })
             .or_insert_with(|| node.id.clone());
-        node_norms.insert(node.id.as_str(), norm);
     }
 
+    // Only store non-identity remappings
     let remap: HashMap<String, String> = graph
         .nodes
         .iter()
-        .map(|n| {
-            let norm = node_norms.get(n.id.as_str()).cloned().unwrap_or_else(|| normalize_id(&n.label));
+        .filter_map(|n| {
+            let norm = normalize_id(&n.label);
             let canonical = label_to_canonical.get(&norm).cloned().unwrap_or_else(|| n.id.clone());
-            (n.id.clone(), canonical)
+            if canonical == n.id { None } else { Some((n.id.clone(), canonical)) }
         })
         .collect();
 
-    let canonical_set: HashSet<&str> = remap.values().map(|s| s.as_str()).collect();
-    graph.nodes.retain(|n| {
-        let canonical = remap.get(&n.id).map(|s| s.as_str()).unwrap_or(&n.id);
-        canonical == n.id || !canonical_set.contains(&n.id.as_str())
-    });
+    let remap_targets: HashSet<&str> = remap.values().map(|s| s.as_str()).collect();
+    graph.nodes.retain(|n| !remap.contains_key(&n.id) || remap_targets.contains(&n.id.as_str()));
     for node in &mut graph.nodes {
-        if let Some(canonical) = remap.get(&node.id) {
-            if *canonical != node.id {
-                node.id = canonical.clone();
-            }
+        if let Some(canonical) = remap.get(&node.id).filter(|c| **c != node.id) {
+            node.id = canonical.clone();
         }
     }
     for edge in &mut graph.edges {
-        if let Some(c) = remap.get(&edge.source) {
-            edge.source = c.clone();
-        }
-        if let Some(c) = remap.get(&edge.target) {
-            edge.target = c.clone();
-        }
+        if let Some(c) = remap.get(&edge.source) { edge.source = c.clone(); }
+        if let Some(c) = remap.get(&edge.target) { edge.target = c.clone(); }
     }
     graph.edges.retain(|e| e.source != e.target);
 }
@@ -234,16 +225,8 @@ pub fn build_merge(
     graph_paths: &[PathBuf],
     output: Option<&Path>,
 ) -> Result<Graph> {
-    use std::fs;
-
     if graph_paths.len() < 2 {
         bail!("at least two graph.json paths are required");
-    }
-
-    for path in graph_paths {
-        if !path.exists() {
-            bail!("not found: {}", path.display());
-        }
     }
 
     let mut merged_nodes: Vec<Node> = Vec::new();
@@ -451,7 +434,6 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
         }
         next_label = groups.keys().copied().max().map(|m| m + 1).unwrap_or(0);
     }
-    // Debug removed
 
     for isolate_idx in isolates {
         groups.entry(next_label).or_default().push(isolate_idx);
@@ -460,7 +442,6 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
 
     let mut final_communities: Vec<Vec<String>> = Vec::new();
     let max_size = std::cmp::max(MIN_SPLIT_SIZE, (n as f64 * MAX_COMMUNITY_FRACTION) as usize);
-    // Debug removed
 
     for members in groups.into_values() {
         let nodes: Vec<String> = members.into_iter().map(|idx| graph.nodes[idx].id.clone()).collect();
@@ -476,7 +457,6 @@ pub fn cluster(graph: &Graph) -> HashMap<usize, Vec<String>> {
         }
     }
 
-    // Debug removed
     let indexed_communities: Vec<Vec<usize>> = final_communities
         .into_iter()
         .map(|nodes| {
@@ -611,11 +591,10 @@ fn is_file_node(node: &Node, degree: usize) -> bool {
     if node.label.is_empty() {
         return false;
     }
-    if !node.source_file.is_empty() {
-        if let Some(filename) = node.source_file.rsplit('/').next()
-            && node.label == filename {
-                return true;
-            }
+    if !node.source_file.is_empty()
+        && node.source_file.rsplit('/').next().is_some_and(|f| f == node.label)
+    {
+        return true;
     }
     if node.label.starts_with('.') && node.label.ends_with("()") {
         return true;
@@ -1200,7 +1179,7 @@ fn cross_community_surprises(
 fn file_category(path: &str) -> &'static str {
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     match ext.as_str() {
-        "py" | "js" | "ts" | "tsx" | "go" | "rs" | "java" | "c" | "h" | "cpp" | "cc" | "cxx"
+        "py" | "js" | "jsx" | "mjs" | "ts" | "tsx" | "go" | "rs" | "java" | "c" | "h" | "cpp" | "cc" | "cxx"
         | "hpp" | "rb" | "cs" | "kt" | "kts" | "scala" | "php" | "swift" | "lua" | "toc"
         | "zig" | "ps1" | "ex" | "exs" | "m" | "mm" | "jl" | "vue" | "svelte" | "dart" | "v"
         | "sv" | "svh" => "code",
@@ -5347,6 +5326,186 @@ pub fn export_cypher(graph: &Graph) -> String {
     lines.join("\n")
 }
 
+/// Push graph nodes and edges directly to a Neo4j instance via the HTTP
+/// transaction API (Bolt-compatible endpoint).
+///
+/// Requires Neo4j HTTP connector to be enabled (`dbms.connector.http.enabled=true`).
+/// Returns `(nodes_pushed, edges_pushed)`.
+pub fn push_to_neo4j(
+    graph: &Graph,
+    uri: &str,
+    user: &str,
+    password: &str,
+    database: Option<&str>,
+    communities: Option<&HashMap<usize, Vec<String>>>,
+) -> Result<(usize, usize)> {
+    const BATCH_SIZE: usize = 100;
+
+    let client = reqwest::blocking::Client::new();
+    let db = database.unwrap_or("neo4j");
+    let url = format!("{}/db/{}/tx/commit", uri.trim_end_matches('/'), db);
+
+    let auth = format!("{}:{}", user, password);
+    let auth_header = format!(
+        "Basic {}",
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, auth)
+    );
+
+    let node_community: HashMap<&str, usize> = communities
+        .map(|c| {
+            c.iter()
+                .flat_map(|(&cid, nodes)| nodes.iter().map(move |n| (n.as_str(), cid)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    fn send_batch(
+        client: &reqwest::blocking::Client,
+        url: &str,
+        auth_header: &str,
+        statements: Vec<Value>,
+    ) -> Result<()> {
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let body = json!({ "statements": statements });
+        let resp = client
+            .post(url)
+            .header("Authorization", auth_header)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .with_context(|| "Neo4j batch request failed")?;
+
+        if !resp.status().is_success() {
+            let text = resp.text().unwrap_or_default();
+            bail!("Neo4j batch error: {}", text);
+        }
+
+        let resp_json: Value = resp.json().with_context(|| "Neo4j response is not valid JSON")?;
+        if let Some(errors) = resp_json.get("errors").and_then(Value::as_array)
+            && !errors.is_empty()
+        {
+            let msg = errors
+                .first()
+                .and_then(|e| e.get("message").and_then(Value::as_str))
+                .unwrap_or("unknown Neo4j error");
+            bail!("Neo4j batch error: {}", msg);
+        }
+        Ok(())
+    }
+
+    let mut nodes_pushed = 0usize;
+    let mut node_batch: Vec<Value> = Vec::with_capacity(BATCH_SIZE);
+    for node in &graph.nodes {
+        let raw_ftype: String = node
+            .file_type
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        let mut ftype = if raw_ftype.is_empty() {
+            "Entity".to_string()
+        } else {
+            raw_ftype
+        };
+        if !ftype
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+        {
+            ftype = "Entity".to_string();
+        }
+        let mut props = serde_json::Map::new();
+        props.insert("id".into(), json!(&node.id));
+        props.insert("label".into(), json!(&node.label));
+        props.insert("file_type".into(), json!(&node.file_type));
+        props.insert("source_file".into(), json!(&node.source_file));
+        if let Some(loc) = &node.source_location {
+            props.insert("source_location".into(), json!(loc));
+        }
+        if let Some(nt) = &node.node_type {
+            props.insert("node_type".into(), json!(nt));
+        }
+        if let Some(ds) = &node.docstring {
+            props.insert("docstring".into(), json!(ds));
+        }
+        if let Some(sig) = &node.signature {
+            props.insert("signature".into(), json!(sig));
+        }
+        for (k, v) in &node.extra {
+            props.insert(k.clone(), v.clone());
+        }
+        if let Some(&cid) = node_community.get(node.id.as_str()) {
+            props.insert("community".into(), json!(cid));
+        }
+
+        node_batch.push(json!({
+            "statement": format!("MERGE (n:{} {{id: $id}}) SET n += $props", ftype),
+            "parameters": { "id": &node.id, "props": props }
+        }));
+        nodes_pushed += 1;
+
+        if node_batch.len() >= BATCH_SIZE {
+            send_batch(&client, &url, &auth_header, std::mem::take(&mut node_batch))?;
+        }
+    }
+    send_batch(&client, &url, &auth_header, std::mem::take(&mut node_batch))?;
+
+    let mut edges_pushed = 0usize;
+    let mut edge_batch: Vec<Value> = Vec::with_capacity(BATCH_SIZE);
+    for edge in &graph.edges {
+        let relation: String = edge
+            .relation
+            .to_uppercase()
+            .replace([' ', '-'], "_")
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '_' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let rel = if relation.is_empty() {
+            "RELATED_TO".to_string()
+        } else {
+            relation
+        };
+
+        let mut props = serde_json::Map::new();
+        props.insert("relation".into(), json!(&edge.relation));
+        props.insert("confidence".into(), json!(&edge.confidence));
+        props.insert("source_file".into(), json!(&edge.source_file));
+        if let Some(loc) = &edge.source_location {
+            props.insert("source_location".into(), json!(loc));
+        }
+        if let Some(score) = edge.confidence_score {
+            props.insert("confidence_score".into(), json!(score));
+        }
+        props.insert("weight".into(), json!(edge.weight));
+        for (k, v) in &edge.extra {
+            props.insert(k.clone(), v.clone());
+        }
+
+        edge_batch.push(json!({
+            "statement": format!(
+                "MATCH (a {{id: $src}}), (b {{id: $tgt}}) MERGE (a)-[r:{}]->(b) SET r += $props",
+                rel
+            ),
+            "parameters": { "src": &edge.source, "tgt": &edge.target, "props": props }
+        }));
+        edges_pushed += 1;
+
+        if edge_batch.len() >= BATCH_SIZE {
+            send_batch(&client, &url, &auth_header, std::mem::take(&mut edge_batch))?;
+        }
+    }
+    send_batch(&client, &url, &auth_header, std::mem::take(&mut edge_batch))?;
+
+    Ok((nodes_pushed, edges_pushed))
+}
+
 pub fn export_graphml(graph: &Graph, communities: &HashMap<usize, Vec<String>>) -> String {
     let node_community: HashMap<&str, usize> = communities
         .iter()
@@ -5441,13 +5600,28 @@ pub fn score_all(graph: &Graph, communities: &HashMap<usize, Vec<String>>) -> Ha
         .collect()
 }
 
+pub fn export_binary(
+    graph: &Graph,
+    communities: &HashMap<usize, Vec<String>>,
+    community_labels: &HashMap<usize, String>,
+    output_path: &Path,
+) -> anyhow::Result<usize> {
+    let layout = crate::layout::compute_layout(graph, communities);
+    let data = crate::binary_schema::encode(graph, communities, community_labels, &layout);
+    let size = data.len();
+    fs::write(output_path, &data)
+        .map_err(|e| anyhow::anyhow!("cannot write {}: {}", output_path.display(), e))?;
+    Ok(size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Graph, build_wiki_export_context, cluster, coerce_graph, community_wiki_article,
-        export_canvas_data, export_html, export_html_3d, export_json_data, export_svg,
-        god_node_wiki_article, god_nodes, merge_extractions,
-        suggest_questions, surprising_connections,
+        Graph, GodNode, build_wiki_export_context,
+        cluster, cohesion_score, coerce_graph, community_wiki_article, export_canvas_data,
+        export_html, export_html_3d, export_json_data, export_svg, file_category,
+        generate_report, god_node_wiki_article, god_nodes, is_concept_node,
+        merge_extractions, score_all, suggest_questions, surprising_connections,
     };
     use crate::schema::{Edge, Node};
     use serde_json::json;
@@ -6250,18 +6424,262 @@ mod tests {
         assert!(html.contains("OrbitControls"));
         assert!(html.contains("zoomToFit"));
     }
-}
 
-pub fn export_binary(
-    graph: &Graph,
-    communities: &HashMap<usize, Vec<String>>,
-    community_labels: &HashMap<usize, String>,
-    output_path: &Path,
-) -> anyhow::Result<usize> {
-    let layout = crate::layout::compute_layout(graph, communities);
-    let data = crate::binary_schema::encode(graph, communities, community_labels, &layout);
-    let size = data.len();
-    fs::write(output_path, &data)
-        .map_err(|e| anyhow::anyhow!("cannot write {}: {}", output_path.display(), e))?;
-    Ok(size)
+    #[test]
+    fn file_category_classifies_code() {
+        assert_eq!(file_category("model.py"), "code");
+        assert_eq!(file_category("app.swift"), "code");
+        assert_eq!(file_category("plugin.lua"), "code");
+        assert_eq!(file_category("build.zig"), "code");
+        assert_eq!(file_category("deploy.ps1"), "code");
+        assert_eq!(file_category("server.ex"), "code");
+        assert_eq!(file_category("component.jsx"), "code");
+        assert_eq!(file_category("analysis.jl"), "code");
+        assert_eq!(file_category("view.m"), "code");
+    }
+
+    #[test]
+    fn file_category_classifies_paper() {
+        assert_eq!(file_category("flash.pdf"), "paper");
+    }
+
+    #[test]
+    fn file_category_classifies_image() {
+        assert_eq!(file_category("diagram.png"), "image");
+    }
+
+    #[test]
+    fn file_category_classifies_doc() {
+        assert_eq!(file_category("notes.md"), "doc");
+    }
+
+    #[test]
+    fn is_concept_node_empty_source() {
+        let node = Node {
+            id: "c1".into(),
+            source_file: "".into(),
+            ..Default::default()
+        };
+        assert!(is_concept_node(&node));
+    }
+
+    #[test]
+    fn is_concept_node_real_file() {
+        let node = Node {
+            id: "n1".into(),
+            source_file: "model.py".into(),
+            ..Default::default()
+        };
+        assert!(!is_concept_node(&node));
+    }
+
+    #[test]
+    fn cohesion_score_complete_graph() {
+        let nodes: Vec<Node> = (0..4)
+            .map(|i| Node {
+                id: format!("n{i}"),
+                file_type: "code".into(),
+                source_file: "a.py".into(),
+                ..Default::default()
+            })
+            .collect();
+        let edges: Vec<Edge> = (0..4)
+            .flat_map(|i| (i + 1..4).map(move |j| (i, j)))
+            .map(|(i, j)| Edge {
+                source: format!("n{i}"),
+                target: format!("n{j}"),
+                relation: "calls".into(),
+                confidence: "EXTRACTED".into(),
+                source_file: "a.py".into(),
+                weight: 1.0,
+                ..Default::default()
+            })
+            .collect();
+        let graph = Graph {
+            nodes,
+            edges,
+            ..Default::default()
+        };
+        let score = cohesion_score(&graph, &["n0".into(), "n1".into(), "n2".into(), "n3".into()]);
+        assert_eq!(score, 1.0);
+    }
+
+    #[test]
+    fn cohesion_score_single_node() {
+        let graph = Graph {
+            nodes: vec![Node {
+                id: "a".into(),
+                file_type: "code".into(),
+                source_file: "a.py".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(cohesion_score(&graph, &["a".into()]), 1.0);
+    }
+
+    #[test]
+    fn cohesion_score_disconnected() {
+        let graph = Graph {
+            nodes: vec![
+                Node {
+                    id: "a".into(),
+                    file_type: "code".into(),
+                    source_file: "a.py".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: "b".into(),
+                    file_type: "code".into(),
+                    source_file: "a.py".into(),
+                    ..Default::default()
+                },
+                Node {
+                    id: "c".into(),
+                    file_type: "code".into(),
+                    source_file: "a.py".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(cohesion_score(&graph, &["a".into(), "b".into(), "c".into()]), 0.0);
+    }
+
+    #[test]
+    fn cohesion_score_range() {
+        let graph = coerce_graph(&json!({
+            "nodes": [
+                {"id": "n1", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "n2", "label": "B", "file_type": "code", "source_file": "a.py"},
+                {"id": "n3", "label": "C", "file_type": "code", "source_file": "b.py"}
+            ],
+            "edges": [
+                {"source": "n1", "target": "n2", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py", "weight": 1.0}
+            ],
+            "input_tokens": 0,
+            "output_tokens": 0
+        })).unwrap();
+        let communities = cluster(&graph);
+        for nodes in communities.values() {
+            let score = cohesion_score(&graph, nodes);
+            assert!((0.0..=1.0).contains(&score));
+        }
+    }
+
+    #[test]
+    fn score_all_keys_match_communities() {
+        let graph = coerce_graph(&json!({
+            "nodes": [
+                {"id": "n1", "label": "A", "file_type": "code", "source_file": "a.py"},
+                {"id": "n2", "label": "B", "file_type": "code", "source_file": "a.py"}
+            ],
+            "edges": [
+                {"source": "n1", "target": "n2", "relation": "calls", "confidence": "EXTRACTED", "source_file": "a.py", "weight": 1.0}
+            ],
+            "input_tokens": 0,
+            "output_tokens": 0
+        })).unwrap();
+        let communities = cluster(&graph);
+        let scores = score_all(&graph, &communities);
+        assert_eq!(
+            scores.keys().cloned().collect::<std::collections::HashSet<_>>(),
+            communities.keys().cloned().collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    fn make_graph_with_hyperedges(hyperedges: Vec<serde_json::Value>) -> Graph {
+        coerce_graph(&json!({
+            "nodes": [
+                {"id": "BasicAuth", "label": "BasicAuth", "file_type": "code", "source_file": "auth.py"},
+                {"id": "DigestAuth", "label": "DigestAuth", "file_type": "code", "source_file": "auth.py"},
+                {"id": "Request", "label": "Request", "file_type": "code", "source_file": "http.py"},
+            ],
+            "edges": [
+                {"source": "BasicAuth", "target": "Request", "relation": "uses", "confidence": "EXTRACTED", "source_file": "auth.py", "weight": 1.0}
+            ],
+            "hyperedges": hyperedges,
+            "input_tokens": 0,
+            "output_tokens": 0
+        })).unwrap()
+    }
+
+    #[test]
+    fn report_includes_hyperedges_section() {
+        let graph = make_graph_with_hyperedges(vec![json!({
+            "id": "auth_flow",
+            "label": "Auth Flow",
+            "nodes": ["BasicAuth", "DigestAuth", "Request"],
+            "relation": "participate_in",
+            "confidence": "INFERRED",
+            "confidence_score": 0.75,
+            "source_file": "auth.py"
+        })]);
+        let communities = cluster(&graph);
+        let labels: HashMap<usize, String> = communities.keys().map(|&k| (k, format!("C{k}"))).collect();
+        let report = generate_report(
+            &graph,
+            &communities,
+            &HashMap::new(),
+            &labels,
+            &[GodNode { id: "BasicAuth".into(), label: "BasicAuth".into(), degree: 2 }],
+            &[],
+            &json!({"total_files": 3}),
+            &json!({"input": 10, "output": 5}),
+            ".",
+            &[],
+            None,
+        );
+        assert!(report.contains("## Hyperedges (group relationships)"));
+        assert!(report.contains("Auth Flow"));
+    }
+
+    #[test]
+    fn report_skips_hyperedges_section_when_empty() {
+        let graph = make_graph_with_hyperedges(vec![]);
+        let communities = cluster(&graph);
+        let labels: HashMap<usize, String> = communities.keys().map(|&k| (k, format!("C{k}"))).collect();
+        let report = generate_report(
+            &graph,
+            &communities,
+            &HashMap::new(),
+            &labels,
+            &[GodNode { id: "BasicAuth".into(), label: "BasicAuth".into(), degree: 2 }],
+            &[],
+            &json!({"total_files": 3}),
+            &json!({"input": 10, "output": 5}),
+            ".",
+            &[],
+            None,
+        );
+        assert!(!report.contains("## Hyperedges"));
+    }
+
+    #[test]
+    fn report_skips_hyperedges_section_when_key_missing() {
+        let graph = coerce_graph(&json!({
+            "nodes": [
+                {"id": "BasicAuth", "label": "BasicAuth", "file_type": "code", "source_file": "auth.py"},
+            ],
+            "edges": [],
+            "input_tokens": 0,
+            "output_tokens": 0
+        })).unwrap();
+        let communities = cluster(&graph);
+        let labels: HashMap<usize, String> = communities.keys().map(|&k| (k, format!("C{k}"))).collect();
+        let report = generate_report(
+            &graph,
+            &communities,
+            &HashMap::new(),
+            &labels,
+            &[GodNode { id: "BasicAuth".into(), label: "BasicAuth".into(), degree: 1 }],
+            &[],
+            &json!({"total_files": 1}),
+            &json!({"input": 10, "output": 5}),
+            ".",
+            &[],
+            None,
+        );
+        assert!(!report.contains("## Hyperedges"));
+    }
 }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use crate::{build, detect, extract};
+use crate::{build, detect, extract, semantic};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RebuildCodeResult {
@@ -96,7 +96,30 @@ pub fn rebuild_code(
         });
     }
 
-    let extraction = extract::extract_paths(&code_files)?;
+    let mut extraction = extract::extract_paths_cached(&code_files, root)?;
+
+    // Semantic extraction for documents, papers, and images.
+    let semantic_files: Vec<String> = detection
+        .files
+        .get("document")
+        .into_iter()
+        .chain(detection.files.get("paper"))
+        .chain(detection.files.get("image"))
+        .flat_map(|v| v.clone())
+        .collect();
+    if !semantic_files.is_empty() {
+        match semantic::extract_semantic_documents(&semantic_files, root) {
+            Ok(semantic) => {
+                extraction.nodes.extend(semantic.nodes);
+                extraction.edges.extend(semantic.edges);
+                extraction.hyperedges.extend(semantic.hyperedges);
+            }
+            Err(e) => {
+                eprintln!("[graphify] Semantic extraction skipped: {e}");
+            }
+        }
+    }
+
     let preserved = load_preserved_semantic_graph(root);
     let graph = build_graph_with_preserved_semantics(extraction, &preserved);
     let detection_value = serde_json::to_value(&detection)?;
@@ -538,7 +561,7 @@ fn write_graph_outputs(
     let graph_json = serde_json::to_string_pretty(&graph_value)
         .context("cannot re-serialize graph.json after merge")?;
 
-    // Shrink guard: refuse to overwrite graph.json with a smaller graph
+    // Incremental re-extraction can produce a partial graph; guard against accidental data loss
     let existing_node_count = fs::read_to_string(&graph_path).ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.get("nodes").and_then(|n| n.as_array()).map(|a| a.len()))
@@ -557,15 +580,14 @@ fn write_graph_outputs(
         .with_context(|| format!("cannot write {}", html_path.display()))?;
     fs::write(&report_path, report)
         .with_context(|| format!("cannot write {}", report_path.display()))?;
-    if legacy_html_path.exists() {
-        fs::remove_file(&legacy_html_path)
-            .with_context(|| format!("cannot remove {}", legacy_html_path.display()))?;
+    if let Err(e) = fs::remove_file(&legacy_html_path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(e).with_context(|| format!("cannot remove {}", legacy_html_path.display()));
     }
 
     let needs_update = out_dir.join("needs_update");
-    if needs_update.exists() {
-        let _ = fs::remove_file(needs_update);
-    }
+    let _ = fs::remove_file(needs_update);
 
     Ok(GraphOutputSummary {
         communities: communities.len(),
@@ -716,8 +738,8 @@ mod tests {
 
         assert!(result.ok);
         assert!(index.contains("# Knowledge Graph Index"));
-        assert!(wiki_dir.read_dir()?.filter_map(Result::ok).any(|entry| {
-            entry.path().extension().and_then(|ext| ext.to_str()) == Some("md")
+        assert!(wiki_dir.read_dir()?.filter_map(Result::ok).any(|entry: std::fs::DirEntry| {
+            entry.path().extension().and_then(|ext: &std::ffi::OsStr| ext.to_str()) == Some("md")
                 && entry.file_name() != "index.md"
         }));
         Ok(())
@@ -778,8 +800,8 @@ mod tests {
         );
         assert!(result.wiki_articles >= 1);
         assert!(wiki_dir.join("index.md").exists());
-        assert!(wiki_dir.read_dir()?.filter_map(Result::ok).any(|entry| {
-            entry.path().extension().and_then(|ext| ext.to_str()) == Some("md")
+        assert!(wiki_dir.read_dir()?.filter_map(Result::ok).any(|entry: std::fs::DirEntry| {
+            entry.path().extension().and_then(|ext: &std::ffi::OsStr| ext.to_str()) == Some("md")
                 && entry.file_name() != "index.md"
         }));
         Ok(())
@@ -813,8 +835,8 @@ mod tests {
         );
         assert!(result.wiki_articles >= 1);
         assert!(wiki_dir.join("index.md").exists());
-        assert!(wiki_dir.read_dir()?.filter_map(Result::ok).any(|entry| {
-            entry.path().extension().and_then(|ext| ext.to_str()) == Some("md")
+        assert!(wiki_dir.read_dir()?.filter_map(Result::ok).any(|entry: std::fs::DirEntry| {
+            entry.path().extension().and_then(|ext: &std::ffi::OsStr| ext.to_str()) == Some("md")
                 && entry.file_name() != "index.md"
         }));
         Ok(())

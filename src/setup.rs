@@ -1247,6 +1247,122 @@ mod tests {
         assert!(!dir.path().join(".git/hooks/post-commit").exists());
     }
 
+    fn init_git_repo(dir: &std::path::Path) {
+        Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(dir)
+            .status()
+            .unwrap();
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["config", "core.hooksPath", ".git/hooks"])
+            .status()
+            .unwrap();
+    }
+
+    #[test]
+    fn hook_install_idempotent() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        hook_install(dir.path()).unwrap();
+        let second = hook_install(dir.path()).unwrap();
+        assert!(second[0].contains("already installed"));
+
+        let content = fs::read_to_string(dir.path().join(".git/hooks/post-commit")).unwrap();
+        assert_eq!(content.matches(HOOK_MARKER).count(), 1);
+    }
+
+    #[test]
+    fn hook_install_appends_to_existing_hook() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        let hook_path = dir.path().join(".git/hooks/post-commit");
+        fs::write(&hook_path, "#!/bin/bash\necho existing\n").unwrap();
+
+        let installed = hook_install(dir.path()).unwrap();
+        assert!(installed[0].contains("appended"));
+
+        let content = fs::read_to_string(&hook_path).unwrap();
+        assert!(content.contains("existing"));
+        assert!(content.contains(HOOK_MARKER));
+    }
+
+    #[test]
+    fn hook_uninstall_no_hook() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        let result = hook_uninstall(dir.path()).unwrap();
+        assert!(result[0].contains("nothing to remove"));
+    }
+
+    #[test]
+    fn hook_status_not_installed() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        let status = hook_status(dir.path()).unwrap();
+        assert!(status.iter().all(|line| line.contains("not installed")));
+    }
+
+    #[test]
+    fn hook_no_git_repo_raises() {
+        let dir = tempdir().unwrap();
+        let result = hook_install(dir.path());
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("No git repository"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hook_install_sets_executable_bit() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        hook_install(dir.path()).unwrap();
+        let meta = fs::metadata(dir.path().join(".git/hooks/post-commit")).unwrap();
+        let mode = meta.permissions().mode();
+        assert!(mode & 0o111 != 0, "hook should be executable");
+    }
+
+    #[test]
+    fn hook_install_creates_post_checkout() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        hook_install(dir.path()).unwrap();
+        assert!(dir.path().join(".git/hooks/post-checkout").exists());
+        let content = fs::read_to_string(dir.path().join(".git/hooks/post-checkout")).unwrap();
+        assert!(content.contains(CHECKOUT_MARKER));
+    }
+
+    #[test]
+    fn hook_uninstall_removes_post_checkout() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        hook_install(dir.path()).unwrap();
+        hook_uninstall(dir.path()).unwrap();
+        assert!(!dir.path().join(".git/hooks/post-checkout").exists());
+    }
+
+    #[test]
+    fn hook_status_shows_both_hooks() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        hook_install(dir.path()).unwrap();
+        let status = hook_status(dir.path()).unwrap();
+        assert!(status.iter().any(|line| line.contains("post-commit")));
+        assert!(status.iter().any(|line| line.contains("post-checkout")));
+        assert!(status.iter().filter(|line| line.contains("installed")).count() >= 2);
+    }
+
     #[test]
     fn hook_install_respects_core_hooks_path() {
         let dir = tempdir().unwrap();

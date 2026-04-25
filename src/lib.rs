@@ -1,5 +1,6 @@
 pub mod binary_schema;
 pub mod build;
+pub mod cache;
 pub mod clone;
 pub mod detect;
 pub mod extract;
@@ -9,7 +10,9 @@ pub mod memory;
 pub mod pipeline;
 pub mod query;
 pub mod schema;
+pub mod semantic;
 pub mod serve;
 pub mod setup;
 pub mod timeutil;
+pub mod transcribe;
 pub mod validate;

@@ -1,4 +1,5 @@
 use crate::build::strip_diacritics;
+use crate::ingest::sanitize_label;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -716,7 +717,7 @@ fn subgraph_to_text(
         };
         lines.push(format!(
             "NODE {} [src={} loc={} community={}]",
-            sanitize_label(&node.label),
+            sanitize_label(Some(&node.label)),
             node.source_file,
             node.source_location,
             node.community.as_deref().unwrap_or_default()
@@ -730,11 +731,11 @@ fn subgraph_to_text(
         let edge = graph.edge(source, target).cloned().unwrap_or_default();
         let source_label = graph
             .node(source)
-            .map(|node| sanitize_label(&node.label))
+            .map(|node| sanitize_label(Some(&node.label)))
             .unwrap_or_else(|| source.clone());
         let target_label = graph
             .node(target)
-            .map(|node| sanitize_label(&node.label))
+            .map(|node| sanitize_label(Some(&node.label)))
             .unwrap_or_else(|| target.clone());
         lines.push(format!(
             "EDGE {} --{} [{}]--> {}",
@@ -941,13 +942,6 @@ fn reconstruct_path(previous: HashMap<String, Option<String>>, goal: &str) -> Ve
     path
 }
 
-fn sanitize_label(text: &str) -> String {
-    text.chars()
-        .filter(|ch| !ch.is_control())
-        .take(256)
-        .collect()
-}
-
 fn truncate_to_boundary(text: &str, max_len: usize) -> String {
     if max_len >= text.len() {
         return text.to_string();
@@ -1115,5 +1109,147 @@ mod tests {
         let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
         let result = benchmark_value(&graph, Some(1_000), &[String::from("xyzzy plugh zorkmid")]);
         assert!(result["error"].as_str().is_some());
+    }
+
+    #[test]
+    fn query_subgraph_tokens_returns_positive_for_match() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let tokens = query_subgraph_tokens(&graph, "how does parser work", 3);
+        assert!(tokens > 0);
+    }
+
+    #[test]
+    fn query_subgraph_tokens_returns_zero_for_no_match() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let tokens = query_subgraph_tokens(&graph, "xyzzy plugh zorkmid", 3);
+        assert_eq!(tokens, 0);
+    }
+
+    #[test]
+    fn query_subgraph_tokens_expands_with_depth() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let tokens_shallow = query_subgraph_tokens(&graph, "parser", 1);
+        let tokens_deep = query_subgraph_tokens(&graph, "parser", 3);
+        assert!(tokens_deep >= tokens_shallow);
+    }
+
+    #[test]
+    fn benchmark_value_corpus_tokens_scales_linearly() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let r1 = benchmark_value(&graph, Some(1_000), &[String::from("parser")]);
+        let r2 = benchmark_value(&graph, Some(10_000), &[String::from("parser")]);
+        let ct1 = r1["corpus_tokens"].as_u64().unwrap_or(0);
+        let ct2 = r2["corpus_tokens"].as_u64().unwrap_or(0);
+        let diff = ct2.abs_diff(ct1 * 10);
+        assert!(diff <= ct1);
+    }
+
+    #[test]
+    fn benchmark_value_estimates_corpus_when_none() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let result = benchmark_value(&graph, None, &[String::from("parser")]);
+        assert!(result["corpus_words"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn benchmark_value_includes_node_edge_counts() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let result = benchmark_value(&graph, Some(5_000), &[String::from("parser")]);
+        assert_eq!(result["nodes"].as_u64().unwrap_or(0), 3);
+        assert_eq!(result["edges"].as_u64().unwrap_or(0), 2);
+    }
+
+    #[test]
+    fn benchmark_value_per_question_has_fields() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let result = benchmark_value(
+            &graph,
+            Some(5_000),
+            &[String::from("parser"), String::from("renderer")],
+        );
+        let per_question = result["per_question"].as_array().expect("per_question array");
+        assert!(!per_question.is_empty());
+        for p in per_question {
+            assert!(p.get("question").is_some());
+            assert!(p.get("query_tokens").is_some());
+            assert!(p.get("reduction").is_some());
+        }
+    }
+
+    #[test]
+    fn bfs_depth_1_reaches_direct_neighbors() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let (visited, edges) = bfs(&graph, &[String::from("n1")], 1);
+        assert!(visited.contains("n1"));
+        assert!(visited.contains("n2"));
+        assert!(!visited.contains("n3"));
+        assert!(!edges.is_empty());
+        assert!(edges.iter().any(|(u, v)| u == "n1" && v == "n2"));
+    }
+
+    #[test]
+    fn bfs_depth_2_reaches_second_degree() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let (visited, _) = bfs(&graph, &[String::from("n1")], 2);
+        assert!(visited.contains("n3"));
+    }
+
+    #[test]
+    fn bfs_isolated_node_returns_self() {
+        let payload = serde_json::json!({
+            "nodes": [
+                {"id": "n1", "label": "A"},
+                {"id": "n5", "label": "isolated"}
+            ],
+            "links": [{"source": "n1", "target": "n1", "relation": "self", "confidence": "EXTRACTED"}]
+        });
+        let graph = QueryGraph::from_value(&payload).expect("graph");
+        let (visited, edges) = bfs(&graph, &[String::from("n5")], 3);
+        assert_eq!(visited.len(), 1);
+        assert!(visited.contains("n5"));
+        assert!(edges.is_empty());
+    }
+
+    #[test]
+    fn dfs_depth_1_reaches_direct_neighbors() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let (visited, _) = dfs(&graph, &[String::from("n1")], 1);
+        assert!(visited.contains("n1"));
+        assert!(visited.contains("n2"));
+        assert!(!visited.contains("n3"));
+    }
+
+    #[test]
+    fn dfs_full_chain_at_high_depth() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let (visited, _) = dfs(&graph, &[String::from("n1")], 5);
+        assert!(visited.contains("n1"));
+        assert!(visited.contains("n2"));
+        assert!(visited.contains("n3"));
+    }
+
+    #[test]
+    fn score_nodes_no_match_returns_empty() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let scored = score_nodes(&graph, &["xyzzy".to_string()]);
+        assert!(scored.is_empty());
+    }
+
+    #[test]
+    fn score_nodes_exact_label_match_ranks_first() {
+        let graph = QueryGraph::from_value(&sample_graph()).expect("graph");
+        let scored = score_nodes(&graph, &["creme".to_string()]);
+        assert_eq!(scored[0].1, "n1");
+    }
+
+    #[test]
+    fn load_graph_roundtrip() {
+        let temp = tempdir().expect("tempdir");
+        let path = temp.path().join("graph.json");
+        fs::write(&path, serde_json::to_string(&sample_graph()).expect("json"))
+            .expect("write graph");
+        let graph = load_graph(&path).expect("load graph");
+        assert_eq!(graph.nodes.len(), 3);
+        assert_eq!(graph.adjacency.len(), 3);
     }
 }

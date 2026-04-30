@@ -196,7 +196,7 @@ fn parse_url(url: &str) -> Result<ParsedUrl> {
     })
 }
 
-fn validate_url(url: &str) -> Result<()> {
+fn validate_url(url: &str) -> Result<Vec<IpAddr>> {
     let parsed = parse_url(url)?;
     if BLOCKED_HOSTS
         .iter()
@@ -208,8 +208,9 @@ fn validate_url(url: &str) -> Result<()> {
             url
         );
     }
-    for ip in resolve_host_ips(&parsed.hostname, parsed.default_port) {
-        if is_blocked_ip(ip) {
+    let ips = resolve_host_ips(&parsed.hostname, parsed.default_port);
+    for ip in &ips {
+        if is_blocked_ip(*ip) {
             bail!(
                 "blocked private/internal IP {} (resolved from '{}'). Got: {:?}",
                 ip,
@@ -218,7 +219,7 @@ fn validate_url(url: &str) -> Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(ips)
 }
 
 fn resolve_host_ips(host: &str, port: u16) -> Vec<IpAddr> {
@@ -260,24 +261,32 @@ fn find_curl_bin() -> Option<String> {
     Some("curl".to_string())
 }
 
-fn run_curl(url: &str, max_time_secs: u32) -> Result<Vec<u8>> {
+fn run_curl(url: &str, max_time_secs: u32, validated_ips: &[IpAddr]) -> Result<Vec<u8>> {
     let curl = find_curl_bin().ok_or_else(|| anyhow!("curl not found"))?;
+
+    let parsed = parse_url(url)?;
+
+    let mut args: Vec<String> = vec![
+        "--proto".into(), "=http,https".into(),
+        "--proto-redir".into(), "=http,https".into(),
+        "--location".into(),
+        "--silent".into(),
+        "--show-error".into(),
+        "--fail".into(),
+        "--max-time".into(), max_time_secs.to_string(),
+        "--user-agent".into(), "Mozilla/5.0 graphify/1.0".into(),
+    ];
+
+    // Pin validated IPs via --resolve to block DNS rebinding (TOCTOU fix).
+    for ip in validated_ips {
+        args.push("--resolve".into());
+        args.push(format!("{}:{}:{}", parsed.hostname, parsed.default_port, ip));
+    }
+
+    args.push(url.into());
+
     let output = Command::new(curl)
-        .args([
-            "--proto",
-            "=http,https",
-            "--proto-redir",
-            "=http,https",
-            "--location",
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--max-time",
-            &max_time_secs.to_string(),
-            "--user-agent",
-            "Mozilla/5.0 graphify/1.0",
-            url,
-        ])
+        .args(&args)
         .output()
         .with_context(|| format!("failed to execute curl for {url}"))?;
     if !output.status.success() {
@@ -295,8 +304,8 @@ fn run_curl(url: &str, max_time_secs: u32) -> Result<Vec<u8>> {
 }
 
 fn safe_fetch(url: &str, max_bytes: usize, timeout_secs: u32) -> Result<Vec<u8>> {
-    validate_url(url)?;
-    let bytes = run_curl(url, timeout_secs)?;
+    let validated_ips = validate_url(url)?;
+    let bytes = run_curl(url, timeout_secs, &validated_ips)?;
     if bytes.len() > max_bytes {
         bail!(
             "response from {:?} exceeds size limit ({} MB). Aborting download.",

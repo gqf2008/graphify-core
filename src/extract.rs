@@ -585,7 +585,7 @@ pub fn extract_paths_cached(paths: &[String], cache_root: &Path) -> Result<Extra
 
     for path_str in paths {
         let path = Path::new(path_str);
-        match cache::load_cached(path, cache_root) {
+        match cache::load_cached(path, cache_root, "ast") {
             Some(cached) => append_extraction(&mut combined, cached),
             None => uncached.push(path_str.clone()),
         }
@@ -619,7 +619,7 @@ pub fn extract_paths_cached(paths: &[String], cache_root: &Path) -> Result<Extra
             cache_root.join(fpath)
         };
         if abs.is_file() {
-            let _ = cache::save_cached(&abs, &per_file, cache_root);
+            let _ = cache::save_cached(&abs, &per_file, cache_root, "ast");
         }
     }
 
@@ -652,6 +652,9 @@ fn resolve_cross_file_calls(extraction: &mut Extraction) {
         .collect();
 
     for raw_call in extraction.raw_calls.drain(..) {
+        if raw_call.is_member_call && raw_call.receiver_call.is_none() {
+            continue;
+        }
         let Some(target_id) = lookup_call_target(&label_to_id, &raw_call.callee).or_else(|| {
             lookup_receiver_method_target(&method_index, &function_return_index, &raw_call)
         }) else {
@@ -920,6 +923,13 @@ fn extract_generic_from_source(
     let mut seen_ids: HashSet<String> = HashSet::new();
     let mut pending_calls: Vec<PendingCall> = Vec::new();
 
+    // Pre-collect Go imported package short names for pkg.Func() disambiguation
+    let go_imported_pkgs = if source_extension(&source_file) == "go" {
+        collect_go_imported_pkgs(root, source)
+    } else {
+        HashSet::new()
+    };
+
     add_node(
         &mut extraction.nodes,
         &mut seen_ids,
@@ -950,6 +960,7 @@ fn extract_generic_from_source(
         &mut seen_ids,
         &mut pending_calls,
         &mut extraction.function_returns,
+        &go_imported_pkgs,
     );
 
     // Resolve pending calls
@@ -974,13 +985,14 @@ fn extract_generic_from_source(
                     line_no: pending.line_no,
                 },
             );
-        } else if pending.allow_cross_file {
+        } else if pending.allow_cross_file && (!pending.is_member_call || pending.receiver_call.is_some()) {
             extraction.raw_calls.push(RawCall {
                 caller_nid: pending.caller_id,
                 callee: pending.callee_name,
                 source_file: source_file.clone(),
                 source_location: Some(format!("L{}", pending.line_no)),
                 receiver_call: pending.receiver_call,
+                is_member_call: pending.is_member_call,
             });
         }
     }
@@ -1016,6 +1028,7 @@ fn walk_tree<'a>(
     seen_ids: &mut HashSet<String>,
     pending_calls: &mut Vec<PendingCall>,
     function_returns: &mut Vec<FunctionReturn>,
+    go_imported_pkgs: &HashSet<String>,
 ) {
     let t = node.kind();
 
@@ -1040,6 +1053,7 @@ fn walk_tree<'a>(
             seen_ids,
             pending_calls,
             function_returns,
+            go_imported_pkgs,
         );
         return;
     }
@@ -1059,6 +1073,7 @@ fn walk_tree<'a>(
             seen_ids,
             pending_calls,
             function_returns,
+            go_imported_pkgs,
         );
         return;
     }
@@ -1078,6 +1093,7 @@ fn walk_tree<'a>(
             seen_ids,
             pending_calls,
             function_returns,
+            go_imported_pkgs,
         );
     }
 }
@@ -1121,6 +1137,7 @@ fn handle_class<'a>(
     seen_ids: &mut HashSet<String>,
     pending_calls: &mut Vec<PendingCall>,
     function_returns: &mut Vec<FunctionReturn>,
+    go_imported_pkgs: &HashSet<String>,
 ) {
     let class_name = if node.kind() == "impl_item" {
         resolve_impl_type(node, source, stem)
@@ -1218,6 +1235,7 @@ fn handle_class<'a>(
                 seen_ids,
                 pending_calls,
                 function_returns,
+                go_imported_pkgs,
             );
         }
     }
@@ -1344,6 +1362,7 @@ fn handle_function<'a>(
     seen_ids: &mut HashSet<String>,
     pending_calls: &mut Vec<PendingCall>,
     function_returns: &mut Vec<FunctionReturn>,
+    go_imported_pkgs: &HashSet<String>,
 ) {
     let ext = source_extension(source_file);
     let func_name = if matches!(ext, "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hxx") {
@@ -1450,7 +1469,7 @@ fn handle_function<'a>(
     // Collect calls inside this function body
     let body = find_body(node, cfg);
     if let Some(body_node) = body {
-        collect_calls(body_node, &func_id, source, cfg, pending_calls);
+        collect_calls(body_node, &func_id, source, cfg, pending_calls, go_imported_pkgs);
     }
 }
 
@@ -2272,6 +2291,7 @@ fn collect_calls(
     source: &[u8],
     cfg: &LanguageConfig,
     pending_calls: &mut Vec<PendingCall>,
+    go_imported_pkgs: &HashSet<String>,
 ) {
     let t = node.kind();
 
@@ -2280,18 +2300,19 @@ fn collect_calls(
     }
 
     if cfg.call_types.contains(&t)
-        && let Some(resolved) = resolve_callee(node, source, cfg) {
+        && let Some(resolved) = resolve_callee(node, source, cfg, go_imported_pkgs) {
             pending_calls.push(PendingCall {
                 caller_id: caller_id.to_string(),
                 callee_name: resolved.callee_name,
                 line_no: node.start_position().row + 1,
                 allow_cross_file: resolved.allow_cross_file,
                 receiver_call: resolved.receiver_call,
+                is_member_call: resolved.is_member_call,
             });
         }
 
     for child in named_children(node) {
-        collect_calls(child, caller_id, source, cfg, pending_calls);
+        collect_calls(child, caller_id, source, cfg, pending_calls, go_imported_pkgs);
     }
 }
 
@@ -2299,9 +2320,10 @@ struct ResolvedCall {
     callee_name: String,
     allow_cross_file: bool,
     receiver_call: Option<String>,
+    is_member_call: bool,
 }
 
-fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Option<ResolvedCall> {
+fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig, go_imported_pkgs: &HashSet<String>) -> Option<ResolvedCall> {
     if node.kind() == "class_constant_access_expression" {
         return None;
     }
@@ -2311,7 +2333,7 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
         .or_else(|| node.child_by_field_name("name"))
         .or_else(|| named_children(node).into_iter().next())?;
 
-    // Accessor call (obj.method())
+    // Accessor call (obj.method() or pkg.Func())
     if cfg
         .call_accessor_node_types
         .iter()
@@ -2322,12 +2344,24 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
         } else {
             None
         };
+
+        // For Go selector_expression: distinguish pkg.Func() from receiver.method()
+        let is_member_call = if !go_imported_pkgs.is_empty() {
+            // Go file — check if the operand is an imported package name
+            let operand = func_node.child_by_field_name("operand");
+            let receiver_name = operand.and_then(|op| node_text(op, source)).unwrap_or_default();
+            !go_imported_pkgs.contains(receiver_name.as_str())
+        } else {
+            true // Non-Go: all accessor calls are member calls
+        };
+
         if !cfg.call_accessor_field.is_empty()
             && let Some(attr) = func_node.child_by_field_name(cfg.call_accessor_field) {
                 return node_text(attr, source).map(|text| ResolvedCall {
                     callee_name: text,
                     allow_cross_file: true,
                     receiver_call,
+                    is_member_call,
                 });
             }
         // Last named child as fallback
@@ -2336,6 +2370,7 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
                 callee_name: text,
                 allow_cross_file: true,
                 receiver_call,
+                is_member_call,
             });
         }
     }
@@ -2349,6 +2384,7 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
                 callee_name: name,
                 allow_cross_file: true,
                 receiver_call: None,
+                is_member_call: false,
             });
         }
         if let Some(last) = named_children(func_node).into_iter().last() {
@@ -2356,6 +2392,7 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
                 callee_name: text,
                 allow_cross_file: true,
                 receiver_call: None,
+                is_member_call: false,
             });
         }
     }
@@ -2364,7 +2401,50 @@ fn resolve_callee(node: TsNode<'_>, source: &[u8], cfg: &LanguageConfig) -> Opti
         callee_name: text,
         allow_cross_file: true,
         receiver_call: None,
+        is_member_call: false,
     })
+}
+
+fn collect_go_imported_pkgs(root: TsNode<'_>, source: &[u8]) -> HashSet<String> {
+    let mut pkgs = HashSet::new();
+    fn scan(node: TsNode<'_>, source: &[u8], pkgs: &mut HashSet<String>) {
+        if node.kind() == "import_declaration" {
+            for child in all_children(node) {
+                let specs = if child.kind() == "import_spec" {
+                    vec![child]
+                } else if child.kind() == "import_spec_list" {
+                    all_children(child)
+                        .into_iter()
+                        .filter(|s| s.kind() == "import_spec")
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for spec in specs {
+                    if let Some(path_node) = spec.child_by_field_name("path") {
+                        if let Some(raw) = node_text(path_node, source) {
+                            let pkg_path = raw.trim_matches('"');
+                            let alias = spec.child_by_field_name("name");
+                            let local_name = if let Some(a) = alias {
+                                node_text(a, source).unwrap_or_default()
+                            } else {
+                                pkg_path.split('/').next_back().unwrap_or("").to_string()
+                            };
+                            if !local_name.is_empty() && local_name != "_" && local_name != "." {
+                                pkgs.insert(local_name);
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        for child in named_children(node) {
+            scan(child, source, pkgs);
+        }
+    }
+    scan(root, source, &mut pkgs);
+    pkgs
 }
 
 fn accessor_receiver_call_name(
@@ -2378,7 +2458,7 @@ fn accessor_receiver_call_name(
     if receiver.kind() != "call_expression" {
         return None;
     }
-    resolve_callee(receiver, source, cfg).map(|resolved| resolved.callee_name)
+    resolve_callee(receiver, source, cfg, &HashSet::new()).map(|resolved| resolved.callee_name)
 }
 
 fn resolve_c_like_function_name(node: TsNode<'_>, source: &[u8], is_cpp: bool) -> Option<String> {
@@ -2725,6 +2805,7 @@ struct PendingCall {
     line_no: usize,
     allow_cross_file: bool,
     receiver_call: Option<String>,
+    is_member_call: bool,
 }
 
 #[derive(Debug)]
@@ -6736,8 +6817,10 @@ pub fn build() {
             .map(|node| node.id.clone())
             .unwrap();
 
-        // Accessor calls now resolve cross-file (matching Python parity)
-        assert!(result.edges.iter().any(|edge| {
+        // Member calls on local variables (kind.as_str()) should NOT resolve
+        // cross-file — "as_str" has no import evidence and collides with any
+        // top-level function named "as_str" in the corpus.
+        assert!(!result.edges.iter().any(|edge| {
             edge.source == build_id && edge.target == as_str_id && edge.relation == "calls"
         }));
     }

@@ -89,9 +89,12 @@ pub fn file_hash(path: &Path, root: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Returns `graphify-out/cache/` — creates it if needed.
-pub fn cache_dir(root: &Path) -> PathBuf {
-    let d = root.canonicalize().unwrap_or_else(|_| root.to_path_buf()).join("graphify-out").join("cache");
+/// Returns `graphify-out/cache/{kind}/` — creates it if needed.
+///
+/// `kind` is `"ast"` or `"semantic"`. Separate subdirectories prevent semantic
+/// cache entries from overwriting AST cache entries for the same source file.
+pub fn cache_dir(root: &Path, kind: &str) -> PathBuf {
+    let d = root.canonicalize().unwrap_or_else(|_| root.to_path_buf()).join("graphify-out").join("cache").join(kind);
     let _ = fs::create_dir_all(&d);
     d
 }
@@ -99,25 +102,36 @@ pub fn cache_dir(root: &Path) -> PathBuf {
 /// Return cached extraction for this file if hash matches, else `None`.
 ///
 /// Cache key: SHA256 of file contents.
-/// Cache value: stored as `graphify-out/cache/{hash}.json`.
-pub fn load_cached(path: &Path, root: &Path) -> Option<Extraction> {
+/// Cache value: stored as `graphify-out/cache/{kind}/{hash}.json`.
+/// Falls back to legacy flat `cache/{hash}.json` for AST entries from pre-split versions.
+pub fn load_cached(path: &Path, root: &Path, kind: &str) -> Option<Extraction> {
     let h = file_hash(path, root).ok()?;
-    let entry = cache_dir(root).join(format!("{h}.json"));
-    let text = fs::read_to_string(&entry).ok()?;
+    let entry = cache_dir(root, kind).join(format!("{h}.json"));
+    if let Some(ext) = try_load_entry(&entry) {
+        return Some(ext);
+    }
+    // Legacy fallback: check flat cache/ dir for entries from pre-split versions
+    let legacy = root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+        .join("graphify-out").join("cache").join(format!("{h}.json"));
+    try_load_entry(&legacy)
+}
+
+fn try_load_entry(entry: &Path) -> Option<Extraction> {
+    let text = fs::read_to_string(entry).ok()?;
     let entry: CacheEntry = serde_json::from_str(&text).ok()?;
     Some(entry.into())
 }
 
 /// Save extraction result for this file.
 ///
-/// Stores as `graphify-out/cache/{hash}.json` where hash = SHA256 of current
+/// Stores as `graphify-out/cache/{kind}/{hash}.json` where hash = SHA256 of current
 /// file contents. No-ops if `path` is not a regular file.
-pub fn save_cached(path: &Path, result: &Extraction, root: &Path) -> Result<()> {
+pub fn save_cached(path: &Path, result: &Extraction, root: &Path, kind: &str) -> Result<()> {
     if !path.is_file() {
         return Ok(());
     }
     let h = file_hash(path, root)?;
-    let entry = cache_dir(root).join(format!("{h}.json"));
+    let entry = cache_dir(root, kind).join(format!("{h}.json"));
     let tmp = entry.with_extension("tmp");
     if let Some(parent) = tmp.parent() {
         fs::create_dir_all(parent)
@@ -139,10 +153,23 @@ pub fn save_cached(path: &Path, result: &Extraction, root: &Path) -> Result<()> 
     Ok(())
 }
 
-/// Delete all `graphify-out/cache/*.json` files.
+/// Delete all cache entries (ast/, semantic/, and legacy flat entries).
 pub fn clear_cache(root: &Path) -> Result<()> {
-    let d = cache_dir(root);
-    for entry in fs::read_dir(&d).with_context(|| format!("cannot read cache dir: {}", d.display()))? {
+    let base = root.canonicalize().unwrap_or_else(|_| root.to_path_buf()).join("graphify-out").join("cache");
+    // Legacy flat entries
+    clear_json_in_dir(&base)?;
+    // Namespaced entries
+    for kind in ["ast", "semantic"] {
+        clear_json_in_dir(&base.join(kind))?;
+    }
+    Ok(())
+}
+
+fn clear_json_in_dir(d: &Path) -> Result<()> {
+    if !d.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(d).with_context(|| format!("cannot read cache dir: {}", d.display()))? {
         let entry = entry?;
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json") {
@@ -161,7 +188,7 @@ pub fn check_semantic_cache(paths: &[PathBuf], root: &Path) -> (Vec<Extraction>,
     let mut uncached = Vec::new();
 
     for path in paths {
-        match load_cached(path, root) {
+        match load_cached(path, root, "semantic") {
             Some(extraction) => cached.push(extraction),
             None => uncached.push(path.clone()),
         }
@@ -214,7 +241,7 @@ pub fn save_semantic_cache(extraction: &Extraction, root: &Path) -> Result<usize
             root.join(fpath)
         };
         if abs.is_file() {
-            save_cached(&abs, &per_file, root)?;
+            save_cached(&abs, &per_file, root, "semantic")?;
             saved += 1;
         }
     }
@@ -305,8 +332,8 @@ mod tests {
             ..Default::default()
         };
 
-        save_cached(&f, &extraction, &root).unwrap();
-        let loaded = load_cached(&f, &root).unwrap();
+        save_cached(&f, &extraction, &root, "ast").unwrap();
+        let loaded = load_cached(&f, &root, "ast").unwrap();
         assert_eq!(loaded.nodes.len(), 1);
         assert_eq!(loaded.nodes[0].id, "main");
         let _ = fs::remove_dir_all(&root);
@@ -330,7 +357,7 @@ mod tests {
             edges: vec![],
             ..Default::default()
         };
-        save_cached(&f1, &ex, &root).unwrap();
+        save_cached(&f1, &ex, &root, "semantic").unwrap();
 
         let (cached, uncached) = check_semantic_cache(&[f1.clone(), f2.clone()], &root);
         assert_eq!(cached.len(), 1);
@@ -355,8 +382,8 @@ mod tests {
             edges: vec![],
             ..Default::default()
         };
-        save_cached(&f, &ex, &root).unwrap();
-        let cache_d = cache_dir(&root);
+        save_cached(&f, &ex, &root, "ast").unwrap();
+        let cache_d = cache_dir(&root, "ast");
         let before = fs::read_dir(&cache_d).unwrap().filter_map(|e| e.ok()).count();
         assert!(before >= 1);
 
@@ -402,11 +429,11 @@ mod tests {
         let saved = save_semantic_cache(&extraction, &root).unwrap();
         assert_eq!(saved, 2);
 
-        let loaded1 = load_cached(&f1, &root).unwrap();
+        let loaded1 = load_cached(&f1, &root, "semantic").unwrap();
         assert_eq!(loaded1.nodes.len(), 1);
         assert_eq!(loaded1.edges.len(), 1);
 
-        let loaded2 = load_cached(&f2, &root).unwrap();
+        let loaded2 = load_cached(&f2, &root, "semantic").unwrap();
         assert_eq!(loaded2.nodes.len(), 1);
         assert_eq!(loaded2.edges.len(), 0);
 
@@ -418,7 +445,7 @@ mod tests {
         let root = tmp_dir();
         let f = root.join("missing.rs");
         fs::write(&f, b"fn main() {}").unwrap();
-        assert!(load_cached(&f, &root).is_none());
+        assert!(load_cached(&f, &root, "ast").is_none());
         let _ = fs::remove_dir_all(&root);
     }
 

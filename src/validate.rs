@@ -6,7 +6,7 @@
 use serde_json::Value;
 use std::collections::HashSet;
 
-static VALID_FILE_TYPES: &[&str] = &["code", "document", "paper", "image", "rationale"];
+static VALID_FILE_TYPES: &[&str] = &["code", "document", "paper", "image", "rationale", "concept"];
 static VALID_CONFIDENCES: &[&str] = &["EXTRACTED", "INFERRED", "AMBIGUOUS"];
 
 /// Validate an extraction JSON value against the graphify schema.

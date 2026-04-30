@@ -25,6 +25,7 @@ pub struct RawCall {
     pub source_file: String,
     pub source_location: Option<String>,
     pub receiver_call: Option<String>,
+    pub is_member_call: bool,
 }
 
 #[derive(Debug, Clone, Default)]

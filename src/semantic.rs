@@ -482,7 +482,7 @@ pub fn extract_semantic_documents(paths: &[String], root: &Path) -> Result<Extra
         match result {
             Ok(extraction) => {
                 let path = Path::new(&path_str);
-                let _ = cache::save_cached(path, &extraction, root);
+                let _ = cache::save_cached(path, &extraction, root, "semantic");
                 append_extraction(&mut combined, extraction);
             }
             Err(e) => {

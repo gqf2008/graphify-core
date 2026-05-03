@@ -782,9 +782,36 @@ pub fn agents_uninstall(project_dir: &Path, platform: &str) -> Result<Vec<String
     Ok(lines)
 }
 
-fn install_claude_hook(project_dir: &Path) -> Result<Vec<String>> {
-    let settings_path = project_dir.join(".claude/settings.json");
-    let mut settings = read_json_or_default(&settings_path);
+fn is_graphify_bash_hook(hook: &Value) -> bool {
+    hook.get("matcher").and_then(Value::as_str) == Some("Bash")
+        && hook.to_string().contains("graphify-out/graph.json")
+}
+
+fn is_graphify_hook(hook: &Value) -> bool {
+    hook.to_string().contains("graphify-out/graph.json")
+}
+
+fn is_legacy_pretooluse_hook(hook: &Value) -> bool {
+    hook.get("matcher").and_then(Value::as_str) == Some("Glob|Grep")
+        && hook.to_string().contains("graphify")
+}
+
+fn user_prompt_hook_json() -> Value {
+    json!({
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "command",
+            "command": "[ -f graphify-out/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"graphify: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files.\"}}' || true"
+        }]
+    })
+}
+
+fn install_user_prompt_hook(
+    settings_path: &Path,
+    mut retain: impl FnMut(&Value) -> bool,
+    msg: &str,
+) -> Result<Vec<String>> {
+    let mut settings = read_json_or_default(settings_path);
     let hooks = settings
         .as_object_mut()
         .unwrap()
@@ -797,61 +824,43 @@ fn install_claude_hook(project_dir: &Path) -> Result<Vec<String>> {
         .or_insert_with(|| Value::Array(Vec::new()))
         .as_array_mut()
         .unwrap();
-    // Remove legacy graphify hooks (identified by our specific command text).
-    user_prompt.retain(|hook| {
-        !(hook.get("matcher").and_then(Value::as_str) == Some("Bash")
-            && hook.to_string().contains("graphify-out/graph.json"))
-    });
-    user_prompt.push(json!({
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": "[ -f graphify-out/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"graphify: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files.\"}}' || true"
-        }]
-    }));
-    write_json(&settings_path, &settings)?;
-    Ok(vec![
-        "  .claude/settings.json  ->  UserPromptSubmit hook registered".to_string(),
-    ])
+    user_prompt.retain(&mut retain);
+    user_prompt.push(user_prompt_hook_json());
+    write_json(settings_path, &settings)?;
+    Ok(vec![format!("  {msg}  ->  UserPromptSubmit hook registered")])
 }
 
-fn uninstall_claude_hook(project_dir: &Path) -> Result<Vec<String>> {
-    let settings_path = project_dir.join(".claude/settings.json");
+fn uninstall_user_prompt_hook(
+    settings_path: &Path,
+    mut user_prompt_retain: impl FnMut(&Value) -> bool,
+    mut pre_tool_retain: impl FnMut(&Value) -> bool,
+    msg: &str,
+) -> Result<Vec<String>> {
     if !settings_path.exists() {
         return Ok(Vec::new());
     }
-    let mut settings = read_json_or_default(&settings_path);
-    let mut hooks = settings
-        .get_mut("hooks")
-        .and_then(Value::as_object_mut);
+    let mut settings = read_json_or_default(settings_path);
+    let mut hooks = settings.get_mut("hooks").and_then(Value::as_object_mut);
     let mut changed = false;
 
-    // Remove from UserPromptSubmit (current location).
     if let Some(user_prompt) = hooks
         .as_mut()
         .and_then(|h| h.get_mut("UserPromptSubmit"))
         .and_then(Value::as_array_mut)
     {
         let original = user_prompt.len();
-        user_prompt.retain(|hook| {
-            !(hook.get("matcher").and_then(Value::as_str) == Some("Bash")
-                && hook.to_string().contains("graphify-out/graph.json"))
-        });
+        user_prompt.retain(&mut user_prompt_retain);
         if user_prompt.len() != original {
             changed = true;
         }
     }
 
-    // Also clean up legacy PreToolUse hooks.
     if let Some(pre_tool) = hooks
         .and_then(|h| h.get_mut("PreToolUse"))
         .and_then(Value::as_array_mut)
     {
         let original = pre_tool.len();
-        pre_tool.retain(|hook| {
-            !(hook.get("matcher").and_then(Value::as_str) == Some("Glob|Grep")
-                && hook.to_string().contains("graphify"))
-        });
+        pre_tool.retain(&mut pre_tool_retain);
         if pre_tool.len() != original {
             changed = true;
         }
@@ -860,10 +869,25 @@ fn uninstall_claude_hook(project_dir: &Path) -> Result<Vec<String>> {
     if !changed {
         return Ok(Vec::new());
     }
-    write_json(&settings_path, &settings)?;
-    Ok(vec![
-        "  .claude/settings.json  ->  UserPromptSubmit hook removed".to_string(),
-    ])
+    write_json(settings_path, &settings)?;
+    Ok(vec![format!("  {msg}  ->  UserPromptSubmit hook removed")])
+}
+
+fn install_claude_hook(project_dir: &Path) -> Result<Vec<String>> {
+    install_user_prompt_hook(
+        &project_dir.join(".claude/settings.json"),
+        |hook| !is_graphify_bash_hook(hook),
+        ".claude/settings.json",
+    )
+}
+
+fn uninstall_claude_hook(project_dir: &Path) -> Result<Vec<String>> {
+    uninstall_user_prompt_hook(
+        &project_dir.join(".claude/settings.json"),
+        |hook| !is_graphify_bash_hook(hook),
+        |hook| !is_legacy_pretooluse_hook(hook),
+        ".claude/settings.json",
+    )
 }
 
 fn install_gemini_hook(project_dir: &Path) -> Result<Vec<String>> {
@@ -921,78 +945,20 @@ fn uninstall_gemini_hook(project_dir: &Path) -> Result<Vec<String>> {
 }
 
 fn install_codex_hook(project_dir: &Path) -> Result<Vec<String>> {
-    let hooks_path = project_dir.join(".codex/hooks.json");
-    let mut existing = read_json_or_default(&hooks_path);
-    let hooks = existing
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .unwrap();
-    let user_prompt = hooks
-        .entry("UserPromptSubmit")
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .unwrap();
-    // Remove legacy graphify hooks (identified by our specific command text).
-    user_prompt.retain(|hook| !hook.to_string().contains("graphify-out/graph.json"));
-    user_prompt.push(json!({
-        "matcher": "Bash",
-        "hooks": [{
-            "type": "command",
-            "command": "[ -f graphify-out/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"graphify: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files.\"}}' || true"
-        }]
-    }));
-    write_json(&hooks_path, &existing)?;
-    Ok(vec![
-        "  .codex/hooks.json  ->  UserPromptSubmit hook registered".to_string(),
-    ])
+    install_user_prompt_hook(
+        &project_dir.join(".codex/hooks.json"),
+        |hook| !is_graphify_hook(hook),
+        ".codex/hooks.json",
+    )
 }
 
 fn uninstall_codex_hook(project_dir: &Path) -> Result<Vec<String>> {
-    let hooks_path = project_dir.join(".codex/hooks.json");
-    if !hooks_path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut existing = read_json_or_default(&hooks_path);
-    let mut hooks = existing
-        .get_mut("hooks")
-        .and_then(Value::as_object_mut);
-    let mut changed = false;
-
-    // Remove from UserPromptSubmit (current location).
-    if let Some(user_prompt) = hooks
-        .as_mut()
-        .and_then(|h| h.get_mut("UserPromptSubmit"))
-        .and_then(Value::as_array_mut)
-    {
-        let original = user_prompt.len();
-        user_prompt.retain(|hook| !hook.to_string().contains("graphify-out/graph.json"));
-        if user_prompt.len() != original {
-            changed = true;
-        }
-    }
-
-    // Also clean up legacy PreToolUse hooks.
-    if let Some(pre_tool) = hooks
-        .and_then(|h| h.get_mut("PreToolUse"))
-        .and_then(Value::as_array_mut)
-    {
-        let original = pre_tool.len();
-        pre_tool.retain(|hook| !hook.to_string().contains("graphify-out/graph.json"));
-        if pre_tool.len() != original {
-            changed = true;
-        }
-    }
-
-    if !changed {
-        return Ok(Vec::new());
-    }
-    write_json(&hooks_path, &existing)?;
-    Ok(vec![
-        "  .codex/hooks.json  ->  UserPromptSubmit hook removed".to_string(),
-    ])
+    uninstall_user_prompt_hook(
+        &project_dir.join(".codex/hooks.json"),
+        |hook| !is_graphify_hook(hook),
+        |hook| !is_graphify_hook(hook),
+        ".codex/hooks.json",
+    )
 }
 
 fn install_opencode_plugin(project_dir: &Path) -> Result<Vec<String>> {

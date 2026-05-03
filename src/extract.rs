@@ -646,7 +646,7 @@ fn resolve_cross_file_calls(extraction: &mut Extraction) {
     // identifiers, and they pollute cross-file matches for short names (#563).
     let mut label_to_id = HashMap::new();
     for node in &extraction.nodes {
-        if node.file_type == "rationale" {
+        if node.is_rationale() {
             continue;
         }
         let normalized = normalize_lookup_name(&node.label);
@@ -2141,7 +2141,7 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
             }
             // Rationale nodes carry docstring text as labels — they must never
             // participate in cross-file import resolution (#563).
-            if node.file_type == "rationale" {
+            if node.is_rationale() {
                 continue;
             }
             // Match Python parity: index both classes and functions
@@ -2172,7 +2172,7 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
             .iter()
             .filter(|node| {
                 node.source_file == source_file
-                    && node.file_type != "rationale"
+                    && !node.is_rationale()
                     && !node.label.ends_with(')')
                     && !node.label.ends_with(".py")
             })

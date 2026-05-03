@@ -1498,15 +1498,18 @@ fn safe_wiki_filename(name: &str) -> String {
         .replace('|', "-")
         .replace('?', "-")
         .replace('*', "-");
-    s = s.trim_end_matches(|c: char| c == '.' || c == ' ').to_string();
+    s = trim_end_dots_and_spaces(&s).to_string();
     if s.len() > 200 {
-        s.truncate(200);
-        s = s.trim_end_matches(|c: char| c == '.' || c == ' ').to_string();
+        s = trim_end_dots_and_spaces(&s[..200]).to_string();
     }
     if s.is_empty() {
         s = "unnamed".to_string();
     }
     s
+}
+
+fn trim_end_dots_and_spaces(s: &str) -> &str {
+    s.trim_end_matches(|c: char| c == '.' || c == ' ')
 }
 
 fn safe_community_name(label: &str) -> String {
@@ -2452,7 +2455,7 @@ pub fn export_json_data(
                 // Restore original direction for directed edge types (#563).
                 // normalize_graph() may have swapped endpoints for deduplication;
                 // calls and rationale_for edges must keep their original direction.
-                if edge.relation == "calls" || edge.relation == "rationale_for" {
+                if edge.is_directed() {
                     if let Some(src) = object.remove("_src") {
                         if let Some(s) = src.as_str() {
                             object.insert("source".to_string(), serde_json::Value::String(s.to_string()));
@@ -2546,14 +2549,7 @@ pub fn export_html(
         .map(|edge| {
             let confidence = edge.confidence.as_str();
             // Preserve original direction for calls / rationale_for (#563).
-            let (from, to) = if edge.relation == "calls" || edge.relation == "rationale_for" {
-                (
-                    edge.original_source.as_ref().unwrap_or(&edge.source),
-                    edge.original_target.as_ref().unwrap_or(&edge.target),
-                )
-            } else {
-                (&edge.source, &edge.target)
-            };
+            let (from, to) = edge.directed_endpoints();
             serde_json::json!({
                 "from": from,
                 "to": to,
@@ -2912,14 +2908,7 @@ pub fn export_html_3d(
                 .copied()
                 .unwrap_or(0);
             // Preserve original direction for calls / rationale_for (#563).
-            let (src, tgt) = if edge.relation == "calls" || edge.relation == "rationale_for" {
-                (
-                    edge.original_source.as_ref().unwrap_or(&edge.source),
-                    edge.original_target.as_ref().unwrap_or(&edge.target),
-                )
-            } else {
-                (&edge.source, &edge.target)
-            };
+            let (src, tgt) = edge.directed_endpoints();
             serde_json::json!({
                 "source": src,
                 "target": tgt,

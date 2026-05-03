@@ -56,6 +56,12 @@ pub struct Node {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+impl Node {
+    pub fn is_rationale(&self) -> bool {
+        self.file_type == "rationale"
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Edge {
     pub source: String,
@@ -78,6 +84,28 @@ pub struct Edge {
     pub weight: f64,
     #[serde(default, flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// Relations whose direction must be preserved after undirected deduplication.
+pub const DIRECTED_RELATIONS: &[&str] = &["calls", "rationale_for"];
+
+impl Edge {
+    /// Whether this edge's relation is inherently directed.
+    pub fn is_directed(&self) -> bool {
+        DIRECTED_RELATIONS.contains(&self.relation.as_str())
+    }
+
+    /// Return the (source, target) pair, using original endpoints for directed relations.
+    pub fn directed_endpoints(&self) -> (&str, &str) {
+        if self.is_directed() {
+            (
+                self.original_source.as_deref().unwrap_or(&self.source),
+                self.original_target.as_deref().unwrap_or(&self.target),
+            )
+        } else {
+            (&self.source, &self.target)
+        }
+    }
 }
 
 fn default_weight() -> f64 {

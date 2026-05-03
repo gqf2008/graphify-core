@@ -1119,29 +1119,19 @@ fn main() -> Result<()> {
             }
             let today = today.unwrap_or_else(today_utc);
             let result = pipeline::cluster_only(&path, Some(today.as_str()), wiki, no_viz)?;
+            let mut parts = vec!["GRAPH_REPORT.md", "graph.json"];
             if result.wiki_path.is_some() {
-                if no_viz {
-                    println!(
-                        "Done — {} communities. GRAPH_REPORT.md and graph.json updated (no viz).",
-                        result.communities
-                    );
-                } else {
-                    println!(
-                        "Done — {} communities. GRAPH_REPORT.md, graph.json, graph-3d.html and graphify-out/wiki updated.",
-                        result.communities
-                    );
-                }
-            } else if no_viz {
-                println!(
-                    "Done — {} communities. GRAPH_REPORT.md and graph.json updated (no viz).",
-                    result.communities
-                );
-            } else {
-                println!(
-                    "Done — {} communities. GRAPH_REPORT.md, graph.json and graph-3d.html updated.",
-                    result.communities
-                );
+                parts.push("graphify-out/wiki");
             }
+            if !no_viz {
+                parts.push("graph-3d.html");
+            }
+            let suffix = if no_viz { " (no viz)" } else { "" };
+            println!(
+                "Done — {} communities. {} updated{suffix}.",
+                result.communities,
+                parts.join(", ")
+            );
         }
         Commands::Benchmark {
             graph,

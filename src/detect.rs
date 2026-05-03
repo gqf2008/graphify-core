@@ -471,29 +471,30 @@ fn is_noise_dir(part: &str) -> bool {
 
 // ── .graphifyignore ──────────────────────────────────────────────────────────
 
-/// A pattern loaded from a `.graphifyignore` file, paired with the directory
-/// where that file was found.
+/// A pattern loaded from a `.graphifyignore` or `.graphifyinclude` file, paired
+/// with the directory where that file was found.
 #[derive(Debug, Clone)]
-struct IgnorePattern {
+struct GraphifyPattern {
     anchor: PathBuf,
     pattern: String,
 }
 
-/// Read `.graphifyignore` from root and ancestor directories up to a `.git` boundary.
-fn load_graphifyignore(root: &Path) -> Vec<IgnorePattern> {
+/// Read a pattern file (`.graphifyignore` or `.graphifyinclude`) from root and
+/// ancestor directories up to a `.git` boundary.
+fn load_pattern_file(root: &Path, filename: &str) -> Vec<GraphifyPattern> {
     let mut patterns = Vec::new();
     let mut current = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
     loop {
-        let ignore_file = current.join(".graphifyignore");
-        if ignore_file.exists()
-            && let Ok(content) = fs::read_to_string(&ignore_file) {
+        let pattern_file = current.join(filename);
+        if pattern_file.exists()
+            && let Ok(content) = fs::read_to_string(&pattern_file) {
                 for line in content.lines() {
                     let line = line.trim();
                     if line.is_empty() || line.starts_with('#') {
                         continue;
                     }
-                    patterns.push(IgnorePattern {
+                    patterns.push(GraphifyPattern {
                         anchor: current.clone(),
                         pattern: line.to_string(),
                     });
@@ -514,8 +515,18 @@ fn load_graphifyignore(root: &Path) -> Vec<IgnorePattern> {
     patterns
 }
 
-/// Check if a path matches any `.graphifyignore` pattern.
-fn is_ignored(path: &Path, root: &Path, patterns: &[IgnorePattern]) -> bool {
+/// Read `.graphifyignore` from root and ancestor directories up to a `.git` boundary.
+fn load_graphifyignore(root: &Path) -> Vec<GraphifyPattern> {
+    load_pattern_file(root, ".graphifyignore")
+}
+
+/// Read `.graphifyinclude` allowlist from root and ancestor directories.
+fn load_graphifyinclude(root: &Path) -> Vec<GraphifyPattern> {
+    load_pattern_file(root, ".graphifyinclude")
+}
+
+/// Check if a path matches any pattern loaded for root/ancestors.
+fn matches_any_pattern(path: &Path, root: &Path, patterns: &[GraphifyPattern]) -> bool {
     if patterns.is_empty() {
         return false;
     }
@@ -547,6 +558,56 @@ fn is_ignored(path: &Path, root: &Path, patterns: &[IgnorePattern]) -> bool {
                     return true;
                 }
             }
+    }
+
+    false
+}
+
+/// Check if a path matches any `.graphifyignore` pattern.
+fn is_ignored(path: &Path, root: &Path, patterns: &[GraphifyPattern]) -> bool {
+    matches_any_pattern(path, root, patterns)
+}
+
+/// Check if a path matches any `.graphifyinclude` allowlist pattern.
+fn is_included(path: &Path, root: &Path, patterns: &[GraphifyPattern]) -> bool {
+    matches_any_pattern(path, root, patterns)
+}
+
+/// Return true if a directory may contain files matched by `.graphifyinclude`.
+fn could_contain_included_path(path: &Path, root: &Path, patterns: &[GraphifyPattern]) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+
+    let mut rels: Vec<String> = Vec::new();
+    if let Ok(rel) = path.strip_prefix(root) {
+        rels.push(rel.to_string_lossy().replace('\\', "/"));
+    }
+    for ip in patterns {
+        if ip.anchor != root {
+            if let Ok(rel) = path.strip_prefix(&ip.anchor) {
+                rels.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    for rel in &rels {
+        let rel = rel.trim_matches('/');
+        if rel.is_empty() {
+            return true;
+        }
+        for ip in patterns {
+            let p = ip.pattern.trim_matches('/');
+            if p.is_empty() {
+                continue;
+            }
+            if p == rel || p.starts_with(&format!("{}/", rel)) {
+                return true;
+            }
+            if matches_path(rel, "", p) {
+                return true;
+            }
+        }
     }
 
     false
@@ -635,6 +696,7 @@ pub struct DetectResult {
     pub warning: Option<String>,
     pub skipped_sensitive: Vec<String>,
     pub graphifyignore_patterns: usize,
+    pub graphifyinclude_patterns: usize,
 }
 
 const CORPUS_WARN_THRESHOLD: usize = 50_000;
@@ -653,6 +715,7 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
     let memory_dir = canonical_root.join("graphify-out").join("memory");
     let converted_dir = canonical_root.join("graphify-out").join("converted");
     let ignore_patterns = load_graphifyignore(&canonical_root);
+    let include_patterns = load_graphifyinclude(&canonical_root);
 
     // Build scan paths
     let mut scan_paths = vec![canonical_root.clone()];
@@ -669,6 +732,7 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
 
         let root_for_filter = canonical_root.clone();
         let ignore_patterns_for_filter = ignore_patterns.clone();
+        let include_patterns_for_filter = include_patterns.clone();
         let mut builder = ignore::WalkBuilder::new(scan_root);
         builder
             .follow_links(follow_symlinks)
@@ -679,11 +743,21 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
             builder.filter_entry(move |entry| {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy();
-                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                    && (name.starts_with('.') || is_noise_dir(&name))
-                {
-                    return false;
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    if is_noise_dir(&name) {
+                        return false;
+                    }
+                    // Hidden dirs remain skipped by default, but .graphifyinclude
+                    // can opt in the exact hidden subtrees needed to reach allowlisted files.
+                    if name.starts_with('.')
+                        && !could_contain_included_path(path, &root_for_filter, &include_patterns_for_filter)
+                    {
+                        return false;
+                    }
+                    return !is_ignored(path, &root_for_filter, &ignore_patterns_for_filter);
                 }
+                // Hidden files are handled in the main loop so sensitive ones
+                // can be recorded in skipped_sensitive.
                 !is_ignored(path, &root_for_filter, &ignore_patterns_for_filter)
             });
         }
@@ -716,7 +790,12 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
                 let dp = &path;
                 if !in_memory_tree
                     && let Some(name) = dp.file_name().and_then(|n| n.to_str()) {
-                        if name.starts_with('.') || is_noise_dir(name) {
+                        if is_noise_dir(name) {
+                            continue;
+                        }
+                        if name.starts_with('.')
+                            && !could_contain_included_path(dp, &canonical_root, &include_patterns)
+                        {
                             continue;
                         }
                         if is_ignored(dp, &canonical_root, &ignore_patterns) {
@@ -737,8 +816,8 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
                 continue;
             }
 
-            // Skip hidden files
-            if fname.starts_with('.') {
+            // Hidden files/directories are excluded unless this exact file is allowlisted.
+            if fname.starts_with('.') && !is_included(&path, &canonical_root, &include_patterns) {
                 if is_sensitive(&path) {
                     skipped_sensitive.push(display_path_for_output(
                         &path,
@@ -846,6 +925,7 @@ pub fn detect(root: &Path, follow_symlinks: bool) -> Result<DetectResult> {
         warning,
         skipped_sensitive,
         graphifyignore_patterns: ignore_patterns.len(),
+        graphifyinclude_patterns: include_patterns.len(),
     })
 }
 
@@ -907,6 +987,7 @@ pub struct DetectIncrementalResult {
     pub warning: Option<String>,
     pub skipped_sensitive: Vec<String>,
     pub graphifyignore_patterns: usize,
+    pub graphifyinclude_patterns: usize,
     pub incremental: bool,
     pub new_files: std::collections::HashMap<String, Vec<String>>,
     pub unchanged_files: std::collections::HashMap<String, Vec<String>>,
@@ -934,6 +1015,7 @@ pub fn detect_incremental(
                 warning: full.warning,
                 skipped_sensitive: full.skipped_sensitive,
                 graphifyignore_patterns: full.graphifyignore_patterns,
+                graphifyinclude_patterns: full.graphifyinclude_patterns,
                 incremental: true,
                 new_files: full.files.clone(),
                 unchanged_files: [
@@ -1017,6 +1099,7 @@ pub fn detect_incremental(
         warning: full.warning,
         skipped_sensitive: full.skipped_sensitive,
         graphifyignore_patterns: full.graphifyignore_patterns,
+        graphifyinclude_patterns: full.graphifyinclude_patterns,
         incremental: true,
         new_files,
         unchanged_files,

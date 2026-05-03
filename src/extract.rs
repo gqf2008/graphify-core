@@ -642,7 +642,18 @@ fn resolve_cross_file_calls(extraction: &mut Extraction) {
         return;
     }
 
-    let label_to_id = build_label_index(&extraction.nodes);
+    // Skip rationale nodes — their labels are docstring text, not callable
+    // identifiers, and they pollute cross-file matches for short names (#563).
+    let mut label_to_id = HashMap::new();
+    for node in &extraction.nodes {
+        if node.file_type == "rationale" {
+            continue;
+        }
+        let normalized = normalize_lookup_name(&node.label);
+        if !normalized.is_empty() {
+            label_to_id.insert(normalized, node.id.clone());
+        }
+    }
     let function_return_index = build_function_return_index(&extraction.function_returns);
     let method_index = build_method_index(&extraction.nodes, &extraction.edges);
     let mut existing_pairs: HashSet<(String, String)> = extraction
@@ -2128,6 +2139,11 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
             if node.node_type.as_deref() == Some("file") {
                 continue;
             }
+            // Rationale nodes carry docstring text as labels — they must never
+            // participate in cross-file import resolution (#563).
+            if node.file_type == "rationale" {
+                continue;
+            }
             // Match Python parity: index both classes and functions
             // (not method stubs ending with ")" or file nodes ending with ".py")
             if node.label.ends_with(')') || node.label.ends_with(".py") {
@@ -2156,6 +2172,7 @@ fn resolve_python_cross_file_imports(per_file: &[(PathBuf, Extraction)]) -> Resu
             .iter()
             .filter(|node| {
                 node.source_file == source_file
+                    && node.file_type != "rationale"
                     && !node.label.ends_with(')')
                     && !node.label.ends_with(".py")
             })
@@ -6297,11 +6314,23 @@ def normalize(value):
             .collect();
 
         assert!(!rationale_ids.is_empty());
+        // Rationale nodes must NOT participate in cross-file resolution (#563).
+        // Their labels are docstring text, not callable identifiers, and they
+        // pollute matches for short names.
+        assert!(
+            !result.edges.iter().any(|edge| {
+                rationale_ids.contains(&edge.source)
+                    && edge.target == response_id
+                    && edge.relation == "uses"
+                    && edge.confidence == "INFERRED"
+            }),
+            "rationale nodes should not produce cross-file uses edges"
+        );
+        // Class-level import edges should still exist.
         assert!(result.edges.iter().any(|edge| {
-            rationale_ids.contains(&edge.source)
-                && edge.target == response_id
-                && edge.relation == "uses"
+            edge.relation == "uses"
                 && edge.confidence == "INFERRED"
+                && edge.target == response_id
         }));
     }
 

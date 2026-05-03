@@ -347,6 +347,10 @@ enum Commands {
         /// Also write graphify-out/wiki markdown articles
         #[arg(long, default_value_t = false)]
         wiki: bool,
+
+        /// Skip HTML visualization generation
+        #[arg(long, default_value_t = false)]
+        no_viz: bool,
     },
 
     /// Measure token reduction versus naive full-corpus reads
@@ -1100,7 +1104,12 @@ fn main() -> Result<()> {
                 exit_code = 1;
             }
         }
-        Commands::ClusterOnly { path, today, wiki } => {
+        Commands::ClusterOnly {
+            path,
+            today,
+            wiki,
+            no_viz,
+        } => {
             let graph_json = path.join("graphify-out").join("graph.json");
             if !graph_json.exists() {
                 bail!(
@@ -1109,10 +1118,22 @@ fn main() -> Result<()> {
                 );
             }
             let today = today.unwrap_or_else(today_utc);
-            let result = pipeline::cluster_only(&path, Some(today.as_str()), wiki)?;
+            let result = pipeline::cluster_only(&path, Some(today.as_str()), wiki, no_viz)?;
             if result.wiki_path.is_some() {
+                if no_viz {
+                    println!(
+                        "Done — {} communities. GRAPH_REPORT.md and graph.json updated (no viz).",
+                        result.communities
+                    );
+                } else {
+                    println!(
+                        "Done — {} communities. GRAPH_REPORT.md, graph.json, graph-3d.html and graphify-out/wiki updated.",
+                        result.communities
+                    );
+                }
+            } else if no_viz {
                 println!(
-                    "Done — {} communities. GRAPH_REPORT.md, graph.json, graph-3d.html and graphify-out/wiki updated.",
+                    "Done — {} communities. GRAPH_REPORT.md and graph.json updated (no viz).",
                     result.communities
                 );
             } else {

@@ -123,7 +123,7 @@ pub fn rebuild_code(
     let preserved = load_preserved_semantic_graph(root);
     let graph = build_graph_with_preserved_semantics(extraction, &preserved);
     let detection_value = serde_json::to_value(&detection)?;
-    let output = write_graph_outputs(root, &graph, detection_value, today, write_wiki)?;
+    let output = write_graph_outputs(root, &graph, detection_value, today, write_wiki, false)?;
 
     Ok(RebuildCodeResult {
         ok: true,
@@ -149,6 +149,7 @@ pub fn cluster_only(
     root: &Path,
     today: Option<&str>,
     write_wiki: bool,
+    no_viz: bool,
 ) -> Result<ClusterOnlyResult> {
     let graph_path = root.join("graphify-out").join("graph.json");
     let graph_json = fs::read_to_string(&graph_path).with_context(|| {
@@ -160,7 +161,7 @@ pub fn cluster_only(
     let graph_value: Value = serde_json::from_str(&graph_json)
         .with_context(|| format!("invalid graph JSON: {}", graph_path.display()))?;
     let graph = build::merge_extractions(std::slice::from_ref(&graph_value));
-    let output = write_graph_outputs(root, &graph, json!({}), today, write_wiki)?;
+    let output = write_graph_outputs(root, &graph, json!({}), today, write_wiki, no_viz)?;
 
     Ok(ClusterOnlyResult {
         ok: true,
@@ -473,6 +474,7 @@ fn write_graph_outputs(
     detection_result: Value,
     today: Option<&str>,
     write_wiki: bool,
+    no_viz: bool,
 ) -> Result<GraphOutputSummary> {
     let communities = build::cluster(graph);
     let cohesion_scores = build::score_all(graph, &communities);
@@ -521,7 +523,13 @@ fn write_graph_outputs(
         },
         || {
             join(
-                || build::export_html_3d(graph, &communities, &community_labels, "graph-3d.html"),
+                || {
+                    if no_viz {
+                        String::new()
+                    } else {
+                        build::export_html_3d(graph, &communities, &community_labels, "graph-3d.html")
+                    }
+                },
                 || {
                     if let Some(wiki_dir) = wiki_path.as_ref() {
                         build::export_wiki(
@@ -576,15 +584,21 @@ fn write_graph_outputs(
         fs::write(&graph_path, graph_json)
             .with_context(|| format!("cannot write {}", graph_path.display()))?;
     }
-    fs::write(&html_path, graph_html)
-        .with_context(|| format!("cannot write {}", html_path.display()))?;
+    if no_viz {
+        // Remove stale HTML from previous runs when viz is skipped.
+        let _ = fs::remove_file(&html_path);
+        let _ = fs::remove_file(&legacy_html_path);
+    } else {
+        fs::write(&html_path, graph_html)
+            .with_context(|| format!("cannot write {}", html_path.display()))?;
+        if let Err(e) = fs::remove_file(&legacy_html_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e).with_context(|| format!("cannot remove {}", legacy_html_path.display()));
+        }
+    }
     fs::write(&report_path, report)
         .with_context(|| format!("cannot write {}", report_path.display()))?;
-    if let Err(e) = fs::remove_file(&legacy_html_path)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(e).with_context(|| format!("cannot remove {}", legacy_html_path.display()));
-    }
 
     let needs_update = out_dir.join("needs_update");
     let _ = fs::remove_file(needs_update);
@@ -704,7 +718,7 @@ mod tests {
             }))?,
         )?;
 
-        let result = cluster_only(dir.path(), Some("2026-04-16"), false)?;
+        let result = cluster_only(dir.path(), Some("2026-04-16"), false, false)?;
         let graph: Value = serde_json::from_str(&fs::read_to_string(out_dir.join("graph.json"))?)?;
         let report = fs::read_to_string(out_dir.join("GRAPH_REPORT.md"))?;
         let html = fs::read_to_string(out_dir.join("graph-3d.html"))?;
@@ -764,7 +778,7 @@ mod tests {
             }))?,
         )?;
 
-        let result = cluster_only(dir.path(), Some("2026-04-16"), false)?;
+        let result = cluster_only(dir.path(), Some("2026-04-16"), false, false)?;
         let index = fs::read_to_string(out_dir.join("wiki").join("index.md"))?;
 
         assert!(result.ok);
@@ -825,7 +839,7 @@ mod tests {
             }))?,
         )?;
 
-        let result = cluster_only(dir.path(), Some("2026-04-16"), true)?;
+        let result = cluster_only(dir.path(), Some("2026-04-16"), true, false)?;
         let wiki_dir = out_dir.join("wiki");
 
         assert!(result.ok);

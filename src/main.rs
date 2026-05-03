@@ -156,6 +156,10 @@ enum Commands {
         /// Report date override (YYYY-MM-DD)
         #[arg(long)]
         today: Option<String>,
+
+        /// Skip HTML visualization generation
+        #[arg(long, default_value_t = false)]
+        no_viz: bool,
     },
 
     /// Watch a directory and rebuild or flag graph updates on change
@@ -679,8 +683,8 @@ fn main() -> Result<()> {
             let result = pipeline::rebuild_code(&root, follow_symlinks, today.as_deref(), false)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
-        Commands::ClusterOnly { root, today } => {
-            let result = pipeline::cluster_only(&root, today.as_deref(), false)?;
+        Commands::ClusterOnly { root, today, no_viz } => {
+            let result = pipeline::cluster_only(&root, today.as_deref(), false, no_viz)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Commands::Watch {

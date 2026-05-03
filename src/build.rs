@@ -1487,7 +1487,26 @@ fn svg_escape(text: &str) -> String {
 }
 
 fn safe_wiki_filename(name: &str) -> String {
-    name.replace('/', "-").replace(' ', "_").replace(':', "-")
+    let mut s = name
+        .replace('/', "-")
+        .replace('\\', "-")
+        .replace(' ', "_")
+        .replace(':', "-")
+        .replace('<', "-")
+        .replace('>', "-")
+        .replace('"', "-")
+        .replace('|', "-")
+        .replace('?', "-")
+        .replace('*', "-");
+    s = s.trim_end_matches(|c: char| c == '.' || c == ' ').to_string();
+    if s.len() > 200 {
+        s.truncate(200);
+        s = s.trim_end_matches(|c: char| c == '.' || c == ' ').to_string();
+    }
+    if s.is_empty() {
+        s = "unnamed".to_string();
+    }
+    s
 }
 
 fn safe_community_name(label: &str) -> String {
@@ -2430,6 +2449,24 @@ pub fn export_json_data(
         .map(|edge| {
             let mut value = serde_json::to_value(edge).unwrap_or_else(|_| serde_json::json!({}));
             if let Some(object) = value.as_object_mut() {
+                // Restore original direction for directed edge types (#563).
+                // normalize_graph() may have swapped endpoints for deduplication;
+                // calls and rationale_for edges must keep their original direction.
+                if edge.relation == "calls" || edge.relation == "rationale_for" {
+                    if let Some(src) = object.remove("_src") {
+                        if let Some(s) = src.as_str() {
+                            object.insert("source".to_string(), serde_json::Value::String(s.to_string()));
+                        }
+                    }
+                    if let Some(tgt) = object.remove("_tgt") {
+                        if let Some(s) = tgt.as_str() {
+                            object.insert("target".to_string(), serde_json::Value::String(s.to_string()));
+                        }
+                    }
+                } else {
+                    object.remove("_src");
+                    object.remove("_tgt");
+                }
                 if let Some(weight) = object.get("weight").and_then(|value| value.as_f64()) {
                     let rounded = (weight * 1_000_000.0).round() / 1_000_000.0;
                     object.insert("weight".to_string(), serde_json::Value::from(rounded));
@@ -2451,7 +2488,7 @@ pub fn export_json_data(
         .collect();
 
     serde_json::json!({
-        "directed": false,
+        "directed": true,
         "multigraph": false,
         "graph": {},
         "nodes": nodes,
@@ -2508,9 +2545,18 @@ pub fn export_html(
         .iter()
         .map(|edge| {
             let confidence = edge.confidence.as_str();
+            // Preserve original direction for calls / rationale_for (#563).
+            let (from, to) = if edge.relation == "calls" || edge.relation == "rationale_for" {
+                (
+                    edge.original_source.as_ref().unwrap_or(&edge.source),
+                    edge.original_target.as_ref().unwrap_or(&edge.target),
+                )
+            } else {
+                (&edge.source, &edge.target)
+            };
             serde_json::json!({
-                "from": edge.source,
-                "to": edge.target,
+                "from": from,
+                "to": to,
                 "label": edge.relation,
                 "title": html_escape(&format!("{} [{}]", edge.relation, edge.confidence)),
                 "dashes": confidence != "EXTRACTED",
@@ -2774,16 +2820,22 @@ network.on('afterDrawing', function(ctx) {{
     )
 }
 
-const MAX_NODES_FOR_VIZ: usize = 5000;
+fn max_nodes_for_viz() -> usize {
+    std::env::var("GRAPHIFY_VIZ_NODE_LIMIT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5000)
+}
 
 fn check_viz_limit(graph: &Graph) -> std::io::Result<()> {
-    if graph.nodes.len() > MAX_NODES_FOR_VIZ {
+    let limit = max_nodes_for_viz();
+    if graph.nodes.len() > limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "Graph has {} nodes, exceeds visualization limit of {}",
                 graph.nodes.len(),
-                MAX_NODES_FOR_VIZ
+                limit
             ),
         ));
     }
@@ -2859,9 +2911,18 @@ pub fn export_html_3d(
                 .get(edge.source.as_str())
                 .copied()
                 .unwrap_or(0);
+            // Preserve original direction for calls / rationale_for (#563).
+            let (src, tgt) = if edge.relation == "calls" || edge.relation == "rationale_for" {
+                (
+                    edge.original_source.as_ref().unwrap_or(&edge.source),
+                    edge.original_target.as_ref().unwrap_or(&edge.target),
+                )
+            } else {
+                (&edge.source, &edge.target)
+            };
             serde_json::json!({
-                "source": edge.source,
-                "target": edge.target,
+                "source": src,
+                "target": tgt,
                 "label": edge.relation,
                 "confidence": confidence,
                 "width": if confidence == "EXTRACTED" { 2 } else { 1 },
@@ -5165,6 +5226,16 @@ pub fn export_wiki(
 ) -> std::io::Result<usize> {
     fs::create_dir_all(output_dir)?;
 
+    // Clear stale articles before regenerating to prevent orphan accumulation (#558).
+    if let Ok(entries) = fs::read_dir(output_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
     let labels: HashMap<usize, String> = if community_labels.is_empty() {
         communities
             .keys()
@@ -6139,8 +6210,7 @@ mod tests {
         assert_eq!(links[0]["target"], "b");
         assert_eq!(links[0]["relation"], "uses");
         assert_eq!(links[0]["confidence"], "INFERRED");
-        assert_eq!(links[0]["_src"], "b");
-        assert_eq!(links[0]["_tgt"], "a");
+        // _src / _tgt are internal fields and are stripped from JSON export (#563).
     }
 
     #[test]
